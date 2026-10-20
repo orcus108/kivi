@@ -1,0 +1,5401 @@
+import AppKit
+import ApplicationServices
+import Foundation
+import Combine
+import os
+import TypeWhisperPluginSDK
+
+private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "typewhisper-mac", category: "DictationViewModel")
+
+private struct CorrectionContributionContext: Sendable {
+    let language: String?
+    let engineId: String
+    let modelId: String?
+}
+
+struct DictationSessionTranscription: Sendable, Equatable {
+    var text: String
+    let rawText: String
+    let timestamp: Date
+    let appName: String?
+    let appBundleIdentifier: String?
+    let appURL: String?
+    let duration: Double
+    let language: String?
+    let engine: String
+    let model: String?
+    var wordsCount: Int
+}
+
+struct DictationSessionSnapshot: Sendable, Equatable {
+    enum Status: String, Sendable {
+        case recording
+        case processing
+        case completed
+        case failed
+    }
+
+    let id: UUID
+    let status: Status
+    let transcription: DictationSessionTranscription?
+    let error: String?
+}
+
+struct DictationInsertionCompletion: Sendable, Equatable {
+    let id: UUID
+    let providerId: String
+    let modelId: String?
+}
+
+@MainActor
+enum DictationLanguageResolver {
+    static func resolve(
+        workflow: Workflow?,
+        globalLanguageSelection: LanguageSelection
+    ) -> LanguageSelection {
+        if let workflow {
+            let workflowSelection = workflow.inputLanguageSelection
+            if workflowSelection != .inheritGlobal {
+                return workflowSelection
+            }
+        }
+
+        return globalLanguageSelection
+    }
+}
+
+@MainActor
+enum DictationTranscriptionOverrideResolver {
+    static func engineId(for workflow: Workflow?) -> String? {
+        guard workflow?.template == .dictation else { return nil }
+        return trimmed(workflow?.behavior.transcriptionEngineId)
+    }
+
+    static func modelId(for workflow: Workflow?) -> String? {
+        guard engineId(for: workflow) != nil else { return nil }
+        return trimmed(workflow?.behavior.transcriptionModelId)
+    }
+
+    private static func trimmed(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+}
+
+enum AutomaticRecoveryFallbackErrorPolicy {
+    static func shouldAttempt(after error: Error, taskIsCancelled: Bool = Task.isCancelled) -> Bool {
+        guard !(error is CancellationError), !taskIsCancelled else { return false }
+
+        if let pluginError = error as? PluginTranscriptionError {
+            switch pluginError {
+            case .fileTooLarge:
+                return false
+            case .notConfigured,
+                 .noModelSelected,
+                 .invalidApiKey,
+                 .rateLimited,
+                 .apiError(_),
+                 .networkError(_):
+                return true
+            }
+        }
+
+        if let transcriptionError = error as? TranscriptionEngineError {
+            switch transcriptionError {
+            case .noEngineSelected,
+                 .engineUnavailable(_, _),
+                 .modelNotLoaded,
+                 .appleSpeechModelNotLoaded,
+                 .transcriptionFailed(_),
+                 .modelLoadFailed(_),
+                 .modelDownloadFailed(_):
+                return true
+            }
+        }
+
+        if let urlError = error as? URLError {
+            return urlError.code != .cancelled
+        }
+
+        return false
+    }
+}
+
+/// Orchestrates the dictation flow: recording → transcription → text insertion.
+@MainActor
+final class DictationViewModel: ObservableObject {
+    typealias RecoveryFallbackConfigurationProvider = @MainActor (
+        _ primaryEngineId: String?,
+        _ task: TranscriptionTask
+    ) -> DictationRecoveryFallbackConfiguration?
+    typealias RecoveryFallbackRunner = @MainActor (
+        _ samples: [Float],
+        _ languageSelection: LanguageSelection,
+        _ task: TranscriptionTask,
+        _ configuration: DictationRecoveryFallbackConfiguration,
+        _ prompt: String?,
+        _ dictionaryTermHints: [PluginDictionaryTermHint],
+        _ normalizeNumbers: Bool?
+    ) async throws -> TranscriptionResult
+    typealias RecoveryHedgeThresholdProvider = @MainActor () -> TimeInterval?
+    /// Upper bound, in seconds, on the whole final-transcription phase (primary,
+    /// hedge, and sequential fallback together) for a recording of the given
+    /// duration. `nil` disables the bound.
+    typealias TranscriptionDeadlineProvider = @MainActor (_ audioDurationSeconds: TimeInterval) -> TimeInterval?
+    typealias PrimaryTranscriptionRunner = @MainActor (
+        _ samples: [Float],
+        _ languageSelection: LanguageSelection,
+        _ task: TranscriptionTask,
+        _ engineOverrideId: String?,
+        _ cloudModelOverride: String?,
+        _ prompt: String?,
+        _ dictionaryTermHints: [PluginDictionaryTermHint],
+        _ normalizeNumbers: Bool?
+    ) async throws -> TranscriptionResult
+
+    private struct FinalTranscriptionOutput: Sendable {
+        let result: TranscriptionResult
+        let modelId: String?
+        let modelDisplayName: String?
+        let usedRecoveryFallback: Bool
+    }
+
+    struct AutomaticRecoveryFallbackFailure: LocalizedError {
+        let primaryError: Error
+        let fallbackDescription: String
+
+        var errorDescription: String? {
+            let primaryDescription = primaryError.localizedDescription
+            return localizedAppText(
+                "Primary transcription failed: \(primaryDescription). Recovery fallback failed: \(fallbackDescription)",
+                de: "Primäre Transkription fehlgeschlagen: \(primaryDescription). Recovery-Fallback fehlgeschlagen: \(fallbackDescription)"
+            )
+        }
+    }
+
+    struct TranscriptionDeadlineExceeded: LocalizedError, Equatable {
+        let seconds: TimeInterval
+
+        // Describes the timeout only. Whether a recovery recording exists is
+        // decided by the failure path (retention policy, file move), which
+        // appends the recovery confirmation and action itself when one does.
+        var errorDescription: String? {
+            let rounded = Int(seconds.rounded())
+            return localizedAppText(
+                "Transcription timed out after \(rounded) seconds.",
+                de: "Die Transkription hat nach \(rounded) Sekunden das Zeitlimit überschritten."
+            )
+        }
+    }
+
+    /// Default final-transcription bound: a minute of headroom plus the
+    /// recording's own length, so long recordings on slow local engines are not
+    /// cut off while a hung cloud request can never pin the app in "Transcribing".
+    nonisolated static func defaultTranscriptionDeadline(forAudioDuration duration: TimeInterval) -> TimeInterval {
+        60 + max(0, duration)
+    }
+
+    nonisolated(unsafe) static var _shared: DictationViewModel?
+    static var shared: DictationViewModel {
+        guard let instance = _shared else {
+            fatalError("DictationViewModel not initialized")
+        }
+        return instance
+    }
+
+    enum State: Equatable {
+        case idle
+        case recording
+        case processing
+        case inserting
+        case promptSelection(String)    // text ready, user picks a prompt
+        case promptProcessing(String)   // prompt name, LLM running
+        case error(String)
+    }
+
+    private enum CancelWarningTarget {
+        case recording
+        case processing
+    }
+
+    private enum ActionFeedbackAction {
+        case undoLearnedCorrections([LearnedDictionaryCorrection])
+        case openDictationRecovery
+        case openSettings(SettingsTab)
+
+        var title: String {
+            switch self {
+            case .undoLearnedCorrections:
+                String(localized: "Undo")
+            case .openDictationRecovery:
+                String(localized: "Open Recovery")
+            case .openSettings:
+                String(localized: "Open Settings")
+            }
+        }
+    }
+
+    private struct PendingHotkeyDictationStart {
+        let forcedWorkflowId: UUID?
+        let requestUptimeNanoseconds: UInt64
+    }
+
+    @Published var state: State = .idle {
+        didSet {
+            refreshCancellationAvailability()
+            updateSubmitOnEnterAvailability()
+            clearCancelWarningIfStateNoLongerMatches()
+        }
+    }
+    @Published var audioLevel: Float = 0
+    @Published var recordingDuration: TimeInterval = 0
+    @Published var hotkeyMode: HotkeyService.HotkeyMode?
+    @Published var partialText: String = ""
+    @Published var isStreaming: Bool = false
+    @Published private(set) var externalStreamingDisplayCount: Int = 0
+    @Published var audioDuckingEnabled: Bool {
+        didSet { UserDefaults.standard.set(audioDuckingEnabled, forKey: UserDefaultsKeys.audioDuckingEnabled) }
+    }
+    @Published var audioDuckingLevel: Double {
+        didSet { UserDefaults.standard.set(audioDuckingLevel, forKey: UserDefaultsKeys.audioDuckingLevel) }
+    }
+    @Published var soundFeedbackEnabled: Bool {
+        didSet { UserDefaults.standard.set(soundFeedbackEnabled, forKey: UserDefaultsKeys.soundFeedbackEnabled) }
+    }
+    @Published var indicatorTranscriptPreviewEnabled: Bool {
+        didSet { Self.persistIndicatorTranscriptPreviewEnabled(indicatorTranscriptPreviewEnabled) }
+    }
+    @Published var liveFieldTranscriptEnabled: Bool {
+        didSet { Self.persistLiveFieldTranscriptEnabled(liveFieldTranscriptEnabled) }
+    }
+    @Published var indicatorVisibleInScreenCaptures: Bool {
+        didSet { Self.persistIndicatorVisibleInScreenCaptures(indicatorVisibleInScreenCaptures) }
+    }
+    /// Engine override for the live transcript preview only. `nil` = follow the
+    /// dictation engine (prior behavior). Lets the preview run a fast local
+    /// streaming engine while the final transcription uses a cloud engine.
+    @Published var livePreviewEngineId: String? {
+        didSet { Self.persistLivePreviewEngineId(livePreviewEngineId) }
+    }
+    @Published var indicatorTranscriptPreviewFontSizeOffset: Int {
+        didSet {
+            let clampedOffset = Self.clampedIndicatorTranscriptPreviewFontSizeOffset(indicatorTranscriptPreviewFontSizeOffset)
+            if clampedOffset != indicatorTranscriptPreviewFontSizeOffset {
+                indicatorTranscriptPreviewFontSizeOffset = clampedOffset
+                return
+            }
+
+            Self.persistIndicatorTranscriptPreviewFontSizeOffset(clampedOffset)
+        }
+    }
+    @Published var preserveClipboard: Bool {
+        didSet { UserDefaults.standard.set(preserveClipboard, forKey: UserDefaultsKeys.preserveClipboard) }
+    }
+    @Published var mediaPauseEnabled: Bool {
+        didSet { UserDefaults.standard.set(mediaPauseEnabled, forKey: UserDefaultsKeys.mediaPauseEnabled) }
+    }
+    @Published var transcribeShortQuietClipsAggressively: Bool {
+        didSet { Self.persistTranscribeShortQuietClipsAggressively(transcribeShortQuietClipsAggressively) }
+    }
+    @Published var cancellationBehavior: CancellationBehavior {
+        didSet {
+            Self.persistCancellationBehavior(cancellationBehavior)
+            refreshCancellationAvailability()
+            // A Double-mode cancel warning must not survive the switch to
+            // Disabled: Escape can't cancel anymore, so the "press Esc again"
+            // indicator would lie.
+            if cancellationBehavior == .disabled {
+                clearCancelWarning()
+            }
+        }
+    }
+    @Published var microphoneBoostEnabled: Bool {
+        didSet {
+            Self.persistMicrophoneBoostEnabled(microphoneBoostEnabled)
+            applyEffectiveMicrophoneBoostToAudioService()
+        }
+    }
+    @Published var spokenFeedbackEnabled: Bool {
+        didSet { speechFeedbackService.spokenFeedbackEnabled = spokenFeedbackEnabled }
+    }
+    @Published private(set) var lastTranscribedText: String?
+    @Published private(set) var lastTranscriptionLanguage: String?
+    /// Updated only by the completed text-insertion path, never by indicator feedback.
+    @Published private(set) var lastSuccessfulDictationInsertion: DictationInsertionCompletion?
+    @Published var hotkeyLabelsVersion = 0
+    var hybridHotkeyLabel: String { Self.loadHotkeyLabel(for: .hybrid) }
+    var pttHotkeyLabel: String { Self.loadHotkeyLabel(for: .pushToTalk) }
+    var toggleHotkeyLabel: String { Self.loadHotkeyLabel(for: .toggle) }
+    var promptPaletteHotkeyLabel: String { Self.loadHotkeyLabel(for: .promptPalette) }
+    var recentTranscriptionsHotkeyLabel: String { Self.loadHotkeyLabel(for: .recentTranscriptions) }
+    var copyLastTranscriptionHotkeyLabel: String { Self.loadHotkeyLabel(for: .copyLastTranscription) }
+    var pasteLastTranscriptionHotkeyLabel: String { Self.loadHotkeyLabel(for: .pasteLastTranscription) }
+    var recorderToggleHotkeyLabel: String { Self.loadHotkeyLabel(for: .recorderToggle) }
+    var undoLastDictationHotkeyLabel: String { Self.loadHotkeyLabel(for: .undoLastDictation) }
+    var restoreRawTranscriptHotkeyLabel: String { Self.loadHotkeyLabel(for: .restoreRawTranscript) }
+    @Published var activeRuleName: String?
+    @Published var activeRuleReasonLabel: String?
+    @Published var activeRuleExplanation: String?
+    @Published var processingPhase: String?
+    @Published private(set) var isRecordingInputReady = false
+    @Published var actionFeedbackMessage: String?
+    @Published private(set) var isNoSpeechFeedback = false
+    @Published var actionFeedbackIcon: String?
+    @Published var actionFeedbackIsError: Bool = false
+    @Published private(set) var actionFeedbackActionTitle: String?
+    @Published private(set) var actionFeedbackRemainingFraction: Double = 0
+    @Published private(set) var actionFeedbackIsPaused = false
+    @Published var activeAppIcon: NSImage?
+    private var actionDisplayDuration: TimeInterval = 3.5
+    private let indicatorFeedbackLifetime = IndicatorFeedbackLifetime()
+    private var actionFeedbackAction: ActionFeedbackAction?
+
+    @Published var indicatorStyle: IndicatorStyle {
+        didSet { Self.persistIndicatorStyle(indicatorStyle) }
+    }
+
+    @Published var indicatorTheme: IndicatorTheme {
+        didSet { Self.persistIndicatorTheme(indicatorTheme) }
+    }
+
+    @Published var notchIndicatorVisibility: NotchIndicatorVisibility {
+        didSet { UserDefaults.standard.set(notchIndicatorVisibility.rawValue, forKey: UserDefaultsKeys.notchIndicatorVisibility) }
+    }
+
+    @Published var notchIndicatorLeftContent: NotchIndicatorContent {
+        didSet { UserDefaults.standard.set(notchIndicatorLeftContent.rawValue, forKey: UserDefaultsKeys.notchIndicatorLeftContent) }
+    }
+
+    @Published var notchIndicatorRightContent: NotchIndicatorContent {
+        didSet { UserDefaults.standard.set(notchIndicatorRightContent.rawValue, forKey: UserDefaultsKeys.notchIndicatorRightContent) }
+    }
+
+    @Published var notchIndicatorDisplay: NotchIndicatorDisplay {
+        didSet { UserDefaults.standard.set(notchIndicatorDisplay.rawValue, forKey: UserDefaultsKeys.notchIndicatorDisplay) }
+    }
+
+    @Published var overlayPosition: OverlayPosition {
+        didSet { UserDefaults.standard.set(overlayPosition.rawValue, forKey: UserDefaultsKeys.overlayPosition) }
+    }
+
+    private let audioRecordingService: AudioRecordingService
+    private let textInsertionService: TextInsertionService
+    private let hotkeyService: HotkeyService
+    private let modelManager: ModelManagerService
+    private let settingsViewModel: SettingsViewModel
+    private let historyService: HistoryService
+    private let usageStatisticsRecorder: UsageStatisticsRecording?
+    private let recentTranscriptionStore: RecentTranscriptionStore
+    private let profileService: ProfileService
+    private let workflowService: WorkflowService
+    private let translationService: AnyObject? // TranslationService (macOS 15+)
+    private let audioDuckingService: AudioDuckingService
+    private let dictionaryService: DictionaryService
+    private let licenseService: LicenseService?
+    private let targetAppCorrectionLearningService: TargetAppCorrectionLearningService
+    private let snippetService: SnippetService
+    private let soundService: SoundService
+    private let audioDeviceService: AudioDeviceService
+    private let promptActionService: PromptActionService
+    private let promptProcessingService: PromptProcessingService
+    private let workflowTextProcessingService: WorkflowTextProcessingService
+    private let speechFeedbackService: SpeechFeedbackService
+    private let accessibilityAnnouncementService: AccessibilityAnnouncementService
+    private let errorLogService: ErrorLogService
+    private let mediaPlaybackService: MediaPlaybackService
+    private let postProcessingPipeline: PostProcessingPipeline
+    private let recoveryFallbackConfigurationProvider: RecoveryFallbackConfigurationProvider
+    private let recoveryFallbackRunner: RecoveryFallbackRunner
+    private let recoveryHedgeThresholdProvider: RecoveryHedgeThresholdProvider
+    private let transcriptionDeadlineProvider: TranscriptionDeadlineProvider
+    private let primaryTranscriptionRunner: PrimaryTranscriptionRunner
+    private var matchedWorkflow: Workflow?
+    private var activeWorkflowMatch: WorkflowMatchResult?
+    private var forcedWorkflowId: UUID?
+    private var capturedActiveApp: (name: String?, bundleId: String?, url: String?)?
+    private var capturedSelectedText: String?
+
+    /// Session-only safe undo / raw-transcript restore for the most recent
+    /// direct text insertion (issue #999). Independent of history settings.
+    private(set) lazy var dictationUndoService: DictationUndoService = {
+        DictationUndoService(
+            textInsertionService: textInsertionService,
+            isPersistencePending: { [weak self] id in
+                guard let self else { return true }
+                // The indicator may already be idle while this dictation is still
+                // awaiting URL/audio persistence. Gate the relevant ID, including
+                // history-disabled sessions, before reflecting a verified restore.
+                return pendingPostInsertionDictationIndex(id: id) != nil
+            },
+            isDictationBusy: { [weak self] in
+                guard let self else { return true }
+                switch state {
+                case .idle, .error:
+                    return false
+                case .recording, .processing, .inserting,
+                     .promptSelection, .promptProcessing:
+                    return true
+                }
+            },
+            didRestoreRawTranscript: { [weak self] id, rawText in
+                self?.reflectRawTranscriptRestore(id: id, rawText: rawText)
+            }
+        )
+    }()
+
+    private var cancellables = Set<AnyCancellable>()
+    private var recordingTimer: Timer?
+    private var recordingStartTime: Date?
+    private let streamingHandler: StreamingHandler
+    private let promptPaletteHandler: PromptPaletteHandler
+    private let recentTranscriptionPaletteHandler: RecentTranscriptionPaletteHandler
+    private let settingsHandler: DictationSettingsHandler
+    private var transcriptionTask: Task<Void, Never>?
+    private var recordingStartTask: Task<Void, Never>?
+    private var submitAvailabilityMonitor: Task<Void, Never>?
+    // A new capture must wait until the previous recorder has stopped and discarded its audio.
+    private var recordingCleanupTask: Task<Void, Never>?
+    private var stopFinalizationTask: Task<Void, Never>?
+    private var targetAppCorrectionLearningTask: Task<Void, Never>?
+    private var targetAppAccessibilityObservationLease: TargetAppAccessibilityObservationLease?
+    private var errorResetTask: Task<Void, Never>?
+    private var insertingResetTask: Task<Void, Never>?
+    private var pendingHotkeyStartTask: Task<Void, Never>?
+    @Published private var cancelWarningTarget: CancelWarningTarget?
+    private var cancelWarningResetTask: Task<Void, Never>?
+    private var cancelConfirmationWindow: Duration = .seconds(3)
+    private let cancelConfirmationClock = ContinuousClock()
+    private var cancelWarningDeadline: ContinuousClock.Instant?
+    /// Resolves the browser URL after recording starts and returns it, so work after insertion
+    /// can still use a URL that was not awaited before insertion.
+    private var urlResolutionTask: Task<String?, Never>?
+    private var metadataCaptureTask: Task<Void, Never>?
+    /// Persists completed dictations (history, completion events, usage statistics) after the
+    /// text was inserted. Chained so records keep their completion order.
+    private var postInsertionPersistenceTask: Task<Void, Never>?
+    /// Inserted dictations that `postInsertionPersistenceTask` has not persisted yet, in completion
+    /// order. `flushPendingPostInsertionPersistence()` persists them when the app terminates first.
+    private var pendingPostInsertionDictations: [CompletedDictation] = []
+    var pasteboardProvider: () -> NSPasteboard = { .general }
+    /// Snapshot of the streaming params used in the most recent `streamingHandler.start(...)`.
+    /// Used to detect when an on-the-fly rule refinement (e.g. browser URL resolution)
+    /// changes the effective engine/language selection/task/cloud-model so the live
+    /// session can be restarted and stay consistent with the final transcription
+    /// (release review K3).
+    private struct StreamingParamsSnapshot: Equatable {
+        let engineOverrideId: String?
+        let providerId: String?
+        let languageSelection: LanguageSelection
+        let task: TranscriptionTask
+        let cloudModelOverride: String?
+        let normalizeNumbers: Bool?
+    }
+    private var lastStreamingParams: StreamingParamsSnapshot?
+    /// Whether the most recent `streamingHandler.start(...)` ran the preview on the
+    /// dictation engine. When false (a distinct preview engine), the live session's
+    /// text is display-only and must never be promoted to the final transcription.
+    private var lastPreviewFollowsDictationEngine = true
+    /// Whether the most recent live session ran with the preview hidden. Its partial
+    /// text then never replaces a failed finalization; the full recording is
+    /// transcribed instead.
+    private var lastStreamingPreviewHidden = false
+    /// A website workflow may still switch the engine once the browser URL resolves,
+    /// so a hidden live-dictation session waits for that instead of streaming audio
+    /// to the global engine first.
+    private var hiddenLiveSessionAwaitsWebsiteWorkflow = false
+    private var liveFieldTranscriptSession: LiveFieldTranscriptSession?
+    /// Workflow LLM segments processed while recording (opt-in per workflow).
+    /// Belongs to the current recording; the stop path takes ownership of it.
+    private var incrementalWorkflowPostProcessing: WorkflowIncrementalPostProcessingSession?
+    private struct PendingLiveFieldCapture {
+        let activeApp: (name: String?, bundleId: String?, url: String?)
+        let pinnedTarget: TextInsertionService.PinnedInsertionTarget
+        let liveFieldTarget: TextInsertionService.LiveFieldTarget?
+    }
+    private var pendingLiveFieldCapture: PendingLiveFieldCapture?
+    private var pinnedInsertionTarget: TextInsertionService.PinnedInsertionTarget?
+    private var isStopInFlight = false
+    private var activeDictationSessionID: UUID?
+    private var pendingHotkeyDictationStart: PendingHotkeyDictationStart?
+    private var pendingPushToTalkDiscardMessage: String?
+    private var recordingStartCuePending = false
+    private var firstRecordingAudioBufferSeen = false
+    private var pendingRecordingStartedPayload: RecordingStartedPayload?
+    private var shouldPlayRecordingStartSoundWhenReady = false
+    private var pendingRecordingAudioDuckingLevel: Float?
+    private var pendingRecordingAudioDuckingTask: Task<Void, Never>?
+    private var recordingUsesBluetoothInput = false
+    private var recordingRestoresSystemAudio = false
+    private var dictationSessions: [UUID: DictationSessionSnapshot] = [:]
+    private var dictationSessionOrder: [UUID] = []
+    private let maxTrackedDictationSessions = 100
+
+    var cancelWarningMessage: String? {
+        switch (state, cancelWarningTarget) {
+        case (.recording, .recording):
+            return String(localized: "Press Esc again to cancel recording")
+        case (.processing, .processing):
+            return String(localized: "Press Esc again to cancel transcription")
+        default:
+            return nil
+        }
+    }
+
+    init(
+        audioRecordingService: AudioRecordingService,
+        textInsertionService: TextInsertionService,
+        hotkeyService: HotkeyService,
+        modelManager: ModelManagerService,
+        settingsViewModel: SettingsViewModel,
+        historyService: HistoryService,
+        recentTranscriptionStore: RecentTranscriptionStore,
+        profileService: ProfileService,
+        workflowService: WorkflowService,
+        translationService: AnyObject?,
+        audioDuckingService: AudioDuckingService,
+        dictionaryService: DictionaryService,
+        licenseService: LicenseService? = nil,
+        targetAppCorrectionLearningService: TargetAppCorrectionLearningService? = nil,
+        snippetService: SnippetService,
+        soundService: SoundService,
+        audioDeviceService: AudioDeviceService,
+        promptActionService: PromptActionService,
+        promptProcessingService: PromptProcessingService,
+        workflowTextProcessingService: WorkflowTextProcessingService? = nil,
+        appFormatterService: AppFormatterService,
+        punctuationStrategyResolver: PunctuationStrategyResolver,
+        speechPunctuationService: SpeechPunctuationService,
+        speechFeedbackService: SpeechFeedbackService,
+        accessibilityAnnouncementService: AccessibilityAnnouncementService,
+        errorLogService: ErrorLogService,
+        mediaPlaybackService: MediaPlaybackService,
+        usageStatisticsRecorder: UsageStatisticsRecording? = nil,
+        recoveryFallbackConfigurationProvider: RecoveryFallbackConfigurationProvider? = nil,
+        recoveryFallbackRunner: RecoveryFallbackRunner? = nil,
+        recoveryHedgeThresholdProvider: RecoveryHedgeThresholdProvider? = nil,
+        primaryTranscriptionRunner: PrimaryTranscriptionRunner? = nil,
+        transcriptionDeadlineProvider: TranscriptionDeadlineProvider? = nil
+    ) {
+        self.audioRecordingService = audioRecordingService
+        self.textInsertionService = textInsertionService
+        self.hotkeyService = hotkeyService
+        self.modelManager = modelManager
+        self.settingsViewModel = settingsViewModel
+        self.historyService = historyService
+        self.usageStatisticsRecorder = usageStatisticsRecorder
+        self.recentTranscriptionStore = recentTranscriptionStore
+        self.profileService = profileService
+        self.workflowService = workflowService
+        self.translationService = translationService
+        self.audioDuckingService = audioDuckingService
+        self.dictionaryService = dictionaryService
+        self.licenseService = licenseService
+        self.targetAppCorrectionLearningService = targetAppCorrectionLearningService
+            ?? TargetAppCorrectionLearningService(
+                textInsertionService: textInsertionService,
+                textDiffService: TextDiffService(),
+                dictionaryService: dictionaryService
+            )
+        self.snippetService = snippetService
+        self.soundService = soundService
+        self.audioDeviceService = audioDeviceService
+        self.promptActionService = promptActionService
+        self.promptProcessingService = promptProcessingService
+        self.workflowTextProcessingService = workflowTextProcessingService
+            ?? WorkflowTextProcessingService(
+                promptProcessingService: promptProcessingService,
+                translationService: translationService,
+                workflowService: workflowService,
+                vocabularyProvider: { [dictionaryService] in dictionaryService.vocabularyForPrompt() }
+            )
+        self.speechFeedbackService = speechFeedbackService
+        self.accessibilityAnnouncementService = accessibilityAnnouncementService
+        self.errorLogService = errorLogService
+        self.mediaPlaybackService = mediaPlaybackService
+        self.recoveryFallbackConfigurationProvider = recoveryFallbackConfigurationProvider ?? { _, _ in nil }
+        self.recoveryHedgeThresholdProvider = recoveryHedgeThresholdProvider ?? { nil }
+        self.transcriptionDeadlineProvider = transcriptionDeadlineProvider ?? { duration in
+            Self.defaultTranscriptionDeadline(forAudioDuration: duration)
+        }
+        self.primaryTranscriptionRunner = primaryTranscriptionRunner ?? { [modelManager] samples, languageSelection, task, engineOverrideId, cloudModelOverride, prompt, dictionaryTermHints, normalizeNumbers in
+            try await modelManager.transcribe(
+                audioSamples: samples,
+                languageSelection: languageSelection,
+                task: task,
+                engineOverrideId: engineOverrideId,
+                cloudModelOverride: cloudModelOverride,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+        self.recoveryFallbackRunner = recoveryFallbackRunner ?? { [modelManager] samples, languageSelection, task, configuration, prompt, dictionaryTermHints, normalizeNumbers in
+            try await modelManager.transcribe(
+                audioSamples: samples,
+                languageSelection: languageSelection,
+                task: task,
+                engineOverrideId: configuration.engineId,
+                cloudModelOverride: configuration.modelId,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+        self.postProcessingPipeline = PostProcessingPipeline(
+            snippetService: snippetService,
+            dictionaryService: dictionaryService,
+            appFormatterService: appFormatterService,
+            speechPunctuationService: speechPunctuationService,
+            punctuationStrategyResolver: punctuationStrategyResolver
+        )
+        self.streamingHandler = StreamingHandler(
+            modelManager: modelManager,
+            bufferProvider: { [weak audioRecordingService] in
+                audioRecordingService?.getCurrentBuffer() ?? []
+            },
+            recentBufferProvider: { [weak audioRecordingService] maxDuration in
+                audioRecordingService?.getRecentBuffer(maxDuration: maxDuration) ?? []
+            },
+            bufferDeltaProvider: { [weak audioRecordingService] offset in
+                audioRecordingService?.getBufferDelta(since: offset) ?? ([], offset)
+            },
+            bufferedDurationProvider: { [weak audioRecordingService] in
+                audioRecordingService?.totalBufferDuration ?? 0
+            }
+        )
+        self.promptPaletteHandler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: historyService,
+            recentTranscriptionStore: recentTranscriptionStore,
+            promptProcessingService: promptProcessingService,
+            workflowTextProcessingService: self.workflowTextProcessingService,
+            soundService: soundService,
+            accessibilityAnnouncementService: accessibilityAnnouncementService
+        )
+        self.recentTranscriptionPaletteHandler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: historyService,
+            recentTranscriptionStore: recentTranscriptionStore
+        )
+        self.settingsHandler = DictationSettingsHandler(
+            hotkeyService: hotkeyService,
+            audioRecordingService: audioRecordingService,
+            textInsertionService: textInsertionService,
+            profileService: profileService,
+            workflowService: workflowService
+        )
+        self.audioDuckingEnabled = UserDefaults.standard.bool(forKey: UserDefaultsKeys.audioDuckingEnabled)
+        self.audioDuckingLevel = UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingLevel) as? Double ?? 0.2
+        self.soundFeedbackEnabled = UserDefaults.standard.object(forKey: UserDefaultsKeys.soundFeedbackEnabled) as? Bool ?? true
+        self.indicatorTranscriptPreviewEnabled = Self.loadIndicatorTranscriptPreviewEnabled()
+        self.liveFieldTranscriptEnabled = Self.loadLiveFieldTranscriptEnabled()
+        self.indicatorVisibleInScreenCaptures = Self.loadIndicatorVisibleInScreenCaptures()
+        self.indicatorTranscriptPreviewFontSizeOffset = Self.loadIndicatorTranscriptPreviewFontSizeOffset()
+        self.livePreviewEngineId = Self.loadLivePreviewEngineId()
+        self.preserveClipboard = UserDefaults.standard.bool(forKey: UserDefaultsKeys.preserveClipboard)
+        self.mediaPauseEnabled = UserDefaults.standard.bool(forKey: UserDefaultsKeys.mediaPauseEnabled)
+        self.transcribeShortQuietClipsAggressively = Self.loadTranscribeShortQuietClipsAggressively()
+        self.cancellationBehavior = Self.loadCancellationBehavior()
+        self.microphoneBoostEnabled = Self.loadMicrophoneBoostEnabled()
+        self.spokenFeedbackEnabled = UserDefaults.standard.bool(forKey: UserDefaultsKeys.spokenFeedbackEnabled)
+        self.indicatorStyle = Self.loadIndicatorStyle()
+        self.indicatorTheme = Self.loadIndicatorTheme()
+        self.notchIndicatorVisibility = UserDefaults.standard.string(forKey: UserDefaultsKeys.notchIndicatorVisibility)
+            .flatMap { NotchIndicatorVisibility(rawValue: $0) } ?? .duringActivity
+        self.notchIndicatorLeftContent = UserDefaults.standard.string(forKey: UserDefaultsKeys.notchIndicatorLeftContent)
+            .flatMap { NotchIndicatorContent(rawValue: $0) } ?? .timer
+        self.notchIndicatorRightContent = UserDefaults.standard.string(forKey: UserDefaultsKeys.notchIndicatorRightContent)
+            .flatMap { NotchIndicatorContent(rawValue: $0) } ?? .waveform
+        self.notchIndicatorDisplay = UserDefaults.standard.string(forKey: UserDefaultsKeys.notchIndicatorDisplay)
+            .flatMap { NotchIndicatorDisplay(rawValue: $0) } ?? .activeScreen
+        self.overlayPosition = UserDefaults.standard.string(forKey: UserDefaultsKeys.overlayPosition)
+            .flatMap { OverlayPosition(rawValue: $0) } ?? .bottom
+        audioRecordingService.microphoneBoostEnabled = microphoneBoostEnabled
+
+        setupBindings()
+
+        streamingHandler.onPartialTextUpdate = { [weak self] text in
+            guard let self else { return }
+            if let liveFieldTranscriptSession = self.liveFieldTranscriptSession,
+               liveFieldTranscriptSession.sessionID == self.activeDictationSessionID {
+                liveFieldTranscriptSession.receivePartial(text)
+            }
+            if self.partialText != text {
+                self.partialText = text
+                if self.state == .recording,
+                   !self.isStopInFlight,
+                   self.streamingHandler.hasActiveLiveTranscriptionSession {
+                    self.incrementalWorkflowPostProcessing?.ingest(confirmedText: text)
+                }
+                let elapsed = self.recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+                EventBus.shared.emit(.partialTranscriptionUpdate(PartialTranscriptionPayload(
+                    text: text,
+                    elapsedSeconds: elapsed
+                )))
+            }
+        }
+        streamingHandler.onStreamingStateChange = { [weak self] streaming in
+            self?.isStreaming = streaming
+        }
+        audioRecordingService.onFirstRecordingAudioBuffer = { [weak self] in
+            self?.handleFirstRecordingAudioBuffer()
+        }
+
+        promptPaletteHandler.onShowNotchFeedback = { [weak self] message, icon, duration, isError, category in
+            self?.showNotchFeedback(message: message, icon: icon, duration: duration, isError: isError, errorCategory: category ?? "general")
+        }
+        promptPaletteHandler.onShowError = { [weak self] message in
+            self?.showError(message, category: "prompt")
+        }
+        promptPaletteHandler.executeActionPlugin = { [weak self] plugin, pluginId, text, activeApp, originalText, language in
+            try await self?.executeActionPlugin(plugin, pluginId: pluginId, text: text, activeApp: activeApp, language: language, originalText: originalText)
+        }
+        promptPaletteHandler.getActionFeedback = { [weak self] in
+            (self?.actionFeedbackMessage, self?.actionFeedbackIcon, self?.actionDisplayDuration ?? 3.5)
+        }
+        promptPaletteHandler.getPreserveClipboard = { [weak self] in
+            self?.preserveClipboard ?? false
+        }
+        recentTranscriptionPaletteHandler.onShowNotchFeedback = { [weak self] message, icon, duration, isError, category in
+            self?.showNotchFeedback(message: message, icon: icon, duration: duration, isError: isError, errorCategory: category ?? "general")
+        }
+        recentTranscriptionPaletteHandler.getPreserveClipboard = { [weak self] in
+            self?.preserveClipboard ?? false
+        }
+
+        settingsHandler.onObjectWillChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
+        settingsHandler.onHotkeyLabelsChanged = { [weak self] in
+            self?.hotkeyLabelsVersion += 1
+        }
+        hotkeyService.discardPushToTalkRecordingOnExtraKeyPress = true
+    }
+
+    /// True when the selected engine can transcribe, or when the automatic recovery
+    /// engine can stand in for it after the primary attempt fails.
+    var canDictate: Bool {
+        modelManager.canTranscribe
+            || recoveryFallbackConfigurationProvider(modelManager.selectedProviderId, effectiveTask) != nil
+    }
+
+    @available(*, deprecated, renamed: "activeRuleName")
+    var activeProfileName: String? { activeRuleName }
+
+    nonisolated static func loadIndicatorTranscriptPreviewEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: UserDefaultsKeys.indicatorTranscriptPreviewEnabled) as? Bool ?? true
+    }
+
+    nonisolated static func persistIndicatorTranscriptPreviewEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: UserDefaultsKeys.indicatorTranscriptPreviewEnabled)
+    }
+
+    nonisolated static func loadLiveFieldTranscriptEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: UserDefaultsKeys.liveFieldTranscriptEnabled) as? Bool ?? false
+    }
+
+    nonisolated static func persistLiveFieldTranscriptEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: UserDefaultsKeys.liveFieldTranscriptEnabled)
+    }
+
+    nonisolated static func loadIndicatorVisibleInScreenCaptures(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: UserDefaultsKeys.indicatorVisibleInScreenCaptures) as? Bool ?? true
+    }
+
+    nonisolated static func persistIndicatorVisibleInScreenCaptures(_ visible: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(visible, forKey: UserDefaultsKeys.indicatorVisibleInScreenCaptures)
+    }
+
+    nonisolated static func loadLivePreviewEngineId(defaults: UserDefaults = .standard) -> String? {
+        guard let engineId = defaults.string(forKey: UserDefaultsKeys.livePreviewEngineId),
+              !engineId.isEmpty else {
+            return nil
+        }
+        return engineId
+    }
+
+    nonisolated static func persistLivePreviewEngineId(_ engineId: String?, defaults: UserDefaults = .standard) {
+        if let engineId, !engineId.isEmpty {
+            defaults.set(engineId, forKey: UserDefaultsKeys.livePreviewEngineId)
+        } else {
+            defaults.removeObject(forKey: UserDefaultsKeys.livePreviewEngineId)
+        }
+    }
+
+    nonisolated static func loadIndicatorTranscriptPreviewFontSizeOffset(defaults: UserDefaults = .standard) -> Int {
+        guard let storedValue = defaults.object(forKey: UserDefaultsKeys.indicatorTranscriptPreviewFontSizeOffset) else {
+            return 0
+        }
+
+        guard let number = storedValue as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return 0
+        }
+
+        return Self.clampedIndicatorTranscriptPreviewFontSizeOffset(number.intValue)
+    }
+
+    nonisolated static func persistIndicatorTranscriptPreviewFontSizeOffset(_ offset: Int, defaults: UserDefaults = .standard) {
+        defaults.set(Self.clampedIndicatorTranscriptPreviewFontSizeOffset(offset), forKey: UserDefaultsKeys.indicatorTranscriptPreviewFontSizeOffset)
+    }
+
+    nonisolated static func loadIndicatorStyle(defaults: UserDefaults = .standard) -> IndicatorStyle {
+        defaults.string(forKey: UserDefaultsKeys.indicatorStyle)
+            .flatMap { IndicatorStyle(rawValue: $0) } ?? .notch
+    }
+
+    nonisolated static func persistIndicatorStyle(_ style: IndicatorStyle, defaults: UserDefaults = .standard) {
+        defaults.set(style.rawValue, forKey: UserDefaultsKeys.indicatorStyle)
+    }
+
+    nonisolated static func loadIndicatorTheme(defaults: UserDefaults = .standard) -> IndicatorTheme {
+        defaults.string(forKey: UserDefaultsKeys.indicatorTheme)
+            .flatMap { IndicatorTheme(rawValue: $0) } ?? .classic
+    }
+
+    nonisolated static func persistIndicatorTheme(_ theme: IndicatorTheme, defaults: UserDefaults = .standard) {
+        defaults.set(theme.rawValue, forKey: UserDefaultsKeys.indicatorTheme)
+    }
+
+    nonisolated static func loadTranscribeShortQuietClipsAggressively(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: UserDefaultsKeys.transcribeShortQuietClipsAggressively) as? Bool ?? true
+    }
+
+    nonisolated static func persistTranscribeShortQuietClipsAggressively(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: UserDefaultsKeys.transcribeShortQuietClipsAggressively)
+    }
+
+    nonisolated static func loadCancellationBehavior(defaults: UserDefaults = .standard) -> CancellationBehavior {
+        if let rawValue = defaults.string(forKey: UserDefaultsKeys.cancellationBehavior),
+           let behavior = CancellationBehavior(rawValue: rawValue) {
+            return behavior
+        }
+        let requiresConfirmation = defaults.object(forKey: UserDefaultsKeys.requireSecondEscapeToCancelRecording) as? Bool ?? true
+        return requiresConfirmation ? .doubleEscape : .singleEscape
+    }
+
+    nonisolated static func persistCancellationBehavior(_ behavior: CancellationBehavior, defaults: UserDefaults = .standard) {
+        defaults.set(behavior.rawValue, forKey: UserDefaultsKeys.cancellationBehavior)
+    }
+
+    nonisolated static func loadMicrophoneBoostEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: UserDefaultsKeys.microphoneBoostEnabled) as? Bool ?? false
+    }
+
+    nonisolated static func persistMicrophoneBoostEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: UserDefaultsKeys.microphoneBoostEnabled)
+    }
+
+    nonisolated static func indicatorTranscriptPreviewFontSize(for style: IndicatorStyle, offset: Int) -> CGFloat {
+        style.transcriptPreviewBaseFontSize + CGFloat(Self.clampedIndicatorTranscriptPreviewFontSizeOffset(offset))
+    }
+
+    nonisolated static func indicatorTranscriptPreviewExpandedHeight(for style: IndicatorStyle, offset: Int) -> CGFloat {
+        let fontSize = Self.indicatorTranscriptPreviewFontSize(for: style, offset: offset)
+        return style.scaledTranscriptPreviewMetric(style.transcriptPreviewBaseExpandedHeight, fontSize: fontSize)
+    }
+
+    func indicatorTranscriptPreviewFontSize(for style: IndicatorStyle) -> CGFloat {
+        Self.indicatorTranscriptPreviewFontSize(for: style, offset: indicatorTranscriptPreviewFontSizeOffset)
+    }
+
+    func indicatorTranscriptPreviewExpandedHeight(for style: IndicatorStyle) -> CGFloat {
+        Self.indicatorTranscriptPreviewExpandedHeight(for: style, offset: indicatorTranscriptPreviewFontSizeOffset)
+    }
+
+    nonisolated private static func clampedIndicatorTranscriptPreviewFontSizeOffset(_ offset: Int) -> Int {
+        min(max(offset, 0), 8)
+    }
+
+    nonisolated private static func elapsedMilliseconds(from start: UInt64, to end: UInt64) -> Double? {
+        guard end >= start else { return nil }
+        return Double(end - start) / 1_000_000
+    }
+
+    nonisolated private static func formatMilliseconds(_ value: Double?) -> String {
+        guard let value else { return "n/a" }
+        return String(format: "%.1f", value)
+    }
+
+    var needsMicPermission: Bool {
+        if AppConstants.isScreenshotAutomation { return false }
+        return !audioRecordingService.hasMicrophonePermission
+    }
+
+    var needsAccessibilityPermission: Bool {
+        if AppConstants.isScreenshotAutomation { return false }
+        return !textInsertionService.isAccessibilityGranted
+    }
+
+    // MARK: - HTTP API
+
+    var isRecording: Bool {
+        state == .recording
+    }
+
+    var canStartAPIRecording: Bool {
+        state == .idle
+    }
+
+    var activeWorkflowId: UUID? {
+        matchedWorkflow?.id
+    }
+
+    var apiStateName: String {
+        switch state {
+        case .idle: "idle"
+        case .recording: "recording"
+        case .processing: "processing"
+        case .inserting: "inserting"
+        case .promptSelection: "prompt_selection"
+        case .promptProcessing: "prompt_processing"
+        case .error: "error"
+        }
+    }
+
+    var apiActiveModelId: String? {
+        modelManager.resolvedModelId(
+            engineOverrideId: effectiveEngineOverrideId,
+            cloudModelOverride: effectiveCloudModelOverride
+        )
+    }
+
+    func apiStartRecording(forcedWorkflowId: UUID? = nil) -> UUID {
+        let sessionID = UUID()
+        startRecording(
+            forcedWorkflowId: forcedWorkflowId,
+            sessionID: sessionID,
+            requestUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+        )
+        return sessionID
+    }
+
+    func apiStartRecordingAwaitingReadiness(forcedWorkflowId: UUID? = nil) async -> UUID {
+        let sessionID = apiStartRecording(forcedWorkflowId: forcedWorkflowId)
+        await apiWaitForRecordingReadiness()
+        return sessionID
+    }
+
+    func apiWaitForRecordingReadiness() async {
+        let startTask = recordingStartTask
+        await startTask?.value
+    }
+
+#if DEBUG
+    func testingWaitForRecordingCleanup() async {
+        await recordingCleanupTask?.value
+    }
+
+    func testingWaitForRecordingStart() async {
+        let startTask = recordingStartTask
+        await startTask?.value
+    }
+
+    func testingWaitForPostInsertionPersistence() async {
+        await postInsertionPersistenceTask?.value
+    }
+
+    func prepareScreenshotIndicatorFixture(partialText: String = "") {
+        guard AppConstants.isScreenshotAutomation else { return }
+
+        indicatorStyle = .overlay
+        indicatorTheme = .classic
+        indicatorTranscriptPreviewEnabled = true
+        indicatorVisibleInScreenCaptures = true
+        notchIndicatorVisibility = .duringActivity
+        notchIndicatorLeftContent = .timer
+        notchIndicatorRightContent = .waveform
+        overlayPosition = .bottom
+        recordingDuration = 83
+        audioLevel = 0.46
+        activeRuleName = localizedAppText("Polish Dictation", de: "Diktat glätten")
+        isRecordingInputReady = true
+        state = .recording
+        self.partialText = partialText
+    }
+#endif
+
+    func apiStopRecording() -> UUID? {
+        let sessionID = activeDictationSessionID
+        stopDictation()
+        return sessionID
+    }
+
+    func apiDictationSession(id: UUID) -> DictationSessionSnapshot? {
+        if let session = dictationSessions[id] {
+            return session
+        }
+        if let record = historyService.record(withID: id) {
+            return DictationSessionSnapshot(
+                id: id,
+                status: .completed,
+                transcription: DictationSessionTranscription(
+                    text: record.finalText,
+                    rawText: record.rawText,
+                    timestamp: record.timestamp,
+                    appName: record.appName,
+                    appBundleIdentifier: record.appBundleIdentifier,
+                    appURL: record.appURL,
+                    duration: record.durationSeconds,
+                    language: record.language,
+                    engine: record.engineUsed,
+                    model: record.modelUsed,
+                    wordsCount: record.wordsCount
+                ),
+                error: nil
+            )
+        }
+        return nil
+    }
+
+    private func beginDictationSession(id: UUID) {
+        activeDictationSessionID = id
+        storeDictationSession(DictationSessionSnapshot(id: id, status: .recording, transcription: nil, error: nil))
+    }
+
+    private func markActiveDictationSessionProcessingIfNeeded() {
+        guard let sessionID = activeDictationSessionID else { return }
+        storeDictationSession(DictationSessionSnapshot(id: sessionID, status: .processing, transcription: nil, error: nil))
+    }
+
+    private func completeDictationSession(id: UUID, transcription: DictationSessionTranscription) {
+        storeDictationSession(DictationSessionSnapshot(id: id, status: .completed, transcription: transcription, error: nil))
+        if activeDictationSessionID == id {
+            activeDictationSessionID = nil
+        }
+    }
+
+    private struct CompletedDictation {
+        let sessionID: UUID?
+        let transcriptionID: UUID
+        let timestamp: Date
+        let rawText: String
+        let finalText: String
+        let appName: String?
+        let appBundleIdentifier: String?
+        var appURL: String?
+        let durationSeconds: Double
+        let language: String?
+        let detectedLanguage: String?
+        let engineUsed: String
+        let modelUsed: String?
+        let ruleName: String?
+        let wordsCount: Int
+        let historyEnabled: Bool
+        /// `HistoryService.clearGeneration` at insertion. Clearing history afterwards drops the record.
+        let historyClearGeneration: Int
+        let audioSamples: [Float]?
+        let pipelineSteps: [String]?
+        /// Set when `.transcriptionCompleted` went out before persistence, so it is emitted once.
+        var completionEventEmitted = false
+    }
+
+    /// Persists a dictation after its text was inserted, so history audio encoding, SwiftData
+    /// saves, and statistics no longer delay insertion or the next recording. The session is
+    /// reported as completed only after its history record exists.
+    private func schedulePostInsertionPersistence(
+        _ dictation: CompletedDictation,
+        pendingURLResolution: Task<String?, Never>?
+    ) {
+        let dictationID = dictation.transcriptionID
+        pendingPostInsertionDictations.append(dictation)
+        let previousTask = postInsertionPersistenceTask
+        postInsertionPersistenceTask = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            saveDeferredPostProcessingUsageCounts()
+            // After each wait, stop if the termination flush already persisted the dictation.
+            if dictation.appURL == nil, let pendingURLResolution {
+                let resolvedURL = await pendingURLResolution.value
+                guard let index = pendingPostInsertionDictationIndex(id: dictationID) else { return }
+                pendingPostInsertionDictations[index].appURL = resolvedURL
+            }
+            var historyAudioFileName: String?
+            if storesHistoryRecord(for: dictation), let audioSamples = dictation.audioSamples {
+                historyAudioFileName = await historyService.writeAudioFileInBackground(
+                    audioSamples,
+                    forRecordID: dictationID
+                )
+            }
+            guard let index = pendingPostInsertionDictationIndex(id: dictationID) else { return }
+            let pendingDictation = pendingPostInsertionDictations.remove(at: index)
+            persistCompletedDictation(pendingDictation, historyAudioFileName: historyAudioFileName)
+        }
+    }
+
+    /// Emits `.transcriptionCompleted` for dictations whose persistence still waits, for
+    /// example for the browser URL, before a new recording starts. Subscribers then see the
+    /// previous completion before the next `.recordingStarted`. The events carry the metadata
+    /// known now, so the URL may be nil; the history record still gets the URL later.
+    private func emitPendingTranscriptionCompletedEvents() {
+        for index in pendingPostInsertionDictations.indices
+        where !pendingPostInsertionDictations[index].completionEventEmitted {
+            emitTranscriptionCompleted(for: pendingPostInsertionDictations[index])
+            pendingPostInsertionDictations[index].completionEventEmitted = true
+        }
+    }
+
+    private func emitTranscriptionCompleted(for dictation: CompletedDictation) {
+        EventBus.shared.emit(.transcriptionCompleted(TranscriptionCompletedPayload(
+            timestamp: dictation.timestamp,
+            rawText: dictation.rawText,
+            finalText: dictation.finalText,
+            language: dictation.language,
+            engineUsed: dictation.engineUsed,
+            modelUsed: dictation.modelUsed,
+            durationSeconds: dictation.durationSeconds,
+            appName: dictation.appName,
+            bundleIdentifier: dictation.appBundleIdentifier,
+            url: dictation.appURL,
+            ruleName: dictation.ruleName
+        )))
+    }
+
+    private func pendingPostInsertionDictationIndex(id: UUID) -> Int? {
+        pendingPostInsertionDictations.firstIndex { $0.transcriptionID == id }
+    }
+
+    /// History cleared after insertion drops the record; statistics and the completion event
+    /// are still recorded, as clearing history does not clear them.
+    private func storesHistoryRecord(for dictation: CompletedDictation) -> Bool {
+        dictation.historyEnabled && dictation.historyClearGeneration == historyService.clearGeneration
+    }
+
+    /// Synchronously persists dictations still waiting for the optional browser URL lookup or
+    /// the background history audio write, for example before the app terminates. They are
+    /// persisted with the metadata known at this point.
+    func flushPendingPostInsertionPersistence() {
+        guard !pendingPostInsertionDictations.isEmpty else { return }
+        let dictations = pendingPostInsertionDictations
+        pendingPostInsertionDictations.removeAll()
+        saveDeferredPostProcessingUsageCounts()
+        for dictation in dictations {
+            var historyAudioFileName: String?
+            if storesHistoryRecord(for: dictation) {
+                historyAudioFileName = dictation.audioSamples.flatMap {
+                    historyService.writeAudioFile($0, forRecordID: dictation.transcriptionID)
+                }
+            } else if dictation.audioSamples != nil {
+                // History was cleared after insertion, so no record will reference the audio.
+                // Remove a file the background write already created and stop one still running.
+                historyService.discardAudioFile(forRecordID: dictation.transcriptionID)
+            }
+            persistCompletedDictation(dictation, historyAudioFileName: historyAudioFileName)
+        }
+    }
+
+    /// Snippet and correction usage counters are saved after insertion, not during post-processing.
+    private func saveDeferredPostProcessingUsageCounts() {
+        snippetService.saveDeferredUsageCounts()
+        dictionaryService.saveDeferredUsageCounts()
+    }
+
+    private func persistCompletedDictation(_ dictation: CompletedDictation, historyAudioFileName: String?) {
+        let appURL = dictation.appURL
+        if dictation.historyEnabled {
+            // Also rejects the record, and removes its audio file, if history was cleared
+            // while the audio was written in the background.
+            historyService.addRecord(
+                id: dictation.transcriptionID,
+                timestamp: dictation.timestamp,
+                rawText: dictation.rawText,
+                finalText: dictation.finalText,
+                appName: dictation.appName,
+                appBundleIdentifier: dictation.appBundleIdentifier,
+                appURL: appURL,
+                durationSeconds: dictation.durationSeconds,
+                language: dictation.language,
+                engineUsed: dictation.engineUsed,
+                modelUsed: dictation.modelUsed,
+                audioFileName: historyAudioFileName,
+                pipelineSteps: dictation.pipelineSteps,
+                capturedInClearGeneration: dictation.historyClearGeneration
+            )
+        }
+
+        if !dictation.completionEventEmitted {
+            emitTranscriptionCompleted(for: dictation)
+        }
+
+        usageStatisticsRecorder?.recordTranscription(
+            timestamp: dictation.timestamp,
+            wordsCount: dictation.wordsCount,
+            durationSeconds: dictation.durationSeconds,
+            appBundleIdentifier: dictation.appBundleIdentifier,
+            appName: dictation.appName,
+            engineUsed: dictation.engineUsed,
+            modelUsed: dictation.modelUsed
+        )
+
+        if let sessionID = dictation.sessionID {
+            completeDictationSession(
+                id: sessionID,
+                transcription: DictationSessionTranscription(
+                    text: dictation.finalText,
+                    rawText: dictation.rawText,
+                    timestamp: dictation.timestamp,
+                    appName: dictation.appName,
+                    appBundleIdentifier: dictation.appBundleIdentifier,
+                    appURL: appURL,
+                    duration: dictation.durationSeconds,
+                    language: dictation.detectedLanguage,
+                    engine: dictation.engineUsed,
+                    model: dictation.modelUsed,
+                    wordsCount: dictation.wordsCount
+                )
+            )
+        }
+    }
+
+    private func failDictationSession(id: UUID, error: String) {
+        storeDictationSession(DictationSessionSnapshot(id: id, status: .failed, transcription: nil, error: error))
+        if activeDictationSessionID == id {
+            activeDictationSessionID = nil
+        }
+    }
+
+    private func cancelActiveDictationSessionIfNeeded(message: String = String(localized: "Cancelled")) {
+        guard let sessionID = activeDictationSessionID else { return }
+        failDictationSession(id: sessionID, error: message)
+    }
+
+    private func restoreRecordingSideEffects() {
+        audioDuckingService.restoreAudio()
+        mediaPlaybackService.resumeIfWePaused()
+        recordingUsesBluetoothInput = false
+        recordingRestoresSystemAudio = false
+    }
+
+    private var bluetoothStopBehavior: AudioRecordingService.BluetoothStopBehavior {
+        Self.bluetoothStopBehavior(
+            usesBluetoothInput: recordingUsesBluetoothInput,
+            restoresSystemAudio: recordingRestoresSystemAudio
+        )
+    }
+
+    static func bluetoothStopBehavior(
+        usesBluetoothInput: Bool,
+        restoresSystemAudio: Bool
+    ) -> AudioRecordingService.BluetoothStopBehavior {
+        usesBluetoothInput && restoresSystemAudio ? .release : .keepPrepared
+    }
+
+    private func prepareRecordingStartCue(playsSound: Bool) {
+        isRecordingInputReady = false
+        recordingStartCuePending = true
+        firstRecordingAudioBufferSeen = false
+        pendingRecordingStartedPayload = nil
+        shouldPlayRecordingStartSoundWhenReady = playsSound
+    }
+
+    private func updateRecordingStartCuePayload(activeApp: (name: String?, bundleId: String?, url: String?)?) {
+        pendingRecordingStartedPayload = RecordingStartedPayload(
+            appName: activeApp?.name,
+            bundleIdentifier: activeApp?.bundleId
+        )
+        emitRecordingStartCueIfReady()
+    }
+
+    private func handleFirstRecordingAudioBuffer() {
+        firstRecordingAudioBufferSeen = true
+        emitRecordingStartCueIfReady()
+    }
+
+    private func emitRecordingStartCueIfReady() {
+        guard recordingStartCuePending,
+              firstRecordingAudioBufferSeen,
+              state == .recording,
+              let payload = pendingRecordingStartedPayload else {
+            return
+        }
+
+        recordingStartCuePending = false
+        isRecordingInputReady = true
+        if shouldPlayRecordingStartSoundWhenReady {
+            let startSoundDuration = soundService.playbackDuration(for: .recordingStarted, enabled: soundFeedbackEnabled)
+            if !soundService.play(.recordingStarted, enabled: soundFeedbackEnabled) {
+                applyPendingRecordingAudioDuckingIfNeeded()
+            } else {
+                applyPendingRecordingAudioDuckingIfNeeded(after: startSoundDuration)
+            }
+        } else {
+            applyPendingRecordingAudioDuckingIfNeeded()
+        }
+        accessibilityAnnouncementService.announceRecordingStarted()
+        EventBus.shared.emit(.recordingStarted(payload))
+    }
+
+    private func applyPendingRecordingAudioDuckingIfNeeded(after delay: TimeInterval? = nil) {
+        guard let level = pendingRecordingAudioDuckingLevel else { return }
+        pendingRecordingAudioDuckingLevel = nil
+        pendingRecordingAudioDuckingTask?.cancel()
+        guard let delay, delay > 0 else {
+            audioDuckingService.duckAudio(to: level)
+            return
+        }
+
+        let nanoseconds = UInt64((delay * 1_000_000_000).rounded(.up))
+        pendingRecordingAudioDuckingTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.audioDuckingService.duckAudio(to: level)
+            self?.pendingRecordingAudioDuckingTask = nil
+        }
+    }
+
+    private func clearRecordingStartCueState(resetReadiness: Bool = true) {
+        if resetReadiness {
+            isRecordingInputReady = false
+        }
+        recordingStartCuePending = false
+        firstRecordingAudioBufferSeen = false
+        pendingRecordingStartedPayload = nil
+        shouldPlayRecordingStartSoundWhenReady = false
+        pendingRecordingAudioDuckingLevel = nil
+        pendingRecordingAudioDuckingTask?.cancel()
+        pendingRecordingAudioDuckingTask = nil
+    }
+
+    private func clearDeferredRecordingContext() {
+        metadataCaptureTask?.cancel()
+        metadataCaptureTask = nil
+        urlResolutionTask?.cancel()
+        urlResolutionTask = nil
+        cancelIncrementalWorkflowPostProcessing()
+        lastStreamingParams = nil
+        pendingLiveFieldCapture = nil
+        pinnedInsertionTarget = nil
+    }
+
+    private func abortActiveRecordingImmediately(sessionMessage: String, preserveRecoveryAudio: Bool = false) {
+        let pendingStartTask = recordingStartTask
+        if pendingStartTask != nil {
+            pendingStartTask?.cancel()
+            audioRecordingService.cancelPendingRecordingStart()
+        }
+        clearRecordingStartCueState()
+        clearDeferredRecordingContext()
+        endTargetAppAccessibilityObservation()
+        cancelLiveFieldTranscriptSession()
+        streamingHandler.stop()
+        stopRecordingTimer()
+        let previousCleanup = recordingCleanupTask
+        recordingCleanupTask = Task {
+            await previousCleanup?.value
+            await pendingStartTask?.value
+            _ = await audioRecordingService.stopRecording(
+                policy: .immediate,
+                bluetoothBehavior: bluetoothStopBehavior
+            )
+            restoreRecordingSideEffects()
+            if preserveRecoveryAudio {
+                audioRecordingService.preserveActiveRecoveryRecording()
+            } else {
+                audioRecordingService.discardActiveRecoveryRecording()
+            }
+        }
+        cancelActiveDictationSessionIfNeeded(message: sessionMessage)
+        hotkeyService.cancelDictation()
+    }
+
+    private func storeDictationSession(_ session: DictationSessionSnapshot) {
+        dictationSessions[session.id] = session
+        dictationSessionOrder.removeAll { $0 == session.id }
+        dictationSessionOrder.append(session.id)
+
+        while dictationSessionOrder.count > maxTrackedDictationSessions {
+            let removedID = dictationSessionOrder.removeFirst()
+            dictationSessions.removeValue(forKey: removedID)
+        }
+    }
+
+    private func setupBindings() {
+        Publishers.CombineLatest(
+            audioDeviceService.$selectedDeviceUID.removeDuplicates(),
+            audioDeviceService.$inputDevices
+        )
+        .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
+        .sink { [weak self] _, _ in
+            self?.refreshRecordingInputConfiguration()
+        }
+        .store(in: &cancellables)
+
+        indicatorFeedbackLifetime.$remainingFraction
+            .removeDuplicates()
+            .sink { [weak self] remainingFraction in
+                self?.actionFeedbackRemainingFraction = remainingFraction
+            }
+            .store(in: &cancellables)
+
+        indicatorFeedbackLifetime.$isPaused
+            .removeDuplicates()
+            .sink { [weak self] isPaused in
+                self?.actionFeedbackIsPaused = isPaused
+            }
+            .store(in: &cancellables)
+
+        hotkeyService.onDictationStart = { [weak self] requestTimestamp in
+            guard let self else { return }
+            logger.info("hotkey→onDictationStart (state=\(String(describing: self.state), privacy: .public))")
+            self.handleHotkeyDictationStart(requestUptimeNanoseconds: requestTimestamp)
+        }
+
+        hotkeyService.onDictationStop = { [weak self] in
+            guard let self else { return }
+            logger.info("hotkey→onDictationStop (state=\(String(describing: self.state), privacy: .public), stopInFlight=\(String(describing: self.isStopInFlight), privacy: .public))")
+            if self.pendingHotkeyDictationStart != nil {
+                logger.info("Cancelling queued dictation start")
+                self.pendingHotkeyDictationStart = nil
+                self.pendingHotkeyStartTask?.cancel()
+                self.pendingHotkeyStartTask = nil
+                return
+            }
+            self.stopDictation()
+        }
+
+        hotkeyService.onWorkflowDictationStart = { [weak self] workflowId, requestTimestamp in
+            self?.handleHotkeyDictationStart(
+                forcedWorkflowId: workflowId,
+                requestUptimeNanoseconds: requestTimestamp
+            )
+        }
+
+        hotkeyService.onWorkflowTextProcessing = { [weak self] workflowId in
+            self?.processWorkflowHotkeyText(workflowId: workflowId)
+        }
+
+        hotkeyService.onSubmitDictationPressed = { [weak self] sessionID in
+            // The event handler already captured eligibility with this recording ID.
+            // A URL workflow update before main-queue delivery must not revoke the press.
+            guard let self, self.activeDictationSessionID == sessionID,
+                  self.state == .recording else { return }
+            self.hotkeyService.cancelDictation()
+            self.stopDictation(submitRequested: true)
+        }
+
+        hotkeyService.onCancelPressed = { [weak self] in
+            self?.handleCancelHotkey()
+        }
+
+        hotkeyService.onPushToTalkInterruption = { [weak self] in
+            self?.handlePushToTalkInterruption()
+        }
+
+        workflowService.$workflows
+            .dropFirst()
+            .sink { [weak self] workflows in
+                guard let self else { return }
+                self.settingsHandler.syncWorkflowHotkeys(workflows)
+            }
+            .store(in: &cancellables)
+
+        audioRecordingService.$audioLevel
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] level in
+                self?.audioLevel = level
+            }
+            .store(in: &cancellables)
+
+        // When the recovery coordinator's circuit breaker gives up mid-session,
+        // `AudioRecordingService` publishes the terminal error here. Surface
+        // it to the UI and unwind the dictation session cleanly — restore
+        // ducking, resume media, stop streaming, cancel the session.
+        audioRecordingService.$recoveryError
+            .receive(on: DispatchQueue.main)
+            .compactMap { $0 }
+            .sink { [weak self] error in
+                guard let self else { return }
+                // Always drain the publisher so `recoveryError` never lingers
+                // on `AudioRecordingService`, even when the session is no
+                // longer active (stop-in-flight, already processed, etc.).
+                defer { self.audioRecordingService.clearRecoveryError() }
+                guard self.state == .recording, !self.isStopInFlight else { return }
+                let errorMessage = error.localizedDescription
+                self.abortActiveRecordingImmediately(sessionMessage: errorMessage, preserveRecoveryAudio: true)
+                self.accessibilityAnnouncementService.announceError(errorMessage)
+                self.showError(errorMessage, category: "recording")
+            }
+            .store(in: &cancellables)
+
+        hotkeyService.$currentMode
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] mode in
+                self?.hotkeyMode = mode
+            }
+            .store(in: &cancellables)
+
+        audioDeviceService.$disconnectedDeviceName
+            .compactMap { $0 }
+            .sink { [weak self] _ in
+                guard let self, self.state == .recording, !self.isStopInFlight else { return }
+                let errorMessage = String(localized: "Microphone disconnected")
+                self.abortActiveRecordingImmediately(sessionMessage: errorMessage)
+                self.showNotchFeedback(
+                    message: errorMessage,
+                    icon: "mic.slash",
+                    duration: 3.0,
+                    isError: true,
+                    errorCategory: "recording"
+                )
+            }
+            .store(in: &cancellables)
+    }
+
+    private func refreshRecordingInputConfiguration() {
+        let resolvedInputSelection = audioDeviceService.resolvedRecordingInputSelection()
+        audioRecordingService.configureInputSelection(
+            deviceID: resolvedInputSelection.deviceID,
+            hasExplicitDeviceSelection: resolvedInputSelection.hasExplicitDeviceSelection,
+            usesBluetoothTransport: resolvedInputSelection.usesBluetoothTransport,
+            deviceName: resolvedInputSelection.deviceName
+        )
+        audioRecordingService.prepareRecordingInputIfEligible()
+    }
+
+    func handleCancelHotkey() {
+        logger.info(
+            "Cancel hotkey received: state=\(String(describing: self.state), privacy: .public), inputReady=\(self.isRecordingInputReady, privacy: .public), startPending=\(self.recordingStartTask != nil, privacy: .public)"
+        )
+        // Disabled mode: Escape never cancels, whatever path delivered the press.
+        guard cancellationBehavior != .disabled else { return }
+        guard let target = cancelWarningTargetForCurrentState() else { return }
+
+        if cancellationBehavior != .doubleEscape {
+            clearCancelWarning()
+            cancelCurrentOperation()
+            return
+        }
+
+        if cancelWarningTarget == target,
+           let cancelWarningDeadline,
+           cancelConfirmationClock.now < cancelWarningDeadline {
+            clearCancelWarning()
+            cancelCurrentOperation()
+        } else {
+            armCancelWarning(for: target)
+        }
+    }
+
+    private func armCancelWarning(for target: CancelWarningTarget) {
+        cancelWarningResetTask?.cancel()
+        cancelWarningTarget = target
+        let confirmationWindow = cancelConfirmationWindow
+        cancelWarningDeadline = cancelConfirmationClock.now.advanced(by: confirmationWindow)
+        cancelWarningResetTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: confirmationWindow)
+            } catch {
+                return
+            }
+            guard self?.cancelWarningTarget == target else { return }
+            self?.clearCancelWarning()
+        }
+    }
+
+    private func refreshCancellationAvailability() {
+        // Disabled mode leaves Escape entirely alone: the hotkey layer must
+        // not suppress it, so it passes through to the foreground app.
+        hotkeyService.isCancellationAvailable =
+            cancellationBehavior != .disabled && cancelWarningTargetForCurrentState() != nil
+    }
+
+    private func cancelWarningTargetForCurrentState() -> CancelWarningTarget? {
+        switch state {
+        case .recording:
+            return .recording
+        case .processing:
+            return .processing
+        default:
+            return nil
+        }
+    }
+
+    private func clearCancelWarningIfStateNoLongerMatches() {
+        guard let cancelWarningTarget,
+              cancelWarningTargetForCurrentState() != cancelWarningTarget else {
+            return
+        }
+        clearCancelWarning()
+    }
+
+    private func clearCancelWarning() {
+        cancelWarningResetTask?.cancel()
+        cancelWarningResetTask = nil
+        cancelWarningTarget = nil
+        cancelWarningDeadline = nil
+    }
+
+    #if DEBUG
+    func testingSetCancelConfirmationWindow(_ window: Duration) {
+        cancelConfirmationWindow = window
+    }
+    #endif
+
+    private func cancelCurrentOperation() {
+        if let token = selectionInstructionToken {
+            IntentSelectionEditor.shared.spokenFailure("Instruction recording cancelled. Original unchanged; type an instruction or capture again.", token: token)
+            selectionInstructionToken = nil
+        }
+        let cancelledMessage = String(localized: "Cancelled")
+        clearCancelWarning()
+
+        if state == .processing, recordingStartTask != nil, !isStopInFlight {
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            finishCancellation(message: cancelledMessage)
+            return
+        }
+
+        switch state {
+        case .recording:
+            guard !isStopInFlight else { return }
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            finishCancellation(message: cancelledMessage)
+        case .processing:
+            cancelActiveDictationSessionIfNeeded(message: cancelledMessage)
+            cancelLiveFieldTranscriptSession()
+            let finalizationTask = stopFinalizationTask
+            finalizationTask?.cancel()
+            let previousCleanup = recordingCleanupTask
+            recordingCleanupTask = Task {
+                await previousCleanup?.value
+                await finalizationTask?.value
+            }
+            stopFinalizationTask = nil
+            streamingHandler.stop()
+            lastStreamingParams = nil
+            cancelIncrementalWorkflowPostProcessing()
+            transcriptionTask?.cancel()
+            transcriptionTask = nil
+            endTargetAppAccessibilityObservation()
+            audioRecordingService.discardActiveRecoveryRecording()
+            finishCancellation(message: cancelledMessage)
+        default:
+            break
+        }
+    }
+
+    private func finishCancellation(message: String) {
+        if cancellationBehavior == .instant {
+            resetDictationState()
+        } else {
+            showNotchFeedback(message: message, icon: "xmark.circle", duration: 1.5)
+        }
+    }
+
+    private var selectionInstructionToken: UUID?
+
+    func startSelectionInstruction() {
+        guard state == .idle, let token = IntentSelectionEditor.shared.captureSelection(spoken: true) else { return }
+        selectionInstructionToken = token
+        startRecording()
+    }
+
+    func stopSelectionInstruction() {
+        guard selectionInstructionToken != nil, state == .recording else { return }
+        hotkeyService.cancelDictation()
+        stopDictation()
+    }
+
+    // Same recording/finalization paths as the existing global hotkeys.
+    private var kiviRecordingWasPrivate = false
+    func kiviMarkPrivateSession() { if state == .recording || state == .processing { kiviRecordingWasPrivate = true; audioRecordingService.discardActiveRecoveryRecording() } }
+    func kiviToggleRecording() {
+        switch state {
+        case .recording: hotkeyService.cancelDictation(); stopDictation()
+        case .idle: startRecording()
+        case .error: resetDictationState(); startRecording()
+        case .inserting where actionFeedbackMessage != nil:
+            handleHotkeyDictationStart(requestUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds)
+        default: break
+        }
+    }
+    func kiviCancelRecording() { cancelCurrentOperation() }
+
+    private func startRecording(
+        forcedWorkflowId: UUID? = nil,
+        sessionID: UUID = UUID(),
+        requestUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        guard state == .idle else {
+            logger.warning("startRecording rejected: state=\(String(describing: self.state), privacy: .public); resetting hotkey state")
+            hotkeyService.cancelDictation()
+            return
+        }
+        kiviRecordingWasPrivate = !(UserDefaults.standard.object(forKey: UserDefaultsKeys.historyEnabled) as? Bool ?? true)
+
+        let startTimestamp = CFAbsoluteTimeGetCurrent()
+        clearRecordingStartCueState()
+        // The previous dictation's completion must reach subscribers before this recording's
+        // `.recordingStarted`, even while its persistence still waits for the browser URL.
+        emitPendingTranscriptionCompletedEvents()
+
+        // Cancel any pending transcription from a previous recording
+        if transcriptionTask != nil {
+            cancelActiveDictationSessionIfNeeded()
+        }
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
+        cancelIncrementalWorkflowPostProcessing()
+        cancelTargetAppCorrectionLearning()
+        clearActionFeedbackAction()
+        insertingResetTask?.cancel()
+        insertingResetTask = nil
+        indicatorFeedbackLifetime.cancel()
+        clearCancelWarning()
+        pendingPushToTalkDiscardMessage = nil
+        cancelLiveFieldTranscriptSession()
+        pendingLiveFieldCapture = nil
+        pinnedInsertionTarget = nil
+        metadataCaptureTask?.cancel()
+        metadataCaptureTask = nil
+        urlResolutionTask?.cancel()
+        urlResolutionTask = nil
+
+        self.forcedWorkflowId = forcedWorkflowId
+        beginDictationSession(id: sessionID)
+
+        guard canDictate else {
+            let readinessError = modelManager.transcriptionReadinessError(providerId: modelManager.selectedProviderId)
+                ?? .noEngineSelected
+            let errorMessage = readinessError.localizedDescription
+            logger.warning("startRecording rejected: canDictate=false; resetting hotkey state")
+            failDictationSession(id: sessionID, error: errorMessage)
+            showError(
+                errorMessage,
+                category: "recording",
+                settingsTab: Self.settingsTab(forTranscriptionError: readinessError)
+            )
+            // Resync the hotkey toggle: HotkeyService already flipped isActive=true
+            // before invoking onDictationStart. Without this, a rejected start leaves
+            // the toggle stuck "active", so the next press is consumed as a phantom
+            // stop and every subsequent start/stop needs an extra press.
+            hotkeyService.cancelDictation()
+            return
+        }
+
+        guard audioRecordingService.hasMicrophonePermission else {
+            let errorMessage = "Microphone permission required."
+            logger.warning("startRecording rejected: microphone permission missing; resetting hotkey state")
+            failDictationSession(id: sessionID, error: errorMessage)
+            showError(errorMessage, category: "recording")
+            hotkeyService.cancelDictation()
+            return
+        }
+
+        captureLiveFieldTargetAtRecordingRequestIfEligible()
+
+        let resolvedInputSelection = audioDeviceService.resolvedRecordingInputSelection()
+        let initialForcedWorkflow = forcedWorkflow(for: forcedWorkflowId)
+        audioRecordingService.microphoneBoostEnabled = microphoneBoostEnabled(for: initialForcedWorkflow)
+        let selectedInputUsesBluetooth = resolvedInputSelection.usesBluetoothTransport
+        audioRecordingService.configureInputSelection(
+            deviceID: resolvedInputSelection.deviceID,
+            hasExplicitDeviceSelection: resolvedInputSelection.hasExplicitDeviceSelection,
+            usesBluetoothTransport: selectedInputUsesBluetooth,
+            deviceName: resolvedInputSelection.deviceName
+        )
+        prepareRecordingStartCue(playsSound: !selectedInputUsesBluetooth)
+        let audioStartTimestamp = DispatchTime.now().uptimeNanoseconds
+
+        // Only the physical-submit mode needs context before microphone startup.
+        // Preserve audio-first startup for existing workflows.
+        let needsEarlyWorkflowMatch = initialForcedWorkflow.map { $0.output.autoEnterMode == .duringDictation }
+            ?? workflowService.workflows.contains { $0.isEnabled && $0.output.autoEnterMode == .duringDictation }
+        let initialActiveApp: (name: String?, bundleId: String?, url: String?) = needsEarlyWorkflowMatch
+            ? (pendingLiveFieldCapture?.activeApp ?? textInsertionService.captureActiveApp())
+            : (nil, nil, nil)
+        if needsEarlyWorkflowMatch {
+            let initialWorkflowMatch = initialForcedWorkflow.map { workflowService.forcedWorkflowMatch(for: $0) }
+                ?? workflowService.matchWorkflow(bundleIdentifier: initialActiveApp.bundleId, url: nil)
+            applyWorkflowMatch(initialWorkflowMatch, activeApp: initialActiveApp)
+        }
+
+        let resolveWebsiteBeforeRecording = initialForcedWorkflow == nil && workflowService.workflows.contains { workflow in
+            guard workflow.isEnabled,
+                  workflow.output.autoEnterMode == .duringDictation || effectiveAutoEnterMode == .duringDictation,
+                  let trigger = workflow.trigger, !trigger.websitePatterns.isEmpty else { return false }
+            return trigger.appBundleIdentifiers.isEmpty
+                || trigger.appBundleIdentifiers.contains(initialActiveApp.bundleId ?? "")
+        }
+        if resolveWebsiteBeforeRecording {
+            state = .processing
+            processingPhase = localizedAppText("Checking website…", de: "Website wird geprüft …")
+        } else {
+            guard ensureSubmitKeySuppressionAvailable() else { return }
+            beginRecordingPreparation()
+        }
+        let requestToFeedbackMs = Self.elapsedMilliseconds(
+            from: requestUptimeNanoseconds,
+            to: DispatchTime.now().uptimeNanoseconds
+        )
+        logger.info(
+            "Preparing recording input without blocking the main actor: requestToFeedbackMs=\(Self.formatMilliseconds(requestToFeedbackMs), privacy: .public), bluetooth=\(selectedInputUsesBluetooth, privacy: .public)"
+        )
+        recordingStartTask?.cancel()
+        let previousCleanup = recordingCleanupTask
+        recordingStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.activeDictationSessionID == sessionID || self.activeDictationSessionID == nil {
+                    self.recordingStartTask = nil
+                }
+            }
+
+            do {
+                await previousCleanup?.value
+                try Task.checkCancellation()
+                guard self.activeDictationSessionID == sessionID else { return }
+                self.recordingUsesBluetoothInput = selectedInputUsesBluetooth
+                self.recordingRestoresSystemAudio = false
+                var resolvedStartupApp: (name: String?, bundleId: String?, url: String?)? = needsEarlyWorkflowMatch
+                    ? initialActiveApp : nil
+                if resolveWebsiteBeforeRecording {
+                    let resolvedURL: String?
+                    if let bundleID = initialActiveApp.bundleId {
+                        resolvedURL = await self.textInsertionService.resolveBrowserURL(bundleId: bundleID)
+                    } else {
+                        resolvedURL = nil
+                    }
+                    try Task.checkCancellation()
+                    guard self.activeDictationSessionID == sessionID else { return }
+                    let app = (name: initialActiveApp.name, bundleId: initialActiveApp.bundleId, url: resolvedURL)
+                    resolvedStartupApp = app
+                    self.applyWorkflowMatch(
+                        self.workflowService.matchWorkflow(bundleIdentifier: app.bundleId, url: app.url),
+                        activeApp: app
+                    )
+                    guard self.ensureSubmitKeySuppressionAvailable() else { return }
+                    self.processingPhase = nil
+                    self.beginRecordingPreparation()
+                }
+                // Keep the application used for early workflow assignment fixed through startup.
+                if resolvedStartupApp != nil,
+                   self.textInsertionService.captureActiveApp().bundleId != initialActiveApp.bundleId {
+                    self.abortActiveRecordingImmediately(sessionMessage: String(localized: "Cancelled"))
+                    self.finishCancellation(message: String(localized: "Cancelled"))
+                    return
+                }
+                if selectedInputUsesBluetooth, self.mediaPauseEnabled {
+                    self.recordingRestoresSystemAudio = await self.mediaPlaybackService.pauseImmediatelyIfPlaying()
+                    try Task.checkCancellation()
+                    guard self.activeDictationSessionID == sessionID else { return }
+                }
+                try await self.audioRecordingService.startRecordingAsync(
+                    requestUptimeNanoseconds: requestUptimeNanoseconds,
+                    storesRecoveryAudio: self.selectionInstructionToken == nil && !self.kiviRecordingWasPrivate
+                )
+                guard !Task.isCancelled,
+                      self.activeDictationSessionID == sessionID,
+                      self.state == .recording else {
+                    return
+                }
+                if let resolvedStartupApp {
+                    var currentURL = resolvedStartupApp.url
+                    if resolveWebsiteBeforeRecording, let bundleID = resolvedStartupApp.bundleId {
+                        currentURL = await self.textInsertionService.resolveBrowserURL(bundleId: bundleID)
+                    }
+                    try Task.checkCancellation()
+                    guard self.activeDictationSessionID == sessionID, self.state == .recording else { return }
+                    guard self.textInsertionService.captureActiveApp().bundleId == resolvedStartupApp.bundleId,
+                          currentURL == resolvedStartupApp.url else {
+                        self.abortActiveRecordingImmediately(sessionMessage: String(localized: "Cancelled"))
+                        self.finishCancellation(message: String(localized: "Cancelled"))
+                        return
+                    }
+                }
+                self.completeRecordingStart(
+                    forcedWorkflowId: forcedWorkflowId,
+                    sessionID: sessionID,
+                    requestUptimeNanoseconds: requestUptimeNanoseconds,
+                    startTimestamp: startTimestamp,
+                    audioStartTimestamp: audioStartTimestamp,
+                    selectedInputUsesBluetooth: selectedInputUsesBluetooth,
+                    initialForcedWorkflow: initialForcedWorkflow,
+                    resolvedStartupApp: resolvedStartupApp,
+                    websiteResolvedBeforeRecording: resolveWebsiteBeforeRecording
+                )
+            } catch is CancellationError {
+                logger.info("Recording preparation cancelled")
+            } catch {
+                guard self.activeDictationSessionID == sessionID else { return }
+                self.handleRecordingStartFailure(
+                    error,
+                    sessionID: sessionID,
+                    resolvedInputSelection: resolvedInputSelection
+                )
+            }
+        }
+    }
+
+    private func handleHotkeyDictationStart(
+        forcedWorkflowId: UUID? = nil,
+        requestUptimeNanoseconds: UInt64
+    ) {
+        if selectionInstructionToken != nil, state == .recording {
+            stopSelectionInstruction()
+            return
+        }
+        guard state == .processing || state == .inserting else {
+            startRecording(
+                forcedWorkflowId: forcedWorkflowId,
+                requestUptimeNanoseconds: requestUptimeNanoseconds
+            )
+            return
+        }
+
+        if pendingHotkeyDictationStart == nil {
+            pendingHotkeyDictationStart = PendingHotkeyDictationStart(
+                forcedWorkflowId: forcedWorkflowId,
+                requestUptimeNanoseconds: requestUptimeNanoseconds
+            )
+            logger.info(
+                "Queued dictation start while state=\(String(describing: self.state), privacy: .public)"
+            )
+        } else {
+            logger.info("Keeping existing queued dictation start")
+        }
+
+        if state == .inserting {
+            if actionFeedbackMessage != nil {
+                indicatorFeedbackLifetime.finishImmediately()
+            } else {
+                scheduleInsertingReset(after: .seconds(actionDisplayDuration))
+            }
+        }
+    }
+
+    private func beginRecordingPreparation() {
+        promptPaletteHandler.hide()
+        recentTranscriptionPaletteHandler.hide()
+        modelManager.cancelAutoUnloadTimer()
+        state = .recording
+        partialText = ""
+        isStopInFlight = false
+        recordingStartTime = nil
+        stopRecordingTimer()
+    }
+
+    private func completeRecordingStart(
+        forcedWorkflowId: UUID?,
+        sessionID: UUID,
+        requestUptimeNanoseconds: UInt64,
+        startTimestamp: TimeInterval,
+        audioStartTimestamp: UInt64,
+        selectedInputUsesBluetooth: Bool,
+        initialForcedWorkflow: Workflow?,
+        resolvedStartupApp: (name: String?, bundleId: String?, url: String?)? = nil,
+        websiteResolvedBeforeRecording: Bool = false
+    ) {
+        guard activeDictationSessionID == sessionID else { return }
+
+        let audioStartCompletedTimestamp = DispatchTime.now().uptimeNanoseconds
+        let audioStartMs = Self.elapsedMilliseconds(
+            from: audioStartTimestamp,
+            to: audioStartCompletedTimestamp
+        )
+        let requestToAudioStartMs = Self.elapsedMilliseconds(
+            from: requestUptimeNanoseconds,
+            to: audioStartCompletedTimestamp
+        )
+        promptPaletteHandler.hide()
+        recentTranscriptionPaletteHandler.hide()
+        modelManager.cancelAutoUnloadTimer()
+        if selectedInputUsesBluetooth {
+            logger.info("Skipping recording start sound for Bluetooth input device")
+        }
+        if mediaPauseEnabled, !selectedInputUsesBluetooth {
+            recordingRestoresSystemAudio = true
+            mediaPlaybackService.pauseIfPlaying()
+        }
+        if audioDuckingEnabled {
+            recordingRestoresSystemAudio = true
+            pendingRecordingAudioDuckingLevel = max(0, min(1, Float(audioDuckingLevel)))
+        } else {
+            pendingRecordingAudioDuckingLevel = nil
+        }
+        state = .recording
+        // Reset hotkey timer so hybrid threshold counts from recording readiness,
+        // not from the key press or Bluetooth route preparation.
+        hotkeyService.resetKeyDownTime()
+        partialText = ""
+        isStopInFlight = false
+        recordingStartTime = Date()
+        startRecordingTimer()
+
+        let contextStartTimestamp = CFAbsoluteTimeGetCurrent()
+        // Match the rule after the audio engine is live. When live-field insertion
+        // is enabled, reuse the target captured at the recording request so a slow
+        // microphone route cannot move the transcript to a newly focused field.
+        let liveFieldCapture = pendingLiveFieldCapture
+        pendingLiveFieldCapture = nil
+        let currentActiveApp = textInsertionService.captureActiveApp()
+        let activeApp: (name: String?, bundleId: String?, url: String?)
+        if let resolvedStartupApp {
+            activeApp = resolvedStartupApp
+        } else if let liveFieldCapture,
+           textInsertionService.pinnedInsertionTargetIsFocused(
+            liveFieldCapture.pinnedTarget,
+            knownActiveBundleIdentifier: currentActiveApp.bundleId
+           ) {
+            activeApp = currentActiveApp
+        } else {
+            activeApp = liveFieldCapture?.activeApp ?? currentActiveApp
+        }
+        pinnedInsertionTarget = liveFieldCapture?.pinnedTarget
+        capturedActiveApp = activeApp
+        capturedSelectedText = nil
+        activeAppIcon = nil
+
+        if let forcedWorkflow = initialForcedWorkflow {
+            applyWorkflowMatch(workflowService.forcedWorkflowMatch(for: forcedWorkflow), activeApp: activeApp)
+        } else if let workflowMatch = workflowService.matchWorkflow(bundleIdentifier: activeApp.bundleId, url: activeApp.url) {
+            applyWorkflowMatch(workflowMatch, activeApp: activeApp)
+        } else {
+            clearActiveRuleState()
+        }
+        guard ensureSubmitKeySuppressionAvailable() else { return }
+        beginTargetAppAccessibilityObservationIfNeeded(
+            bundleIdentifier: activeApp.bundleId
+        )
+        applyEffectiveMicrophoneBoostToAudioService()
+        if selectedInputUsesBluetooth {
+            // The asynchronous Bluetooth start only returns after the current
+            // engine generation has produced a confirmed ready stream.
+            firstRecordingAudioBufferSeen = true
+        }
+        updateRecordingStartCuePayload(activeApp: activeApp)
+        let contextMs = (CFAbsoluteTimeGetCurrent() - contextStartTimestamp) * 1000
+
+        beginLiveFieldTranscriptSessionIfEligible(
+            sessionID: sessionID,
+            activeApp: activeApp,
+            preCapturedTarget: liveFieldCapture?.liveFieldTarget
+        )
+        hiddenLiveSessionAwaitsWebsiteWorkflow = !websiteResolvedBeforeRecording
+            && forcedWorkflowId == nil
+            && activeApp.bundleId != nil
+            && hasApplicableWebsiteWorkflow(bundleIdentifier: activeApp.bundleId)
+        startLiveStreaming(
+            allowLiveTranscription: indicatorTranscriptPreviewEnabled
+                || liveFieldTranscriptEnabled
+                || externalStreamingDisplayCount > 0
+        )
+        refreshIncrementalWorkflowPostProcessing(forceRestart: true)
+        scheduleDeferredRecordingMetadataCapture(
+            sessionID: sessionID,
+            activeApp: activeApp,
+            forcedWorkflowId: forcedWorkflowId,
+            resolveURL: !websiteResolvedBeforeRecording
+        )
+
+        let totalStartMs = (CFAbsoluteTimeGetCurrent() - startTimestamp) * 1000
+        logger.info(
+            "Recording started: requestToAudioStartMs=\(Self.formatMilliseconds(requestToAudioStartMs), privacy: .public), audioStartMs=\(Self.formatMilliseconds(audioStartMs), privacy: .public), contextMs=\(String(format: "%.1f", contextMs), privacy: .public), totalStartMs=\(String(format: "%.1f", totalStartMs), privacy: .public)"
+        )
+    }
+
+    private func handleRecordingStartFailure(
+        _ error: Error,
+        sessionID: UUID,
+        resolvedInputSelection: ResolvedRecordingInputSelection
+    ) {
+        clearRecordingStartCueState()
+        clearDeferredRecordingContext()
+        endTargetAppAccessibilityObservation()
+        restoreRecordingSideEffects()
+        let errorMessage: String
+        if let recordingError = error as? AudioRecordingService.AudioRecordingError,
+           case .noMicrophoneDetected = recordingError {
+            errorMessage = String(localized: "No mic detected.")
+        } else if let recordingError = error as? AudioRecordingService.AudioRecordingError,
+                  case .selectedInputDeviceIncompatible(let issue) = recordingError {
+            audioDeviceService.markRecordingInputSelectionCompatibility(
+                .incompatible(issue),
+                selection: resolvedInputSelection
+            )
+            errorMessage = recordingError.localizedDescription
+        } else {
+            errorMessage = error.localizedDescription
+        }
+        accessibilityAnnouncementService.announceError(errorMessage)
+        failDictationSession(id: sessionID, error: errorMessage)
+        showError(errorMessage, category: "recording")
+        hotkeyService.cancelDictation()
+    }
+
+    private func scheduleDeferredRecordingMetadataCapture(
+        sessionID: UUID,
+        activeApp: (name: String?, bundleId: String?, url: String?),
+        forcedWorkflowId: UUID?,
+        resolveURL: Bool = true
+    ) {
+        let metadataStartTimestamp = CFAbsoluteTimeGetCurrent()
+
+        metadataCaptureTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let selectedText = textInsertionService.getSelectedText()
+            guard !Task.isCancelled else { return }
+            capturedSelectedText = selectedText
+            if let selectedText {
+                logger.info("Captured selected text (\(selectedText.count) chars)")
+            }
+
+            if let bundleId = activeApp.bundleId,
+               let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+                activeAppIcon = NSWorkspace.shared.icon(forFile: appURL.path)
+            } else {
+                activeAppIcon = nil
+            }
+
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - metadataStartTimestamp) * 1000
+            logger.info("Deferred recording metadata captured in \(String(format: "%.1f", elapsedMs), privacy: .public)ms")
+        }
+
+        // Resolve browser URL asynchronously after recording has already started.
+        // If a more specific URL workflow matches, update the active rule on the fly.
+        // Skip URL resolution when a forced workflow is set (manual shortcut overrides app matching).
+        guard resolveURL, forcedWorkflowId == nil, let bundleId = activeApp.bundleId else { return }
+        urlResolutionTask = Task { [weak self] in
+            guard let self else { return nil }
+            logger.info("URL resolution: starting for bundleId=\(bundleId)")
+            let resolvedURL = await textInsertionService.resolveBrowserURL(bundleId: bundleId)
+            logger.info("URL resolution: resolvedURL=\(resolvedURL ?? "nil"), state=\(String(describing: self.state))")
+            guard state == .recording || state == .processing else {
+                logger.info("URL resolution: skipped - state is \(String(describing: self.state))")
+                return resolvedURL
+            }
+            // Insertion may no longer wait for this lookup, so it can finish after a newer
+            // session started. Only the session that requested it may use the result.
+            guard activeDictationSessionID == sessionID else {
+                logger.info("URL resolution: skipped - session changed")
+                return resolvedURL
+            }
+            guard let currentApp = capturedActiveApp, currentApp.bundleId == bundleId else {
+                logger.info("URL resolution: skipped - bundleId mismatch")
+                return nil
+            }
+
+            capturedActiveApp = (name: currentApp.name, bundleId: currentApp.bundleId, url: resolvedURL)
+            let hiddenLiveSessionWasDeferred = hiddenLiveSessionAwaitsWebsiteWorkflow
+            hiddenLiveSessionAwaitsWebsiteWorkflow = false
+
+            guard let resolvedURL else {
+                logger.info("URL resolution: no URL resolved")
+                if hiddenLiveSessionWasDeferred, refreshLiveStreamingIfParamsChanged() {
+                    refreshIncrementalWorkflowPostProcessing(forceRestart: true)
+                }
+                return nil
+            }
+
+            if let workflowMatch = workflowService.matchWorkflow(bundleIdentifier: bundleId, url: resolvedURL) {
+                logger.info("URL resolution: matched workflow '\(workflowMatch.workflow.name)'")
+                applyWorkflowMatch(workflowMatch, activeApp: capturedActiveApp)
+                let restartedLiveStreaming = refreshLiveStreamingIfParamsChanged()
+                refreshIncrementalWorkflowPostProcessing(forceRestart: restartedLiveStreaming)
+                return resolvedURL
+            }
+
+            // The URL can change the resolved output format of the current workflow.
+            let startedDeferredLiveSession = hiddenLiveSessionWasDeferred
+                && refreshLiveStreamingIfParamsChanged()
+            refreshIncrementalWorkflowPostProcessing(forceRestart: startedDeferredLiveSession)
+            logger.info("URL resolution: no workflow matched for URL \(resolvedURL)")
+            return resolvedURL
+        }
+    }
+
+    private var effectiveLanguageSelection: LanguageSelection {
+        DictationLanguageResolver.resolve(
+            workflow: matchedWorkflow,
+            globalLanguageSelection: settingsViewModel.languageSelection
+        )
+    }
+
+    private var effectiveLanguage: String? {
+        effectiveLanguageSelection.requestedLanguage
+    }
+
+    private var effectiveTask: TranscriptionTask {
+        if selectionInstructionToken != nil { return .transcribe }
+        return settingsViewModel.selectedTask
+    }
+
+    private var effectiveTranslationTarget: String? {
+        if selectionInstructionToken != nil { return nil }
+        if settingsViewModel.translationEnabled {
+            return settingsViewModel.translationTargetLanguage
+        }
+        return nil
+    }
+
+    private var effectiveEngineOverrideId: String? {
+        DictationTranscriptionOverrideResolver.engineId(for: matchedWorkflow)
+    }
+
+    private var effectiveCloudModelOverride: String? {
+        DictationTranscriptionOverrideResolver.modelId(for: matchedWorkflow)
+    }
+
+    private var effectiveMicrophoneBoostEnabled: Bool {
+        microphoneBoostEnabled(for: matchedWorkflow)
+    }
+
+    private var effectiveRuleName: String? {
+        matchedWorkflow?.name
+    }
+
+    private var effectiveOutputFormat: String? {
+        matchedWorkflow?.output.format
+    }
+
+    private func resolvedEffectiveOutputFormat(
+        for activeApp: (name: String?, bundleId: String?, url: String?)
+    ) -> String? {
+        let storedFormat = effectiveOutputFormat
+        let resolvedFormat = WorkflowOutputFormatResolver.resolvedFormat(
+            storedFormat: storedFormat,
+            bundleIdentifier: activeApp.bundleId,
+            url: activeApp.url
+        )
+        if storedFormat != nil {
+            logger.info(
+                "Workflow output format resolved: stored=\(storedFormat ?? "nil", privacy: .public), resolved=\(resolvedFormat ?? "nil", privacy: .public), bundle=\(activeApp.bundleId ?? "nil", privacy: .public), url=\(activeApp.url ?? "nil", privacy: .public)"
+            )
+        }
+        return resolvedFormat
+    }
+
+    /// Whether anything before insertion can depend on the browser URL: website triggers can
+    /// change the matched workflow (language, engine, prompt, output, auto-enter, action),
+    /// automatic output formats resolve by URL, and action and post-processor plugins receive it.
+    /// Waits for the website workflow, then sends the finished recording through the
+    /// resolved engine's live session if that engine streams dictation. Returns nil when
+    /// batch transcription should handle the recording instead.
+    private func transcribeRecordingThroughDeferredLiveSession(_ samples: [Float]) async -> TranscriptionResult? {
+        if let pendingURLResolution = urlResolutionTask {
+            _ = await pendingURLResolution.value
+        }
+        guard !Task.isCancelled else { return nil }
+        let previewRequested = indicatorTranscriptPreviewEnabled
+            || liveFieldTranscriptEnabled
+            || externalStreamingDisplayCount > 0
+        let engineOverrideId = effectiveEngineOverrideId
+        let providerId = modelManager.selectedProviderId
+        guard !previewRequested,
+              modelManager.prefersLiveSessionForDictation(
+                engineOverrideId: engineOverrideId,
+                selectedProviderId: providerId
+              ) else {
+            return nil
+        }
+        let dictionaryProviderId = engineOverrideId ?? providerId
+        let streamPrompt = dictionaryService.getTermsForPrompt(providerId: dictionaryProviderId) ?? ""
+        let dictionaryTermHints = dictionaryService.getTermHints(providerId: dictionaryProviderId)
+        let languageSelection = effectiveLanguageSelection
+        let task = effectiveTask
+        let cloudModelOverride = effectiveCloudModelOverride
+        let normalizeNumbers = effectiveNumberNormalizationOverride
+        let replay: @MainActor () async throws -> TranscriptionResult? = { [streamingHandler] in
+            await streamingHandler.transcribeRecordingThroughLiveSession(
+                samples,
+                streamPrompt: streamPrompt,
+                dictionaryTermHints: dictionaryTermHints,
+                engineOverrideId: engineOverrideId,
+                languageSelection: languageSelection,
+                task: task,
+                cloudModelOverride: cloudModelOverride,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+        // A stalled provider must not hold the stop path; on expiry the replay is
+        // cancelled and batch transcription takes over with its own deadline.
+        let audioDuration = Double(samples.count) / AudioRecordingService.targetSampleRate
+        guard let deadline = transcriptionDeadlineProvider(audioDuration), deadline > 0 else {
+            return try? await replay()
+        }
+        do {
+            return try await runWithDeadline(deadline, operationName: "Live replay", replay)
+        } catch {
+            logger.warning("Live replay did not finish, using batch transcription: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    private func hasApplicableWebsiteWorkflow(bundleIdentifier: String?) -> Bool {
+        workflowService.workflows.contains { workflow in
+            guard workflow.isEnabled,
+                  let trigger = workflow.trigger,
+                  !trigger.websitePatterns.isEmpty else {
+                return false
+            }
+            return trigger.appBundleIdentifiers.isEmpty
+                || trigger.appBundleIdentifiers.contains(bundleIdentifier ?? "")
+        }
+    }
+
+    private func browserURLRequiredBeforeInsertion(bundleIdentifier: String?) -> Bool {
+        !IntentTextPipeline.rules().filter { !$0.host.isEmpty }.isEmpty
+            || hasApplicableWebsiteWorkflow(bundleIdentifier: bundleIdentifier)
+            || WorkflowOutputFormatResolver.isAutomaticFormat(effectiveOutputFormat)
+            || effectiveActionPluginId != nil
+            || PluginManager.shared?.postProcessors.isEmpty == false
+    }
+
+    private var shouldTrackTargetAppCorrectionLearning: Bool {
+        if TargetAppCorrectionLearningService.isPrivateBuild {
+            return !kiviRecordingWasPrivate && UserDefaults.standard.bool(forKey: TargetAppCorrectionLearningService.localEnabledKey)
+
+        }
+        return (licenseService?.hasCommercialLicense ?? false) &&
+            UserDefaults.standard.bool(forKey: UserDefaultsKeys.targetAppCorrectionLearningEnabled)
+    }
+
+    private var effectiveNumberNormalizationOverride: Bool? {
+        matchedWorkflow?.output.numberNormalizationMode.overrideValue
+    }
+
+    private var effectiveActionPluginId: String? {
+        matchedWorkflow?.output.targetActionPluginId
+    }
+
+    private var effectiveAutoEnterMode: WorkflowAutoEnterMode {
+        if selectionInstructionToken != nil { return .never }
+        return matchedWorkflow?.output.autoEnterMode ?? .never
+    }
+
+    private var requiresVisiblePostProcessingPhase: Bool {
+        effectiveTranslationTarget != nil
+            || matchedWorkflow?.isManuallyRunnable == true
+            || effectiveOutputFormat != nil
+            || effectiveActionPluginId != nil
+            || !PluginManager.shared.postProcessors.isEmpty
+    }
+
+    private func updateSubmitOnEnterAvailability() {
+        hotkeyService.submitOnEnterSessionID = state == .recording && effectiveAutoEnterMode == .duringDictation
+            ? activeDictationSessionID : nil
+        submitAvailabilityMonitor?.cancel()
+        submitAvailabilityMonitor = nil
+        guard let sessionID = hotkeyService.submitOnEnterSessionID else { return }
+        // Secure Input and event-tap loss can happen without delivering a key event.
+        submitAvailabilityMonitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(100))
+                } catch {
+                    return
+                }
+                guard let self, self.activeDictationSessionID == sessionID,
+                      self.state == .recording, self.effectiveAutoEnterMode == .duringDictation else { return }
+                guard self.ensureSubmitKeySuppressionAvailable() else { return }
+            }
+        }
+    }
+
+    private func ensureSubmitKeySuppressionAvailable() -> Bool {
+        guard effectiveAutoEnterMode == .duringDictation, !hotkeyService.canSuppressExternalKeyEvents else { return true }
+        let message = localizedAppText(
+            "Enter submission is unavailable. Check Accessibility access and restart TypeWhisper, or choose another Enter option.",
+            de: "Absenden mit Enter ist nicht verfügbar. Prüfe die Bedienungshilfen und starte TypeWhisper neu oder wähle eine andere Enter-Option."
+        )
+        abortActiveRecordingImmediately(sessionMessage: message)
+        showError(message, category: "recording")
+        return false
+    }
+
+    private func stopDictation(submitRequested: Bool = false) {
+        if state == .processing, recordingStartTask != nil, !isStopInFlight {
+            cancelCurrentOperation()
+            return
+        }
+        guard state == .recording, !isStopInFlight else { return }
+        clearCancelWarning()
+        if recordingStartTask != nil, !isRecordingInputReady {
+            let cancelledMessage = String(localized: "Cancelled")
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            finishCancellation(message: cancelledMessage)
+            return
+        }
+        isStopInFlight = true
+        let canKeepFinalLiveInsertionQuiet = streamingHandler.hasActiveLiveTranscriptionSession
+            && !requiresVisiblePostProcessingPhase
+        // Stopped before the browser URL resolved: the hidden live session never started.
+        // Captured here because the URL task may clear the marker before finalization runs.
+        let hiddenLiveSessionWasDeferred = hiddenLiveSessionAwaitsWebsiteWorkflow && lastStreamingParams == nil
+        state = .processing
+        processingPhase = canKeepFinalLiveInsertionQuiet
+            ? nil
+            : String(localized: "Processing...")
+        markActiveDictationSessionProcessingIfNeeded()
+        stopFinalizationTask = Task { [weak self] in
+            guard let self else { return }
+            await finalizeStopDictation(
+                submitRequested: submitRequested,
+                hiddenLiveSessionWasDeferred: hiddenLiveSessionWasDeferred
+            )
+        }
+    }
+
+    private func finalizeStopDictation(submitRequested: Bool, hiddenLiveSessionWasDeferred: Bool) async {
+        var didStartTranscriptionTask = false
+        defer {
+            if Task.isCancelled {
+                isStopInFlight = false
+            }
+            if !didStartTranscriptionTask {
+                endTargetAppAccessibilityObservation()
+                cancelIncrementalWorkflowPostProcessing()
+            }
+            stopFinalizationTask = nil
+        }
+        let sessionID = activeDictationSessionID
+
+        clearRecordingStartCueState(resetReadiness: false)
+        if let discardMessage = pendingPushToTalkDiscardMessage {
+            pendingPushToTalkDiscardMessage = nil
+            cancelLiveFieldTranscriptSession()
+            streamingHandler.stop()
+            lastStreamingParams = nil
+            stopRecordingTimer()
+            _ = await audioRecordingService.stopRecording(
+                policy: .immediate,
+                bluetoothBehavior: bluetoothStopBehavior
+            )
+            restoreRecordingSideEffects()
+            audioRecordingService.discardActiveRecoveryRecording()
+            guard !Task.isCancelled else { return }
+            if let sessionID {
+                failDictationSession(id: sessionID, error: discardMessage)
+            }
+            showNotchFeedback(
+                message: discardMessage,
+                icon: "xmark.circle",
+                duration: 1.8
+            )
+            return
+        }
+
+        let stopStart = CFAbsoluteTimeGetCurrent()
+        func stopElapsedMs() -> String { String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - stopStart) * 1000) }
+
+        let streamingParams = lastStreamingParams
+        lastStreamingParams = nil
+        let previewFollowedDictationEngine = lastPreviewFollowsDictationEngine
+        lastPreviewFollowsDictationEngine = true
+        let streamingPreviewWasHidden = lastStreamingPreviewHidden || hiddenLiveSessionWasDeferred
+        lastStreamingPreviewHidden = false
+        stopRecordingTimer()
+        let previewText = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stopPolicy = AudioRecordingService.StopPolicy.finalizeShortSpeech()
+        var samples = await audioRecordingService.stopRecording(
+            policy: stopPolicy,
+            bluetoothBehavior: bluetoothStopBehavior
+        )
+        restoreRecordingSideEffects()
+        guard !Task.isCancelled else { return }
+        logger.info("Stop timing: stopRecording done elapsedMs=\(stopElapsedMs(), privacy: .public), previewTextLength=\(previewText.count, privacy: .public)")
+        let liveSessionResultBeforePreviewFallback: TranscriptionResult?
+        if hiddenLiveSessionWasDeferred,
+           let replayedResult = await transcribeRecordingThroughDeferredLiveSession(samples) {
+            liveSessionResultBeforePreviewFallback = replayedResult
+        } else if previewFollowedDictationEngine {
+            liveSessionResultBeforePreviewFallback = await streamingHandler.finish(finalSamples: samples)
+        } else {
+            // The live session ran on a preview-only engine; its text is display-only
+            // and the final transcription comes from the dictation engine below. Don't
+            // await the preview's (possibly network-bound) finalization — cancel it.
+            streamingHandler.stop()
+            liveSessionResultBeforePreviewFallback = nil
+        }
+        guard !Task.isCancelled else { return }
+        logger.info("Stop timing: streamingHandler.finish done elapsedMs=\(stopElapsedMs(), privacy: .public), resultTextLength=\(liveSessionResultBeforePreviewFallback?.text.count ?? -1, privacy: .public)")
+        var liveSessionResult = liveSessionResultBeforePreviewFallback.map {
+            StreamingHandler.resultPreferringStablePreviewIfNeeded($0, stablePreview: previewText)
+        }
+        let hasPreviewText = !previewText.isEmpty
+
+        if !partialText.isEmpty {
+            let elapsed = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+            EventBus.shared.emit(.partialTranscriptionUpdate(PartialTranscriptionPayload(
+                text: partialText,
+                isFinal: true,
+                elapsedSeconds: elapsed
+            )))
+        }
+
+        let peakLevel = audioRecordingService.peakRawAudioLevel
+        let rawDuration = Double(samples.count) / AudioRecordingService.targetSampleRate
+        if previewFollowedDictationEngine,
+           !streamingPreviewWasHidden,
+           !hasConfirmedTranscriptionResultText(liveSessionResult),
+           let previewResult = stableLivePreviewFallbackResult(
+            previewText: previewText,
+            streamingParams: streamingParams,
+            duration: rawDuration
+           ) {
+            liveSessionResult = previewResult
+        }
+        // Text from a distinct preview engine or a hidden live session never becomes
+        // the final result on its own, but its having recognized speech still counts
+        // for the discard-quiet-clip gating — otherwise valid quiet speech would be
+        // discarded before the dictation engine gets to transcribe it.
+        let previewEngineConfirmedSpeech = (!previewFollowedDictationEngine || streamingPreviewWasHidden)
+            && StreamingHandler.isSubstantiveStablePreview(
+                previewText.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        let hasConfirmedText = hasConfirmedTranscriptionResultText(liveSessionResult)
+            || previewEngineConfirmedSpeech
+        let decision = classifyShortSpeech(
+            rawDuration: rawDuration,
+            peakLevel: peakLevel,
+            hasConfirmedText: hasConfirmedText,
+            transcribeShortQuietClipsAggressively: transcribeShortQuietClipsAggressively
+        )
+        let graceApplied = audioRecordingService.lastStopGraceCaptureApplied
+
+        logger.info(
+            "Stop finalized: rawDuration=\(String(format: "%.3f", rawDuration), privacy: .public)s, bufferedSamples=\(samples.count), peakLevel=\(String(format: "%.4f", peakLevel), privacy: .public), hasPreviewText=\(hasPreviewText, privacy: .public), previewTextLength=\(previewText.count, privacy: .public), hasConfirmedText=\(hasConfirmedText, privacy: .public), stopPolicy=\(stopPolicy.logDescription, privacy: .public), graceApplied=\(graceApplied, privacy: .public), decision=\(decision.logDescription, privacy: .public)"
+        )
+
+        switch decision {
+        case .discardTooShort:
+            cancelLiveFieldTranscriptSession()
+            audioRecordingService.discardActiveRecoveryRecording()
+            let errorMessage = String(localized: "Too short, hold the hotkey a bit longer")
+            if let sessionID {
+                failDictationSession(id: sessionID, error: errorMessage)
+            }
+            showNotchFeedback(
+                message: errorMessage,
+                icon: "waveform.badge.exclamationmark",
+                duration: 1.8
+            )
+            return
+        case .discardNoSpeech:
+            cancelLiveFieldTranscriptSession()
+            audioRecordingService.discardActiveRecoveryRecording()
+            logger.info("Peak level too low (\(String(format: "%.4f", peakLevel))) - no speech detected")
+            let errorMessage = String(localized: "No speech detected")
+            if let sessionID {
+                failDictationSession(id: sessionID, error: errorMessage)
+            }
+            showNotchFeedback(
+                message: errorMessage,
+                icon: "mic.slash",
+                duration: 8.0,
+                noSpeech: true
+            )
+            soundService.playNoSpeech(enabled: soundFeedbackEnabled)
+            return
+        case .transcribe:
+            break
+        }
+
+        samples = paddedSamplesForFinalTranscription(samples, rawDuration: rawDuration)
+
+        let saveAudio = UserDefaults.standard.bool(forKey: UserDefaultsKeys.saveAudioWithHistory)
+        let audioSamplesForHistory: [Float]? = saveAudio ? samples : nil
+
+        let audioDuration = Double(samples.count) / AudioRecordingService.targetSampleRate
+        EventBus.shared.emit(.recordingStopped(RecordingStoppedPayload(
+            durationSeconds: audioDuration
+        )))
+
+        processingPhase = if liveSessionResult == nil {
+            String(localized: "Transcribing...")
+        } else if requiresVisiblePostProcessingPhase {
+            String(localized: "Processing...")
+        } else {
+            nil
+        }
+
+        guard !Task.isCancelled else { return }
+        let usedLiveSessionResult = liveSessionResult != nil
+        let accessibilityObservationLease = targetAppAccessibilityObservationLease
+        // Incremental results are only valid for a final text from the same live session.
+        let incrementalPostProcessing = usedLiveSessionResult ? incrementalWorkflowPostProcessing : nil
+        if !usedLiveSessionResult {
+            incrementalWorkflowPostProcessing?.cancel()
+        }
+        incrementalWorkflowPostProcessing = nil
+        let instructionToken = selectionInstructionToken
+        transcriptionTask = Task {
+            var didTransferAccessibilityObservationLease = false
+            defer {
+                if !didTransferAccessibilityObservationLease {
+                    finishTargetAppAccessibilityObservation(
+                        accessibilityObservationLease
+                    )
+                }
+                incrementalPostProcessing?.cancel()
+            }
+            do {
+                // Only wait for browser URL resolution when something before insertion depends
+                // on the URL. Otherwise history metadata picks it up after insertion.
+                let pendingURLResolution = urlResolutionTask
+                if let pendingURLResolution {
+                    if browserURLRequiredBeforeInsertion(bundleIdentifier: capturedActiveApp?.bundleId) {
+                        _ = await pendingURLResolution.value
+                        logger.info("Stop timing: urlResolutionTask done elapsedMs=\(stopElapsedMs(), privacy: .public)")
+                    } else {
+                        logger.info("Stop timing: urlResolutionTask not needed before insertion elapsedMs=\(stopElapsedMs(), privacy: .public)")
+                    }
+                }
+
+                let activeApp = capturedActiveApp ?? textInsertionService.captureActiveApp()
+                let resolvedOutputFormat = self.resolvedEffectiveOutputFormat(for: activeApp)
+                let languageSelection = effectiveLanguageSelection
+                let language = languageSelection.requestedLanguage
+                let languageCandidates = languageSelection.selectedCodes
+                let task = effectiveTask
+                let engineOverride = effectiveEngineOverrideId
+                let cloudModelOverride = effectiveCloudModelOverride
+                let translationTarget = effectiveTranslationTarget
+                let primaryEngineId = engineOverride ?? modelManager.selectedProviderId
+                let dictionaryProviderId = primaryEngineId
+                let termsPrompt = dictionaryService.getTermsForPrompt(providerId: dictionaryProviderId)
+                let termHints = dictionaryService.getTermHints(providerId: dictionaryProviderId)
+
+                let transcription = if let liveSessionResult {
+                    FinalTranscriptionOutput(
+                        result: liveSessionResult,
+                        modelId: modelManager.resolvedModelId(
+                            engineOverrideId: engineOverride,
+                            cloudModelOverride: cloudModelOverride
+                        ),
+                        modelDisplayName: modelManager.resolvedModelDisplayName(
+                            engineOverrideId: engineOverride,
+                            cloudModelOverride: cloudModelOverride
+                        ),
+                        usedRecoveryFallback: false
+                    )
+                } else {
+                    try await transcribeFinalAudio(
+                        audioSamples: samples,
+                        languageSelection: languageSelection,
+                        task: task,
+                        primaryEngineId: primaryEngineId,
+                        primaryCloudModelOverride: cloudModelOverride,
+                        prompt: termsPrompt,
+                        dictionaryTermHints: termHints,
+                        normalizeNumbers: effectiveNumberNormalizationOverride
+                    )
+                }
+                let result = transcription.result
+                let diagnostics = result.diagnosticSummary(audioDuration: audioDuration)
+                logger.info("Stop timing: final transcription ready elapsedMs=\(stopElapsedMs(), privacy: .public), usedLiveResult=\(usedLiveSessionResult, privacy: .public), engine=\(result.engineUsed, privacy: .public), model=\(transcription.modelId ?? "unknown", privacy: .public), usedRecoveryFallback=\(transcription.usedRecoveryFallback, privacy: .public), primaryPromptChars=\(termsPrompt?.count ?? 0, privacy: .public), \(diagnostics, privacy: .public)")
+
+                // Bail out if a new recording started while we were transcribing
+                guard !Task.isCancelled else { return }
+
+                var text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let instructionToken {
+                    // This route ends here, before cleanup, plugins, submit commands,
+                    // insertion, history events, or any external action dispatch.
+                    self.selectionInstructionToken = nil
+                    cancelLiveFieldTranscriptSession()
+                    pinnedInsertionTarget = nil
+                    audioRecordingService.discardActiveRecoveryRecording()
+                    IntentSelectionEditor.shared.acceptSpokenInstruction(text, token: instructionToken)
+                    if let sessionID {
+                        completeDictationSession(id: sessionID, transcription: DictationSessionTranscription(
+                            text: text, rawText: result.text, timestamp: Date(), appName: activeApp.name,
+                            appBundleIdentifier: activeApp.bundleId, appURL: activeApp.url, duration: audioDuration,
+                            language: result.detectedLanguage ?? language, engine: result.engineUsed,
+                            model: transcription.modelDisplayName, wordsCount: text.split(whereSeparator: \.isWhitespace).count))
+                    }
+                    state = .inserting
+                    scheduleInsertingReset(after: .milliseconds(100))
+                    self.transcriptionTask = nil
+                    return
+                }
+                guard !text.isEmpty else {
+                    handleLiveFieldTranscriptionFailure(stablePreviewText: previewText)
+                    logger.info("Transcription returned empty text (duration: \(String(format: "%.2f", result.duration))s, engine: \(result.engineUsed))")
+                    let recoveryPreservation = audioRecordingService
+                        .preserveActiveRecoveryRecordingResult()
+                    let errorMessage = String(localized: "No speech recognized")
+                    if let sessionID {
+                        failDictationSession(id: sessionID, error: errorMessage)
+                    }
+                    showRecoveryAwareFeedback(
+                        message: errorMessage,
+                        icon: "text.magnifyingglass",
+                        duration: 2.0,
+                        recoveryPreservation: recoveryPreservation,
+                        noSpeech: true
+                    )
+                    soundService.playNoSpeech(enabled: soundFeedbackEnabled)
+                    return
+                }
+
+                let ordinaryIntentRoute = self.effectiveActionPluginId == nil && resolvedOutputFormat == nil
+                    && translationTarget == nil && self.matchedWorkflow == nil
+                let intentStyle = IntentTextPipeline.style(bundleID: activeApp.bundleId, url: activeApp.url)
+                let literalIntentRoute = ordinaryIntentRoute && intentStyle == .literal
+                var cleanupObservation: TextInsertionService.FocusedTextObservation?
+                var cleanupTargetBundle: String?
+                var cleanupAttempted = false
+                var intentSteps: [String] = []
+                var intentCorrectionIDs = Set<UUID>()
+                if ordinaryIntentRoute {
+                    cleanupObservation = textInsertionService.captureFocusedTextObservation()
+                    cleanupTargetBundle = textInsertionService.captureActiveApp().bundleId
+                    let processed = try await IntentDictationProcessor.process(text, style: intentStyle, dictionary: dictionaryService)
+                    try Task.checkCancellation()
+                    text = processed.text
+                    cleanupAttempted = processed.usedAPI
+                    intentSteps = processed.steps + ["Style: \(intentStyle.title)"]
+                    intentCorrectionIDs = processed.correctionIDs
+                    if intentStyle != .literal {
+                        let styled = await KiviStyleRouter.process(text, appName: activeApp.name, bundleID: activeApp.bundleId, protectedTerms: dictionaryService.vocabularyForPrompt(limit: .max))
+                        try Task.checkCancellation()
+                        text = styled.text
+                        if let step = styled.step { intentSteps.append(step) }
+                    }
+                }
+
+                let actionPluginId = self.effectiveActionPluginId
+                // An accepted physical submit survives a later browser URL workflow match.
+                let autoEnterMode: WorkflowAutoEnterMode = literalIntentRoute ? .never : (submitRequested ? .duringDictation : self.effectiveAutoEnterMode)
+                let autoEnterResolution = WorkflowAutoEnterResolver.resolve(
+                    text: text,
+                    mode: autoEnterMode,
+                    submitRequested: submitRequested
+                )
+                text = autoEnterResolution.text
+                if autoEnterMode == .spokenCommand, autoEnterResolution.shouldPressEnter {
+                    logger.info("Detected terminal spoken Enter command")
+                }
+
+                let llmHandler = buildLLMHandler(
+                    translationTarget: translationTarget,
+                    detectedLanguage: result.detectedLanguage,
+                    configuredLanguage: language,
+                    resolvedOutputFormat: resolvedOutputFormat,
+                    incrementalPostProcessing: incrementalPostProcessing,
+                    stopTimingStart: stopStart
+                )
+
+                guard !Task.isCancelled else { return }
+
+                // Post-processing pipeline (priority-based)
+                let llmStepName: String? = if llmHandler != nil {
+                    if self.matchedWorkflow != nil {
+                        "Workflow"
+                    } else {
+                        "Translation"
+                    }
+                } else {
+                    nil
+                }
+                self.processingPhase = self.requiresVisiblePostProcessingPhase
+                    ? String(localized: "Processing...")
+                    : nil
+                await metadataCaptureTask?.value
+                let ppContext = PostProcessingContext(
+                    appName: activeApp.name,
+                    bundleIdentifier: activeApp.bundleId,
+                    url: activeApp.url,
+                    language: language,
+                    ruleName: self.effectiveRuleName,
+                    selectedText: self.capturedSelectedText
+                )
+                let dictationContext = DictationRuntimeContext(
+                    engineId: result.engineUsed,
+                    modelId: transcription.modelId,
+                    configuredLanguage: language,
+                    configuredLanguageCandidates: languageCandidates,
+                    detectedLanguage: result.detectedLanguage
+                )
+                let ppResult = literalIntentRoute ? PostProcessingResult(text: text, appliedSteps: [], fallback: nil) : try await postProcessingPipeline.process(
+                    text: text, context: ppContext, dictationContext: dictationContext, llmHandler: llmHandler,
+                    outputFormat: resolvedOutputFormat,
+                    llmStepName: llmStepName,
+                    normalizeNumbers: self.effectiveNumberNormalizationOverride,
+                    llmFailureFallbackText: actionPluginId == nil ? text : nil,
+                    // Snippet and correction usage counters are saved after insertion.
+                    deferUsageCountSaves: true,
+                    preprocessedCorrectionIDs: intentCorrectionIDs
+                )
+                try Task.checkCancellation()
+                text = ppResult.text
+                let postProcessingFallback = ppResult.fallback
+                if let postProcessingFallback {
+                    errorLogService.addEntry(
+                        message: localizedAppText(
+                            "\(postProcessingFallback.failedStep) post-processing failed. Raw transcription fallback selected. \(postProcessingFallback.reason)",
+                            de: "\(postProcessingFallback.failedStep)-Nachbearbeitung fehlgeschlagen. Rohtext-Fallback ausgewählt. \(postProcessingFallback.reason)"
+                        ),
+                        category: "prompt"
+                    )
+                }
+                let shouldAutoEnterAfterInsertion = actionPluginId == nil
+                    && WorkflowAutoEnterResolver.shouldPressEnterAfterInsertion(
+                        mode: autoEnterMode,
+                        resolution: autoEnterResolution,
+                        insertedText: text,
+                        usedRawTranscriptionFallback: postProcessingFallback != nil
+                    )
+                logger.info("Stop timing: post-processing done elapsedMs=\(stopElapsedMs(), privacy: .public)")
+                let transcriptionID = sessionID ?? UUID()
+                let completionTimestamp = Date()
+                recentTranscriptionStore.recordTranscription(
+                    id: transcriptionID,
+                    finalText: text,
+                    timestamp: completionTimestamp,
+                    appName: activeApp.name,
+                    appBundleIdentifier: activeApp.bundleId
+                )
+
+                partialText = ""
+                var insertedTextForCorrectionTracking: String?
+                var targetAppCorrectionBaseline: TextInsertionService.FocusedTextObservation?
+                let modelDisplayName = transcription.modelDisplayName
+                var pipelineSteps = ppResult.appliedSteps + intentSteps
+                if postProcessingFallback != nil {
+                    pipelineSteps.append(localizedAppText("Raw transcription fallback", de: "Rohtext-Fallback"))
+                }
+                if transcription.usedRecoveryFallback {
+                    pipelineSteps.append(localizedAppText("Recovery fallback", de: "Recovery-Fallback"))
+                }
+
+                // Route to action plugin or insert text
+                if let actionPluginId,
+                   let actionPlugin = PluginManager.shared.actionPlugin(for: actionPluginId) {
+                    cancelLiveFieldTranscriptSession()
+                    try await executeActionPlugin(
+                        actionPlugin, pluginId: actionPluginId, text: text,
+                        activeApp: activeApp, language: language, originalText: result.text
+                    )
+                    pinnedInsertionTarget = nil
+                } else {
+                    let contextualInsertionEnabled = DictationInsertionTextFormatter.contextualInsertionEnabled()
+                    let insertionContext: TextInsertionService.InsertionContext? = if contextualInsertionEnabled {
+                        liveFieldTranscriptSession?.originalInsertionContext
+                            ?? pinnedInsertionTarget?.originalInsertionContext
+                            ?? textInsertionService.captureInsertionContext()
+                    } else {
+                        nil
+                    }
+                    let insertionText = literalIntentRoute ? text : DictationInsertionTextFormatter.textForInsertion(
+                        text,
+                        insertionContext: insertionContext,
+                        contextualInsertionEnabled: contextualInsertionEnabled,
+                        standaloneValueFinalPeriodCleanupEnabled: DictationInsertionTextFormatter
+                            .standaloneValueFinalPeriodCleanupEnabled()
+                    )
+                    let shouldObservePostInsertionEdits = (
+                        shouldTrackTargetAppCorrectionLearning
+                            || improveTypeWhisperCaptureEnabled
+                    ) && resolvedOutputFormat == nil && !literalIntentRoute
+                    var didInsertText = false
+                    var shouldUseNormalInsertion = true
+                    if cleanupAttempted {
+                        let current = cleanupObservation.flatMap { textInsertionService.recaptureFocusedTextObservation(matching: $0) }
+                        let fieldChanged = cleanupObservation.map { previous in
+                            current == nil || current?.value != previous.value || current?.selectedRange != previous.selectedRange
+                        } ?? false
+                        if fieldChanged || cleanupTargetBundle != activeApp.bundleId
+                            || textInsertionService.captureActiveApp().bundleId != cleanupTargetBundle {
+                            shouldUseNormalInsertion = false
+                            cancelLiveFieldTranscriptSession()
+                            pinnedInsertionTarget = nil
+                            showLiveFieldRecoveryFeedback()
+                        }
+                    }
+                    var insertionResult: TextInsertionService.InsertionResult?
+
+                    if resolvedOutputFormat == nil,
+                       liveFieldTranscriptSession != nil,
+                       let pinnedInsertionTarget,
+                       !textInsertionService.pinnedInsertionTargetIsFocused(pinnedInsertionTarget) {
+                        shouldUseNormalInsertion = await textInsertionService
+                            .focusPinnedInsertionTarget(pinnedInsertionTarget)
+                        if !shouldUseNormalInsertion {
+                            showLiveFieldRecoveryFeedback()
+                            cancelLiveFieldTranscriptSession()
+                        }
+                    }
+
+                    if shouldUseNormalInsertion,
+                       resolvedOutputFormat == nil,
+                       let liveFieldTranscriptSession {
+                        switch liveFieldTranscriptSession.finalize(with: insertionText) {
+                        case .applied(let finalObservation):
+                            shouldUseNormalInsertion = false
+                            didInsertText = true
+                            targetAppCorrectionBaseline = shouldObservePostInsertionEdits && !TargetAppCorrectionLearningService.isPrivateBuild
+                                ? finalObservation
+                                : nil
+                            insertedTextForCorrectionTracking = insertionText
+                            if shouldAutoEnterAfterInsertion {
+                                if liveFieldTranscriptSession.targetIsCurrentlyFocused {
+                                    try? await Task.sleep(for: .milliseconds(50))
+                                    if liveFieldTranscriptSession.targetIsCurrentlyFocused {
+                                        textInsertionService.simulateReturn()
+                                    }
+                                } else {
+                                    logger.info(
+                                        "Skipping Auto Enter because the pinned live-field target is no longer focused"
+                                    )
+                                }
+                            }
+                        case .detached(let hadAttemptedMutation, let allowsFocusedFallback):
+                            shouldUseNormalInsertion = !hadAttemptedMutation
+                                && (allowsFocusedFallback || pinnedInsertionTarget != nil)
+                            if !shouldUseNormalInsertion {
+                                showLiveFieldRecoveryFeedback()
+                            }
+                        }
+                        self.liveFieldTranscriptSession = nil
+                    } else if liveFieldTranscriptSession != nil {
+                        shouldUseNormalInsertion = prepareLiveFieldSessionForNormalInsertion()
+                    }
+
+                    if shouldUseNormalInsertion,
+                       let pinnedInsertionTarget,
+                       !textInsertionService.pinnedInsertionTargetIsFocused(pinnedInsertionTarget) {
+                        shouldUseNormalInsertion = await textInsertionService
+                            .focusPinnedInsertionTarget(pinnedInsertionTarget)
+                        if !shouldUseNormalInsertion {
+                            showLiveFieldRecoveryFeedback()
+                        }
+                    }
+
+                    if shouldUseNormalInsertion {
+                        let learningPreInsertionObservation = shouldObservePostInsertionEdits
+                            ? textInsertionService.captureFocusedTextObservation()
+                            : nil
+                        // Correction learning recaptures the field after insertion, so it
+                        // needs the paste to have landed before insertText returns.
+                        insertionResult = try await textInsertionService.insertText(
+                            insertionText,
+                            preserveClipboard: preserveClipboard,
+                            autoEnter: shouldAutoEnterAfterInsertion,
+                            outputFormat: resolvedOutputFormat,
+                            awaitPasteVerification: learningPreInsertionObservation != nil
+                        )
+                        if case .pasted(.unverified(let reason))? = insertionResult {
+                            logger.info(
+                                "Text insertion paste could not be verified; continuing with clipboard paste fallback. reason=\(reason.rawValue, privacy: .public), app=\(activeApp.bundleId ?? "nil", privacy: .public)"
+                            )
+                        }
+                        targetAppCorrectionBaseline = learningPreInsertionObservation.flatMap {
+                            textInsertionService.recaptureFocusedTextObservation(matching: $0)
+                        }
+                        if TargetAppCorrectionLearningService.isPrivateBuild {
+                            let verifiedResult: Bool
+                            switch insertionResult {
+                            case .insertedViaAccessibility?, .pasted(.verified)?: verifiedResult = true
+                            default: verifiedResult = false
+                            }
+                            targetAppCorrectionBaseline = verifiedResult
+                                ? TargetAppCorrectionLearningService.verifiedInsertionObservation(
+                                    insertedText: insertionText, before: learningPreInsertionObservation, after: targetAppCorrectionBaseline)
+                                : nil
+                        }
+                        insertedTextForCorrectionTracking = insertionText
+                        didInsertText = true
+                    }
+                    self.pinnedInsertionTarget = nil
+
+                    if didInsertText {
+                        dictionaryService.recordUsage(ofCorrectionIDs: intentCorrectionIDs, deferUsageCountSave: true)
+                        lastSuccessfulDictationInsertion = DictationInsertionCompletion(
+                            id: transcriptionID,
+                            providerId: result.engineUsed,
+                            modelId: transcription.modelId
+                        )
+                        logger.info("Stop timing: text inserted elapsedMs=\(stopElapsedMs(), privacy: .public)")
+                        EventBus.shared.emit(.textInserted(TextInsertedPayload(
+                            text: insertionText,
+                            appName: activeApp.name,
+                            bundleIdentifier: activeApp.bundleId
+                        )))
+                        // Action-plugin runs never insert text and are out of scope for
+                        // undo/restore (issue #999). A snapshot is only recorded when the
+                        // insertion is verifiable: formatted output may transform the
+                        // text, and unverified or unawaited pastes may not have landed
+                        // yet, so neither can back a safe snapshot. The live-field
+                        // finalize path produces no insertionResult and applies the text
+                        // directly, which is verifiable.
+                        let insertionIsVerifiable: Bool
+                        if actionPluginId != nil || resolvedOutputFormat != nil {
+                            insertionIsVerifiable = false
+                        } else if let insertionResult {
+                            switch insertionResult {
+                            case .insertedViaAccessibility, .pasted(.verified):
+                                insertionIsVerifiable = true
+                            case .pasted(.unverified), .pasted(.notAwaited):
+                                insertionIsVerifiable = false
+                            }
+                        } else {
+                            insertionIsVerifiable = true
+                        }
+                        if insertionIsVerifiable {
+                            dictationUndoService.recordSnapshot(
+                                rawTranscript: result.text,
+                                insertedText: insertionText,
+                                transcriptionID: transcriptionID
+                            )
+                        }
+                    }
+                }
+
+                if let insertedTextForCorrectionTracking {
+                    let contributionContext: CorrectionContributionContext? = improveTypeWhisperCaptureEnabled
+                        ? CorrectionContributionContext(
+                            language: result.detectedLanguage ?? language,
+                            engineId: result.engineUsed,
+                            modelId: transcription.modelId
+                        )
+                        : nil
+                    didTransferAccessibilityObservationLease = startTargetAppCorrectionLearningIfNeeded(
+                        insertedText: insertedTextForCorrectionTracking,
+                        baseline: targetAppCorrectionBaseline,
+                        contributionContext: TargetAppCorrectionLearningService.isPrivateBuild ? nil : contributionContext,
+                        accessibilityObservationLease: accessibilityObservationLease
+                    )
+                }
+
+                // Keep the finished recording recoverable. The store's serial queue orders this
+                // before the next recording replaces the active file, without blocking here.
+                audioRecordingService.preserveActiveRecoveryRecordingInBackground(successful: true)
+                soundService.play(.transcriptionSuccess, enabled: soundFeedbackEnabled)
+                let wordCount = text.split(separator: " ").count
+                let detectedLang = result.detectedLanguage ?? language
+                accessibilityAnnouncementService.announceTranscriptionComplete(wordCount: wordCount)
+                speechFeedbackService.speakAutomaticTranscription(text: text, language: detectedLang)
+                lastTranscribedText = text
+                lastTranscriptionLanguage = detectedLang
+
+                if postProcessingFallback != nil {
+                    showNotchFeedback(
+                        message: localizedAppText(
+                            "AI post-processing failed — raw transcription inserted",
+                            de: "KI-Nachbearbeitung fehlgeschlagen – Rohtext eingefügt",
+                            ja: "AI後処理に失敗しました — 未処理の文字起こしを挿入しました"
+                        ),
+                        icon: "exclamationmark.triangle.fill",
+                        duration: 4.0
+                    )
+                }
+
+                schedulePostInsertionPersistence(
+                    CompletedDictation(
+                        sessionID: sessionID,
+                        transcriptionID: transcriptionID,
+                        timestamp: completionTimestamp,
+                        rawText: result.text,
+                        finalText: text,
+                        appName: activeApp.name,
+                        appBundleIdentifier: activeApp.bundleId,
+                        appURL: activeApp.url,
+                        durationSeconds: audioDuration,
+                        language: language,
+                        detectedLanguage: detectedLang,
+                        engineUsed: result.engineUsed,
+                        modelUsed: modelDisplayName,
+                        ruleName: self.effectiveRuleName,
+                        wordsCount: wordCount,
+                        historyEnabled: (UserDefaults.standard.object(forKey: UserDefaultsKeys.historyEnabled) as? Bool ?? true) && !kiviRecordingWasPrivate,
+                        historyClearGeneration: historyService.clearGeneration,
+                        audioSamples: audioSamplesForHistory,
+                        pipelineSteps: pipelineSteps.isEmpty ? nil : pipelineSteps
+                    ),
+                    pendingURLResolution: activeApp.url == nil ? pendingURLResolution : nil
+                )
+
+                state = .inserting
+                if actionFeedbackMessage != nil {
+                    startActionFeedbackLifetime(duration: actionDisplayDuration)
+                } else {
+                    scheduleInsertingReset(after: .seconds(1.5))
+                }
+            } catch {
+                saveDeferredPostProcessingUsageCounts()
+                guard !Task.isCancelled else { return }
+                if let instructionToken {
+                    self.selectionInstructionToken = nil
+                    audioRecordingService.discardActiveRecoveryRecording()
+                    IntentSelectionEditor.shared.spokenFailure(error.localizedDescription, token: instructionToken)
+                    if let sessionID { failDictationSession(id: sessionID, error: error.localizedDescription) }
+                    state = .inserting
+                    scheduleInsertingReset(after: .milliseconds(100))
+                    self.transcriptionTask = nil
+                    return
+                }
+                handleLiveFieldTranscriptionFailure(stablePreviewText: previewText)
+                let recoveryPreservation = audioRecordingService
+                    .preserveActiveRecoveryRecordingResult()
+                EventBus.shared.emit(.transcriptionFailed(TranscriptionFailedPayload(
+                    error: error.localizedDescription,
+                    appName: capturedActiveApp?.name,
+                    bundleIdentifier: capturedActiveApp?.bundleId
+                )))
+                if let sessionID {
+                    failDictationSession(id: sessionID, error: error.localizedDescription)
+                }
+                accessibilityAnnouncementService.announceError(error.localizedDescription)
+                showError(
+                    error.localizedDescription,
+                    category: "transcription",
+                    recoveryPreservation: recoveryPreservation,
+                    settingsTab: Self.settingsTab(forTranscriptionError: error)
+                )
+                clearActiveRuleState()
+                capturedActiveApp = nil
+                activeAppIcon = nil
+            }
+            self.transcriptionTask = nil
+        }
+        didStartTranscriptionTask = true
+        stopFinalizationTask = nil
+    }
+
+    private func stableLivePreviewFallbackResult(
+        previewText: String,
+        streamingParams: StreamingParamsSnapshot?,
+        duration: Double
+    ) -> TranscriptionResult? {
+        let preview = previewText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let streamingParams,
+              streamingProviderSupportsLiveSession(streamingParams),
+              StreamingHandler.isSubstantiveStablePreview(preview) else {
+            return nil
+        }
+
+        let engineUsed = streamingParams.engineOverrideId
+            ?? streamingParams.providerId
+            ?? "unknown"
+        logger.info("Using stable live preview as final text because live finalization returned no usable text")
+        return TranscriptionNormalizationService.normalizeResult(
+            text: preview,
+            detectedLanguage: nil,
+            configuredLanguage: streamingParams.languageSelection.requestedLanguage,
+            configuredLanguageCandidates: streamingParams.languageSelection.selectedCodes,
+            duration: duration,
+            processingTime: 0.001,
+            engineUsed: engineUsed,
+            segments: [],
+            task: streamingParams.task,
+            normalizeNumbers: streamingParams.normalizeNumbers
+        )
+    }
+
+    private func streamingProviderSupportsLiveSession(_ streamingParams: StreamingParamsSnapshot) -> Bool {
+        guard let providerId = streamingParams.engineOverrideId ?? streamingParams.providerId,
+              let plugin = PluginManager.shared.transcriptionEngine(for: providerId) else {
+            return false
+        }
+        return plugin is any LiveTranscriptionCapablePlugin
+    }
+
+    private func transcribeFinalAudio(
+        audioSamples: [Float],
+        languageSelection: LanguageSelection,
+        task: TranscriptionTask,
+        primaryEngineId: String?,
+        primaryCloudModelOverride: String?,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        normalizeNumbers: Bool?
+    ) async throws -> FinalTranscriptionOutput {
+        let audioDuration = Double(audioSamples.count) / AudioRecordingService.targetSampleRate
+        guard let deadline = transcriptionDeadlineProvider(audioDuration), deadline > 0 else {
+            return try await transcribeFinalAudioWithoutDeadline(
+                audioSamples: audioSamples,
+                languageSelection: languageSelection,
+                task: task,
+                primaryEngineId: primaryEngineId,
+                primaryCloudModelOverride: primaryCloudModelOverride,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+
+        // Bound the whole transcription phase (primary, hedge, and the sequential
+        // fallback) by a deadline that holds regardless of how the runners behave:
+        // the phase is an unstructured task settled through an arbiter, so when
+        // the deadline fires the caller gets TranscriptionDeadlineExceeded at the
+        // bound. The in-flight work is cancelled - which aborts the transport for
+        // runners that honour cancellation - but it is never awaited, so a runner
+        // that ignores cancellation (a stalled upload, a server that accepted the
+        // audio and went silent, a plugin without prompt cancellation) cannot
+        // hold the app in "Transcribing..." past the bound. Its late result is
+        // dropped by the arbiter.
+        let transcriptionOperation: @MainActor () async throws -> FinalTranscriptionOutput = { [self] in
+            try await self.transcribeFinalAudioWithoutDeadline(
+                audioSamples: audioSamples,
+                languageSelection: languageSelection,
+                task: task,
+                primaryEngineId: primaryEngineId,
+                primaryCloudModelOverride: primaryCloudModelOverride,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+        return try await runWithDeadline(deadline, operationName: "Final transcription", transcriptionOperation)
+    }
+
+    /// Runs `operation` as an unstructured task settled through a `DeadlineArbiter`:
+    /// returns its outcome, or throws `TranscriptionDeadlineExceeded` once `deadline`
+    /// passes. The work is cancelled but never awaited.
+    private func runWithDeadline<Value>(
+        _ deadline: TimeInterval,
+        operationName: String,
+        _ operation: @escaping @MainActor () async throws -> Value
+    ) async throws -> Value {
+        let arbiter = DeadlineArbiter<Value>()
+        // The continuation only signals completion; the (non-Sendable) outcome
+        // stays inside the main-actor arbiter and is read back here.
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                arbiter.begin(continuation)
+                let work = Task { @MainActor in
+                    do {
+                        arbiter.settle(.success(try await operation()))
+                    } catch {
+                        arbiter.settle(.failure(error))
+                    }
+                }
+                let timer = Task { @MainActor [logger] in
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+                    } catch {
+                        return
+                    }
+                    logger.error("\(operationName, privacy: .public) exceeded its deadline of \(deadline, format: .fixed(precision: 1))s; abandoning in-flight requests")
+                    arbiter.settle(.failure(TranscriptionDeadlineExceeded(seconds: deadline)))
+                }
+                arbiter.register(work: work, timer: timer)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                arbiter.settle(.failure(CancellationError()))
+            }
+        }
+        return try arbiter.takeOutcome().get()
+    }
+
+    /// Settles a deadline-bounded operation on its first outcome: the work's own
+    /// result, the deadline, or outer cancellation. Everything runs on the main
+    /// actor; the first call resumes the caller and cancels both tasks, later
+    /// calls are dropped, and neither task is ever awaited.
+    @MainActor
+    private final class DeadlineArbiter<Value> {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var work: Task<Void, Never>?
+        private var timer: Task<Void, Never>?
+        private var settled = false
+        private var outcome: Result<Value, Error>?
+
+        func begin(_ continuation: CheckedContinuation<Void, Never>) {
+            self.continuation = continuation
+        }
+
+        func takeOutcome() -> Result<Value, Error> {
+            outcome ?? .failure(CancellationError())
+        }
+
+        func register(work: Task<Void, Never>, timer: Task<Void, Never>) {
+            self.work = work
+            self.timer = timer
+            if settled {
+                work.cancel()
+                timer.cancel()
+            }
+        }
+
+        func settle(_ outcome: Result<Value, Error>) {
+            guard !settled else { return }
+            settled = true
+            self.outcome = outcome
+            work?.cancel()
+            timer?.cancel()
+            let continuation = self.continuation
+            self.continuation = nil
+            continuation?.resume()
+        }
+    }
+
+    private func transcribeFinalAudioWithoutDeadline(
+        audioSamples: [Float],
+        languageSelection: LanguageSelection,
+        task: TranscriptionTask,
+        primaryEngineId: String?,
+        primaryCloudModelOverride: String?,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        normalizeNumbers: Bool?
+    ) async throws -> FinalTranscriptionOutput {
+        let fallbackConfiguration = recoveryFallbackConfigurationProvider(primaryEngineId, task)
+        do {
+            // The provider is injectable; only a threshold that converts to a
+            // sleep duration safely starts a race, anything else means no hedge
+            // (the sequential error-path fallback below still applies).
+            if let configuration = fallbackConfiguration,
+               let hedgeThreshold = recoveryHedgeThresholdProvider(),
+               Self.hedgeDelayNanoseconds(forThreshold: hedgeThreshold) != nil {
+                return try await hedgedTranscription(
+                    audioSamples: audioSamples,
+                    languageSelection: languageSelection,
+                    task: task,
+                    primaryEngineId: primaryEngineId,
+                    primaryCloudModelOverride: primaryCloudModelOverride,
+                    prompt: prompt,
+                    dictionaryTermHints: dictionaryTermHints,
+                    normalizeNumbers: normalizeNumbers,
+                    configuration: configuration,
+                    threshold: hedgeThreshold
+                )
+            }
+            let result = try await primaryTranscriptionRunner(
+                audioSamples,
+                languageSelection,
+                task,
+                primaryEngineId,
+                primaryCloudModelOverride,
+                prompt,
+                dictionaryTermHints,
+                normalizeNumbers
+            )
+            return finalTranscriptionOutput(
+                result: result,
+                engineId: primaryEngineId,
+                modelId: primaryCloudModelOverride,
+                usedRecoveryFallback: false
+            )
+        } catch let failure as AutomaticRecoveryFallbackFailure {
+            // The hedge already ran the fallback; don't retry it below.
+            throw failure
+        } catch {
+            let primaryError = error
+            guard shouldAttemptAutomaticRecoveryFallback(after: primaryError),
+                  let configuration = fallbackConfiguration else {
+                throw primaryError
+            }
+
+            logger.warning(
+                "Primary transcription failed; retrying with recovery fallback engine \(configuration.engineId, privacy: .public): \(primaryError.localizedDescription, privacy: .public)"
+            )
+            let fallbackPrompt = dictionaryService.getTermsForPrompt(providerId: configuration.engineId)
+            let fallbackDictionaryTermHints = dictionaryService.getTermHints(providerId: configuration.engineId)
+
+            do {
+                let fallbackResult = try await recoveryFallbackRunner(
+                    audioSamples,
+                    languageSelection,
+                    task,
+                    configuration,
+                    fallbackPrompt,
+                    fallbackDictionaryTermHints,
+                    normalizeNumbers
+                )
+                logger.info(
+                    "Recovery fallback transcription succeeded with engine \(configuration.engineId, privacy: .public)"
+                )
+                return finalTranscriptionOutput(
+                    result: fallbackResult,
+                    engineId: configuration.engineId,
+                    modelId: configuration.modelId,
+                    usedRecoveryFallback: true
+                )
+            } catch {
+                logger.error(
+                    "Recovery fallback transcription failed with engine \(configuration.engineId, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                throw AutomaticRecoveryFallbackFailure(
+                    primaryError: primaryError,
+                    fallbackDescription: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private enum HedgedTranscriptionEvent {
+        case primary(Result<TranscriptionResult, Error>)
+        case fallback(Result<TranscriptionResult, Error>)
+        case fallbackSkipped
+    }
+
+    private enum HedgedTranscriptionOutcome {
+        case primaryWon(TranscriptionResult)
+        case fallbackWon(TranscriptionResult)
+        case primaryFailedBeforeHedge(Error)
+        case bothFailed(primary: Error, fallback: Error)
+    }
+
+    /// Collects the outcome of a hedged race. Every transition happens on the
+    /// main actor; the first decisive event resumes the continuation and
+    /// cancels both tasks, everything that arrives afterwards is dropped.
+    @MainActor
+    private final class HedgedTranscriptionArbiter {
+        private var continuation: CheckedContinuation<HedgedTranscriptionOutcome, Never>?
+        private var primaryTask: Task<Void, Never>?
+        private var fallbackTask: Task<Void, Never>?
+        private var primaryError: Error?
+        private var fallbackError: Error?
+        private var fallbackDispatched = false
+        private var settled = false
+
+        func begin(_ continuation: CheckedContinuation<HedgedTranscriptionOutcome, Never>) {
+            self.continuation = continuation
+        }
+
+        func register(primary: Task<Void, Never>, fallback: Task<Void, Never>) {
+            primaryTask = primary
+            fallbackTask = fallback
+            if settled {
+                primary.cancel()
+                fallback.cancel()
+            }
+        }
+
+        /// Returns false when the race is already over, so a late timer never
+        /// dispatches a fallback request nobody is waiting for.
+        func markFallbackDispatched() -> Bool {
+            guard !settled else { return false }
+            fallbackDispatched = true
+            return true
+        }
+
+        func primaryFailed(_ error: Error, eligibleForFallback: Bool) {
+            guard !settled else { return }
+            // Before the hedge fires (or for errors the sequential fallback must
+            // not retry) the caller's existing error path applies unchanged.
+            guard fallbackDispatched, eligibleForFallback else {
+                return settle(.primaryFailedBeforeHedge(error))
+            }
+            if let fallbackError {
+                return settle(.bothFailed(primary: error, fallback: fallbackError))
+            }
+            primaryError = error
+        }
+
+        func fallbackFailed(_ error: Error) {
+            guard !settled else { return }
+            if let primaryError {
+                return settle(.bothFailed(primary: primaryError, fallback: error))
+            }
+            fallbackError = error
+        }
+
+        func fallbackSkipped() {
+            guard !settled, let primaryError else { return }
+            settle(.primaryFailedBeforeHedge(primaryError))
+        }
+
+        func settle(_ outcome: HedgedTranscriptionOutcome) {
+            guard !settled else { return }
+            settled = true
+            primaryTask?.cancel()
+            fallbackTask?.cancel()
+            let continuation = self.continuation
+            self.continuation = nil
+            continuation?.resume(returning: outcome)
+        }
+    }
+
+    /// Longest hedge threshold the race accepts. The settings UI offers 1...15 s;
+    /// anything past a minute is not a hedge any more and is treated as "no
+    /// hedge" rather than being converted.
+    nonisolated static let maximumHedgeThreshold: TimeInterval = 60
+
+    /// Converts a hedge threshold to a sleep duration, or nil when the value
+    /// must not be converted: non-finite, non-positive, or so large that the
+    /// nanosecond product would overflow (`UInt64(1e308 * 1e9)` traps). Guarding
+    /// the value alone is not enough; the product is what gets converted.
+    nonisolated static func hedgeDelayNanoseconds(forThreshold threshold: TimeInterval) -> UInt64? {
+        guard threshold.isFinite, threshold > 0, threshold <= maximumHedgeThreshold else { return nil }
+        let nanoseconds = threshold * 1_000_000_000
+        guard nanoseconds.isFinite, nanoseconds < Double(UInt64.max) else { return nil }
+        return UInt64(nanoseconds)
+    }
+
+    /// Races the primary engine against the recovery fallback engine: the fallback
+    /// request is dispatched only after `threshold` elapses with the primary still
+    /// running, the first successful transcription wins, and the loser is cancelled.
+    /// A primary failure before the hedge fires is rethrown so the caller's
+    /// sequential error-path fallback applies unchanged.
+    private func hedgedTranscription(
+        audioSamples: [Float],
+        languageSelection: LanguageSelection,
+        task: TranscriptionTask,
+        primaryEngineId: String?,
+        primaryCloudModelOverride: String?,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        normalizeNumbers: Bool?,
+        configuration: DictationRecoveryFallbackConfiguration,
+        threshold: TimeInterval
+    ) async throws -> FinalTranscriptionOutput {
+        let fallbackPrompt = dictionaryService.getTermsForPrompt(providerId: configuration.engineId)
+        let fallbackDictionaryTermHints = dictionaryService.getTermHints(providerId: configuration.engineId)
+
+        let primaryOperation: @MainActor () async throws -> TranscriptionResult = { [primaryTranscriptionRunner] in
+            try await primaryTranscriptionRunner(
+                audioSamples,
+                languageSelection,
+                task,
+                primaryEngineId,
+                primaryCloudModelOverride,
+                prompt,
+                dictionaryTermHints,
+                normalizeNumbers
+            )
+        }
+        let fallbackOperation: @MainActor () async throws -> TranscriptionResult = { [recoveryFallbackRunner] in
+            try await recoveryFallbackRunner(
+                audioSamples,
+                languageSelection,
+                task,
+                configuration,
+                fallbackPrompt,
+                fallbackDictionaryTermHints,
+                normalizeNumbers
+            )
+        }
+
+        let fallbackEngineId = configuration.engineId
+        // The race is settled by the first decisive event and returns at once.
+        // Both requests run as unstructured tasks so a losing engine that does
+        // not honour cooperative cancellation (the plugin contract does not
+        // guarantee prompt cancellation) cannot delay the winner: it is
+        // cancelled, its eventual result is dropped by the arbiter, and it is
+        // never awaited. A structured task group would wait for it.
+        let arbiter = HedgedTranscriptionArbiter()
+        let outcome = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<HedgedTranscriptionOutcome, Never>) in
+                arbiter.begin(continuation)
+                let primaryTask = Task { @MainActor [weak self] in
+                    do {
+                        let result = try await primaryOperation()
+                        arbiter.settle(.primaryWon(result))
+                    } catch {
+                        guard let self else { return arbiter.settle(.primaryFailedBeforeHedge(error)) }
+                        arbiter.primaryFailed(
+                            error,
+                            eligibleForFallback: self.shouldAttemptAutomaticRecoveryFallback(after: error)
+                        )
+                    }
+                }
+                let fallbackTask = Task { @MainActor [logger] in
+                    do {
+                        // The caller only starts the race for a convertible threshold.
+                        guard let delay = Self.hedgeDelayNanoseconds(forThreshold: threshold) else {
+                            arbiter.fallbackSkipped()
+                            return
+                        }
+                        try await Task.sleep(nanoseconds: delay)
+                    } catch {
+                        arbiter.fallbackSkipped()
+                        return
+                    }
+                    guard arbiter.markFallbackDispatched() else { return }
+                    logger.info(
+                        "Primary transcription exceeded hedge threshold (\(threshold, format: .fixed(precision: 1))s); racing recovery fallback engine \(fallbackEngineId, privacy: .public)"
+                    )
+                    do {
+                        let result = try await fallbackOperation()
+                        arbiter.settle(.fallbackWon(result))
+                    } catch {
+                        arbiter.fallbackFailed(error)
+                    }
+                }
+                arbiter.register(primary: primaryTask, fallback: fallbackTask)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                arbiter.settle(.primaryFailedBeforeHedge(CancellationError()))
+            }
+        }
+
+        switch outcome {
+        case .primaryWon(let result):
+            return finalTranscriptionOutput(
+                result: result,
+                engineId: primaryEngineId,
+                modelId: primaryCloudModelOverride,
+                usedRecoveryFallback: false
+            )
+        case .fallbackWon(let result):
+            logger.info(
+                "Hedged recovery fallback won the race with engine \(configuration.engineId, privacy: .public)"
+            )
+            return finalTranscriptionOutput(
+                result: result,
+                engineId: configuration.engineId,
+                modelId: configuration.modelId,
+                usedRecoveryFallback: true
+            )
+        case .primaryFailedBeforeHedge(let error):
+            throw error
+        case .bothFailed(let primary, let fallback):
+            logger.error(
+                "Hedged transcription failed on both engines; primary: \(primary.localizedDescription, privacy: .public), fallback: \(fallback.localizedDescription, privacy: .public)"
+            )
+            throw AutomaticRecoveryFallbackFailure(
+                primaryError: primary,
+                fallbackDescription: fallback.localizedDescription
+            )
+        }
+    }
+
+    private func finalTranscriptionOutput(
+        result: TranscriptionResult,
+        engineId: String?,
+        modelId: String?,
+        usedRecoveryFallback: Bool
+    ) -> FinalTranscriptionOutput {
+        FinalTranscriptionOutput(
+            result: result,
+            modelId: modelManager.resolvedModelId(
+                engineOverrideId: engineId,
+                cloudModelOverride: modelId
+            ),
+            modelDisplayName: modelManager.resolvedModelDisplayName(
+                engineOverrideId: engineId,
+                cloudModelOverride: modelId
+            ),
+            usedRecoveryFallback: usedRecoveryFallback
+        )
+    }
+
+    private func shouldAttemptAutomaticRecoveryFallback(after error: Error) -> Bool {
+        AutomaticRecoveryFallbackErrorPolicy.shouldAttempt(after: error)
+    }
+
+    func requestMicPermission() { settingsHandler.requestMicPermission() }
+    func requestAccessibilityPermission() { settingsHandler.requestAccessibilityPermission() }
+    func hotkeys(for slot: HotkeySlotType) -> [UnifiedHotkey] { settingsHandler.hotkeys(for: slot) }
+    func setHotkey(_ hotkey: UnifiedHotkey, for slot: HotkeySlotType) { settingsHandler.setHotkey(hotkey, for: slot) }
+    func addHotkey(_ hotkey: UnifiedHotkey, for slot: HotkeySlotType) { settingsHandler.addHotkey(hotkey, for: slot) }
+    func replaceHotkey(_ existingHotkey: UnifiedHotkey, with newHotkey: UnifiedHotkey, for slot: HotkeySlotType) { settingsHandler.replaceHotkey(existingHotkey, with: newHotkey, for: slot) }
+    func removeHotkey(_ hotkey: UnifiedHotkey, for slot: HotkeySlotType) { settingsHandler.removeHotkey(hotkey, for: slot) }
+    func removeConflictingHotkey(_ hotkey: UnifiedHotkey, for slot: HotkeySlotType) { settingsHandler.removeConflictingHotkey(hotkey, for: slot) }
+    func clearHotkey(for slot: HotkeySlotType) { settingsHandler.clearHotkey(for: slot) }
+    func isHotkeyAssigned(_ hotkey: UnifiedHotkey, excluding: HotkeySlotType) -> HotkeySlotType? { settingsHandler.isHotkeyAssigned(hotkey, excluding: excluding) }
+
+    private static func loadHotkeyLabel(for slotType: HotkeySlotType) -> String {
+        DictationSettingsHandler.loadHotkeyLabel(for: slotType)
+    }
+
+    /// Register profile/workflow hotkeys after app is fully initialized.
+    /// Called from ServiceContainer.initialize() to avoid early monitor setup.
+    func registerInitialTriggerHotkeys() { settingsHandler.registerInitialTriggerHotkeys() }
+
+    @available(*, deprecated, renamed: "registerInitialTriggerHotkeys")
+    func registerInitialProfileHotkeys() { registerInitialTriggerHotkeys() }
+
+    private func resetDictationState() {
+        if let token = selectionInstructionToken {
+            IntentSelectionEditor.shared.spokenFailure("Instruction recording ended. Your selection is unchanged; type an instruction to continue.", token: token)
+            selectionInstructionToken = nil
+        }
+        errorResetTask?.cancel()
+        insertingResetTask?.cancel()
+        insertingResetTask = nil
+        indicatorFeedbackLifetime.cancel()
+        stopFinalizationTask?.cancel()
+        stopFinalizationTask = nil
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
+        recordingStartTask?.cancel()
+        recordingStartTask = nil
+        audioRecordingService.cancelPendingRecordingStart()
+        urlResolutionTask?.cancel()
+        urlResolutionTask = nil
+        metadataCaptureTask?.cancel()
+        metadataCaptureTask = nil
+        cancelIncrementalWorkflowPostProcessing()
+        lastStreamingParams = nil
+        liveFieldTranscriptSession = nil
+        pendingLiveFieldCapture = nil
+        pinnedInsertionTarget = nil
+        isStopInFlight = false
+        activeDictationSessionID = nil
+        pendingPushToTalkDiscardMessage = nil
+        clearRecordingStartCueState()
+        clearCancelWarning()
+        state = .idle
+        partialText = ""
+        recordingStartTime = nil
+        clearActiveRuleState()
+        capturedActiveApp = nil
+        capturedSelectedText = nil
+        activeAppIcon = nil
+        processingPhase = nil
+        actionFeedbackMessage = nil
+        isNoSpeechFeedback = false
+        actionFeedbackIcon = nil
+        actionFeedbackIsError = false
+        clearActionFeedbackAction()
+        actionDisplayDuration = 3.5
+
+        guard pendingHotkeyDictationStart != nil else { return }
+        pendingHotkeyStartTask?.cancel()
+        pendingHotkeyStartTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            defer { self.pendingHotkeyStartTask = nil }
+            guard self.state == .idle,
+                  let pendingHotkeyStart = self.pendingHotkeyDictationStart else {
+                self.pendingHotkeyDictationStart = nil
+                return
+            }
+            self.pendingHotkeyDictationStart = nil
+            logger.info("Starting queued dictation")
+            self.startRecording(
+                forcedWorkflowId: pendingHotkeyStart.forcedWorkflowId,
+                requestUptimeNanoseconds: pendingHotkeyStart.requestUptimeNanoseconds
+            )
+        }
+    }
+
+    private func handlePushToTalkInterruption() {
+        guard state == .recording, !isStopInFlight else { return }
+        pendingPushToTalkDiscardMessage = String(localized: "Recording discarded because additional keys were pressed")
+    }
+
+    private func applyWorkflowMatch(
+        _ match: WorkflowMatchResult?,
+        activeApp: (name: String?, bundleId: String?, url: String?)?
+    ) {
+        guard selectionInstructionToken == nil else { clearActiveRuleState(); return }
+        activeWorkflowMatch = match
+        matchedWorkflow = match?.workflow
+        updateSubmitOnEnterAvailability()
+        activeRuleName = match?.workflow.name
+        activeRuleReasonLabel = match?.kind.label
+        activeRuleExplanation = match.map { workflowExplanation(for: $0, activeApp: activeApp) }
+        applyEffectiveMicrophoneBoostToAudioService()
+    }
+
+    private func forcedWorkflow(for id: UUID?) -> Workflow? {
+        guard let id else { return nil }
+        return workflowService.workflows.first { $0.id == id && $0.isEnabled }
+    }
+
+    private func microphoneBoostEnabled(for workflow: Workflow?) -> Bool {
+        return workflow?.behavior.microphoneBoostOverride ?? microphoneBoostEnabled
+    }
+
+    private func applyEffectiveMicrophoneBoostToAudioService() {
+        audioRecordingService.microphoneBoostEnabled = effectiveMicrophoneBoostEnabled
+    }
+
+    /// Starts the live streaming handler with the currently effective workflow/global params
+    /// and records a snapshot for later change detection (release review K3).
+    private func startLiveStreaming(allowLiveTranscription: Bool) {
+        let params = StreamingParamsSnapshot(
+            engineOverrideId: effectiveEngineOverrideId,
+            providerId: modelManager.selectedProviderId,
+            languageSelection: effectiveLanguageSelection,
+            task: effectiveTask,
+            cloudModelOverride: effectiveCloudModelOverride,
+            normalizeNumbers: effectiveNumberNormalizationOverride
+        )
+        let resolution = Self.resolvePreviewEngine(
+            preferredPreviewEngineId: livePreviewEngineId,
+            dictationEngineOverrideId: params.engineOverrideId,
+            selectedProviderId: params.providerId,
+            isEngineAvailable: { [weak self] engineId in
+                guard let self, let engine = PluginManager.shared?.transcriptionEngine(for: engineId) else {
+                    return false
+                }
+                return self.canUseEngineForPreview(engine)
+            }
+        )
+        var previewEngineOverrideId: String?
+        let previewUsable: Bool
+        switch resolution {
+        case .followsDictationEngine:
+            previewEngineOverrideId = params.engineOverrideId
+            previewUsable = true
+        case .overrideEngine(let engineId):
+            previewEngineOverrideId = engineId
+            previewUsable = true
+        case .previewUnavailable:
+            // The user explicitly chose a preview engine that can't run right now.
+            // Fail visibly (no preview) instead of silently resuming preview
+            // traffic on the (possibly metered cloud) dictation engine.
+            previewEngineOverrideId = params.engineOverrideId
+            previewUsable = false
+            logger.warning("Selected live preview engine is unavailable; preview disabled for this recording instead of falling back to the dictation engine")
+        }
+        var effectiveAllowLiveTranscription = allowLiveTranscription && previewUsable
+        // Engines whose live session is the dictation path (e.g. Soniox realtime) keep
+        // streaming when the preview is hidden. Otherwise the final transcription would
+        // fall back to a much slower batch request after the user stops. An unavailable
+        // preview engine stays suppressed, since the preview would still be shown.
+        let streamsDictationWithoutPreview = !allowLiveTranscription
+            && !hiddenLiveSessionAwaitsWebsiteWorkflow
+            && modelManager.prefersLiveSessionForDictation(
+                engineOverrideId: params.engineOverrideId,
+                selectedProviderId: params.providerId
+            )
+        if streamsDictationWithoutPreview {
+            previewEngineOverrideId = params.engineOverrideId
+            effectiveAllowLiveTranscription = true
+        }
+        lastStreamingParams = effectiveAllowLiveTranscription ? params : nil
+        let previewFollowsDictationEngine =
+            (previewEngineOverrideId ?? params.providerId) == (params.engineOverrideId ?? params.providerId)
+        lastPreviewFollowsDictationEngine = previewFollowsDictationEngine
+        lastStreamingPreviewHidden = streamsDictationWithoutPreview
+        let dictionaryProviderId = previewEngineOverrideId ?? params.providerId
+        // A distinct preview engine that can't translate still previews the speech —
+        // as a transcription. The final (translating) result comes from the dictation
+        // engine anyway; keeping .translate here would make its sessions fail outright.
+        var previewTask = params.task
+        if !previewFollowsDictationEngine,
+           previewTask == .translate,
+           let previewProviderId = previewEngineOverrideId,
+           let previewPlugin = PluginManager.shared?.transcriptionEngine(for: previewProviderId),
+           !previewPlugin.supportsTranslation {
+            previewTask = .transcribe
+        }
+        streamingHandler.start(
+            streamPrompt: dictionaryService.getTermsForPrompt(providerId: dictionaryProviderId) ?? "",
+            dictionaryTermHints: dictionaryService.getTermHints(providerId: dictionaryProviderId),
+            engineOverrideId: previewEngineOverrideId,
+            selectedProviderId: params.providerId,
+            languageSelection: params.languageSelection,
+            task: previewTask,
+            cloudModelOverride: previewFollowsDictationEngine ? params.cloudModelOverride : nil,
+            normalizeNumbers: params.normalizeNumbers,
+            allowLiveTranscription: effectiveAllowLiveTranscription,
+            previewHidden: streamsDictationWithoutPreview,
+            stateCheck: { [weak self] in self?.state == .recording }
+        )
+    }
+
+    private func captureLiveFieldTargetAtRecordingRequestIfEligible() {
+        pendingLiveFieldCapture = nil
+        guard liveFieldTranscriptEnabled, selectionInstructionToken == nil else { return }
+
+        targetAppAccessibilityObservationLease = textInsertionService
+            .beginFocusedApplicationAccessibilityObservation()
+        guard let capture = textInsertionService.captureLiveFieldTargetAtRecordingRequest() else {
+            endTargetAppAccessibilityObservation()
+            return
+        }
+        pendingLiveFieldCapture = PendingLiveFieldCapture(
+            activeApp: capture.activeApp,
+            pinnedTarget: capture.pinnedTarget,
+            liveFieldTarget: capture.liveFieldTarget
+        )
+    }
+
+    private func beginLiveFieldTranscriptSessionIfEligible(
+        sessionID: UUID,
+        activeApp: (name: String?, bundleId: String?, url: String?),
+        preCapturedTarget: TextInsertionService.LiveFieldTarget? = nil
+    ) {
+        liveFieldTranscriptSession = nil
+        guard liveFieldTranscriptEnabled, selectionInstructionToken == nil,
+              effectiveActionPluginId == nil,
+              resolvedEffectiveOutputFormat(for: activeApp) == nil else {
+            return
+        }
+
+        let target = preCapturedTarget ?? textInsertionService.captureLiveFieldTarget(
+            expectedBundleIdentifier: activeApp.bundleId
+        )
+        guard let target else { return }
+
+        liveFieldTranscriptSession = LiveFieldTranscriptSession(
+            sessionID: sessionID,
+            target: target,
+            textInsertionService: textInsertionService
+        )
+    }
+
+    private func cancelLiveFieldTranscriptSession() {
+        guard let liveFieldTranscriptSession else { return }
+        _ = liveFieldTranscriptSession.cancel()
+        self.liveFieldTranscriptSession = nil
+    }
+
+    private func prepareLiveFieldSessionForNormalInsertion() -> Bool {
+        guard let liveFieldTranscriptSession else { return true }
+        defer { self.liveFieldTranscriptSession = nil }
+
+        switch liveFieldTranscriptSession.cancel() {
+        case .applied:
+            return true
+        case .detached(let hadAttemptedMutation, let allowsFocusedFallback):
+            if hadAttemptedMutation
+                || (!allowsFocusedFallback && pinnedInsertionTarget == nil) {
+                showLiveFieldRecoveryFeedback()
+                return false
+            }
+            return true
+        }
+    }
+
+    private func handleLiveFieldTranscriptionFailure(stablePreviewText: String) {
+        guard let liveFieldTranscriptSession else { return }
+        let hasUsableVisiblePartial = liveFieldTranscriptSession.hasProvisionalText
+            && StreamingHandler.isSubstantiveStablePreview(
+                stablePreviewText.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        if hasUsableVisiblePartial {
+            liveFieldTranscriptSession.keepProvisionalText()
+            self.liveFieldTranscriptSession = nil
+        } else {
+            cancelLiveFieldTranscriptSession()
+        }
+    }
+
+    private func showLiveFieldRecoveryFeedback() {
+        showNotchFeedback(
+            message: String(localized: "The text field changed. The final transcript is available in Recent Transcriptions."),
+            icon: "text.badge.xmark",
+            duration: 3.0,
+            isError: true,
+            errorCategory: "insertion"
+        )
+    }
+
+    /// Whether an engine is usable as the live preview engine: auth-available and
+    /// either currently configured or restorable on demand (an installed local
+    /// engine whose model was auto-unloaded restores at session start via
+    /// `prepareEngineForTranscription` → `triggerRestoreModel`), AND actually able
+    /// to produce a preview — via a native live session or the batch fallback.
+    func canUseEngineForPreview(_ engine: TranscriptionEnginePlugin) -> Bool {
+        guard modelManager.canPrepareForTranscription(engine) else { return false }
+        if engine is any LiveTranscriptionCapablePlugin { return true }
+        let allowsFallback = (engine as? any TranscriptPreviewFallbackPolicyProviding)?
+            .allowsTranscriptPreviewFallback ?? true
+        return allowsFallback
+    }
+
+    enum PreviewEngineResolution: Equatable {
+        /// No usable distinct preference — the preview follows the dictation
+        /// engine (prior behavior), keeping any cloud model override intact.
+        case followsDictationEngine
+        /// A distinct, usable preview engine runs the preview session.
+        case overrideEngine(String)
+        /// A preview engine is explicitly selected but unusable — suppress the
+        /// preview entirely rather than silently falling back to the (possibly
+        /// metered cloud) dictation engine.
+        case previewUnavailable
+    }
+
+    /// Resolve which engine the live transcript preview session should use.
+    nonisolated static func resolvePreviewEngine(
+        preferredPreviewEngineId: String?,
+        dictationEngineOverrideId: String?,
+        selectedProviderId: String?,
+        isEngineAvailable: (String) -> Bool
+    ) -> PreviewEngineResolution {
+        guard let preferred = preferredPreviewEngineId, !preferred.isEmpty else {
+            return .followsDictationEngine
+        }
+        guard isEngineAvailable(preferred) else {
+            return .previewUnavailable
+        }
+        if preferred == (dictationEngineOverrideId ?? selectedProviderId) {
+            return .followsDictationEngine
+        }
+        return .overrideEngine(preferred)
+    }
+
+    /// Restart live streaming if the currently effective params differ from the ones
+    /// used when `streamingHandler.start(...)` was last called. Called after URL
+    /// resolution refines the rule, to keep live preview consistent with the final
+    /// transcription. No-op when recording already stopped, when no meaningful param
+    /// changed, or when live streaming was disabled and the refined engine doesn't
+    /// stream dictation through a live session.
+    @discardableResult
+    private func refreshLiveStreamingIfParamsChanged() -> Bool {
+        guard state == .recording else { return false }
+        let newParams = StreamingParamsSnapshot(
+            engineOverrideId: effectiveEngineOverrideId,
+            providerId: modelManager.selectedProviderId,
+            languageSelection: effectiveLanguageSelection,
+            task: effectiveTask,
+            cloudModelOverride: effectiveCloudModelOverride,
+            normalizeNumbers: effectiveNumberNormalizationOverride
+        )
+        let allowLive = indicatorTranscriptPreviewEnabled
+            || liveFieldTranscriptEnabled
+            || externalStreamingDisplayCount > 0
+        guard let previous = lastStreamingParams else {
+            // Nothing streams yet, but a workflow may have switched to an engine that
+            // streams dictation even with the preview hidden.
+            guard modelManager.prefersLiveSessionForDictation(
+                engineOverrideId: newParams.engineOverrideId,
+                selectedProviderId: newParams.providerId
+            ) else { return false }
+            startLiveStreaming(allowLiveTranscription: allowLive)
+            return lastStreamingParams != nil
+        }
+        guard newParams != previous else { return false }
+        logger.info("Streaming params changed after URL resolution, restarting live session")
+        startLiveStreaming(allowLiveTranscription: allowLive)
+        return true
+    }
+
+    private func clearActiveRuleState() {
+        matchedWorkflow = nil
+        updateSubmitOnEnterAvailability()
+        activeWorkflowMatch = nil
+        forcedWorkflowId = nil
+        activeRuleName = nil
+        activeRuleReasonLabel = nil
+        activeRuleExplanation = nil
+    }
+
+    private func workflowExplanation(
+        for match: WorkflowMatchResult,
+        activeApp: (name: String?, bundleId: String?, url: String?)?
+    ) -> String {
+        let appDescriptor = activeApp?.name ?? activeApp?.bundleId ?? "the active app"
+
+        let base: String
+        switch match.kind {
+        case .appAndWebsite:
+            if let domain = match.matchedDomain {
+                base = localizedAppText(
+                    "This workflow applies because \(appDescriptor) was detected together with \(domain).",
+                    de: "Dieser Workflow greift, weil \(appDescriptor) zusammen mit \(domain) erkannt wurde.",
+                    ja: "\(appDescriptor) と \(domain) が一緒に検出されたため、このワークフローが適用されます。"
+                )
+            } else {
+                base = localizedAppText(
+                    "This workflow applies because the app and website were detected together.",
+                    de: "Dieser Workflow greift, weil App und Website zusammen erkannt wurden.",
+                    ja: "アプリとWebサイトが一緒に検出されたため、このワークフローが適用されます。"
+                )
+            }
+        case .website:
+            if let domain = match.matchedDomain {
+                base = localizedAppText(
+                    "This workflow applies because \(domain) was detected.",
+                    de: "Dieser Workflow greift, weil \(domain) erkannt wurde.",
+                    ja: "\(domain) が検出されたため、このワークフローが適用されます。"
+                )
+            } else {
+                base = localizedAppText(
+                    "This workflow applies because the current website was detected.",
+                    de: "Dieser Workflow greift, weil die aktuelle Website erkannt wurde.",
+                    ja: "現在のWebサイトが検出されたため、このワークフローが適用されます。"
+                )
+            }
+        case .app:
+            base = localizedAppText(
+                "This workflow applies because \(appDescriptor) was detected.",
+                de: "Dieser Workflow greift, weil \(appDescriptor) erkannt wurde.",
+                ja: "\(appDescriptor) が検出されたため、このワークフローが適用されます。"
+            )
+        case .globalFallback:
+            base = localizedAppText(
+                "This workflow applies because no more specific workflow matched.",
+                de: "Dieser Workflow greift, weil kein spezifischerer Workflow gepasst hat.",
+                ja: "より具体的なワークフローに一致しなかったため、このワークフローが適用されます。"
+            )
+        case .manualOverride:
+            base = localizedAppText(
+                "This workflow was manually triggered via its keyboard shortcut.",
+                de: "Dieser Workflow wurde manuell ueber seine Tastenkombination ausgeloest.",
+                ja: "このワークフローはキーボードショートカットで手動実行されました。"
+            )
+        }
+
+        guard match.wonBySortOrder else { return base }
+        return base + localizedAppText(
+            " Among multiple matching workflows, the one higher in the list wins here.",
+            de: " Unter mehreren passenden Workflows gewinnt hier der weiter oben stehende Eintrag.",
+            ja: " 複数の一致するワークフローがある場合は、一覧で上位のものが優先されます。"
+        )
+    }
+
+    // MARK: - Shared Helpers
+
+    /// Builds an LLM handler for the post-processing pipeline.
+    /// Priority: workflow > translation > nil.
+    private func buildLLMHandler(
+        translationTarget: String?,
+        detectedLanguage: String?,
+        configuredLanguage: String?,
+        resolvedOutputFormat: String?,
+        incrementalPostProcessing: WorkflowIncrementalPostProcessingSession? = nil,
+        stopTimingStart: CFAbsoluteTime? = nil
+    ) -> ((String) async throws -> String)? {
+        if let workflowHandler = buildWorkflowTextProcessingHandler(
+            translationTarget: translationTarget,
+            detectedLanguage: detectedLanguage,
+            configuredLanguage: configuredLanguage,
+            resolvedOutputFormat: resolvedOutputFormat,
+            incrementalPostProcessing: incrementalPostProcessing,
+            stopTimingStart: stopTimingStart
+        ) {
+            return workflowHandler
+        }
+
+        #if canImport(Translation)
+        if let targetCode = translationTarget {
+            if #available(macOS 15, *), let ts = translationService as? TranslationService {
+                let sourceRaw = detectedLanguage ?? configuredLanguage
+                let sourceNormalized = TranslationService.normalizedLanguageIdentifier(from: sourceRaw)
+                if let sourceRaw {
+                    if let sourceNormalized {
+                        if sourceRaw.caseInsensitiveCompare(sourceNormalized) != .orderedSame {
+                            logger.info("Translation source normalized \(sourceRaw, privacy: .public) -> \(sourceNormalized, privacy: .public)")
+                        }
+                    } else {
+                        logger.warning("Translation source language \(sourceRaw, privacy: .public) invalid, using auto source")
+                    }
+                }
+                let sourceLanguage = sourceNormalized.map { Locale.Language(identifier: $0) }
+                return { text in
+                    guard let targetNormalized = TranslationService.normalizedLanguageIdentifier(from: targetCode) else {
+                        logger.error("Translation target language invalid: \(targetCode, privacy: .public)")
+                        return text
+                    }
+                    if targetCode.caseInsensitiveCompare(targetNormalized) != .orderedSame {
+                        logger.info("Translation target normalized \(targetCode, privacy: .public) -> \(targetNormalized, privacy: .public)")
+                    }
+                    let target = Locale.Language(identifier: targetNormalized)
+                    return try await ts.translate(text: text, to: target, source: sourceLanguage)
+                }
+            }
+        }
+        #endif
+
+        return nil
+    }
+
+    private func buildWorkflowTextProcessingHandler(
+        translationTarget: String?,
+        detectedLanguage: String?,
+        configuredLanguage: String?,
+        resolvedOutputFormat: String?,
+        incrementalPostProcessing: WorkflowIncrementalPostProcessingSession?,
+        stopTimingStart: CFAbsoluteTime?
+    ) -> ((String) async throws -> String)? {
+        guard let workflow = matchedWorkflow else { return nil }
+
+        let workflowProcessor = workflowTextProcessingService
+        let workflowService = workflowService
+        guard workflowProcessor.canProcess(
+            workflow: workflow,
+            fallbackTranslationTarget: translationTarget,
+            detectedLanguage: detectedLanguage,
+            configuredLanguage: configuredLanguage,
+            resolvedOutputFormat: resolvedOutputFormat
+        ) else {
+            return nil
+        }
+
+        let segmentedRequest = workflow.usesSegmentedPostProcessing
+            ? workflowProcessor.segmentedPromptRequest(
+                workflow: workflow,
+                fallbackTranslationTarget: translationTarget,
+                detectedLanguage: detectedLanguage,
+                configuredLanguage: configuredLanguage,
+                resolvedOutputFormat: resolvedOutputFormat
+            )
+            : nil
+        // Segments sent while recording could not know the detected language yet.
+        let incrementalRequest = segmentedRequest == nil
+            ? nil
+            : workflowProcessor.segmentedPromptRequest(
+                workflow: workflow,
+                fallbackTranslationTarget: translationTarget,
+                detectedLanguage: nil,
+                configuredLanguage: configuredLanguage,
+                resolvedOutputFormat: resolvedOutputFormat
+            )
+        let segmentationPolicy = segmentedRequest.map { workflowSegmentationPolicy(for: $0) } ?? .default
+
+        return { text in
+            if workflowService.shouldSkipAIProcessingForShortDictation(text: text) {
+                incrementalPostProcessing?.cancel()
+                logger.info("Skipping workflow AI processing for short dictation")
+                return text
+            }
+
+            guard let segmentedRequest else {
+                incrementalPostProcessing?.cancel()
+                return try await workflowProcessor.process(
+                    workflow: workflow,
+                    text: text,
+                    fallbackTranslationTarget: translationTarget,
+                    detectedLanguage: detectedLanguage,
+                    configuredLanguage: configuredLanguage,
+                    resolvedOutputFormat: resolvedOutputFormat
+                )
+            }
+
+            let llmStart = CFAbsoluteTimeGetCurrent()
+            let outcome = try await WorkflowSegmentedPostProcessor(policy: segmentationPolicy).process(
+                text: text,
+                incrementalSession: incrementalPostProcessing,
+                incrementalRequest: incrementalRequest,
+                segmentProcessor: { segment in
+                    try await workflowProcessor.process(request: segmentedRequest, text: segment)
+                },
+                // Same request `process(workflow:)` builds for this workflow and text.
+                wholeTextProcessor: {
+                    try await workflowProcessor.process(request: segmentedRequest, text: text)
+                }
+            )
+            let llmMs = String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - llmStart) * 1000)
+            let elapsedMs = stopTimingStart.map { String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - $0) * 1000) } ?? "n/a"
+            logger.info("Stop timing: segmented workflow LLM done elapsedMs=\(elapsedMs, privacy: .public), llmMs=\(llmMs, privacy: .public), \(outcome.report.logDescription, privacy: .public)")
+            return outcome.text
+        }
+    }
+
+    /// Arms incremental workflow post-processing for the current recording when the
+    /// matched workflow opted in and the live preview runs on the dictation engine,
+    /// so its confirmed text can become the final transcript.
+    private func refreshIncrementalWorkflowPostProcessing(forceRestart: Bool = false) {
+        guard state == .recording, !isStopInFlight else { return }
+
+        let configuration = incrementalWorkflowPostProcessingConfiguration()
+        if !forceRestart,
+           let current = incrementalWorkflowPostProcessing,
+           current.request == configuration?.request,
+           current.policy == configuration?.policy {
+            return
+        }
+
+        cancelIncrementalWorkflowPostProcessing()
+        guard let configuration else { return }
+
+        let workflowProcessor = workflowTextProcessingService
+        let request = configuration.request
+        incrementalWorkflowPostProcessing = WorkflowIncrementalPostProcessingSession(
+            request: request,
+            policy: configuration.policy,
+            prepareInput: configuration.prepareInput,
+            processor: { segment in
+                try await workflowProcessor.process(request: request, text: segment)
+            }
+        )
+        logger.info("Incremental workflow post-processing armed for this recording localProvider=\(configuration.policy.isLocalProvider, privacy: .public)")
+    }
+
+    /// Segmentation tuned for the provider `request` will actually use. Uses the
+    /// locality snapshotted into the request, so it matches the request identity.
+    private func workflowSegmentationPolicy(for request: WorkflowLLMRequest) -> WorkflowSegmentationPolicy {
+        WorkflowSegmentationPolicy.default.forLLMProvider(
+            isLocal: request.providerResolution?.isLocal
+                ?? promptProcessingService.workflowUsesLocalLLMProvider(providerOverride: request.providerId)
+        )
+    }
+
+    private func incrementalWorkflowPostProcessingConfiguration() -> (
+        request: WorkflowLLMRequest,
+        policy: WorkflowSegmentationPolicy,
+        prepareInput: @MainActor (String) -> String
+    )? {
+        guard let workflow = matchedWorkflow,
+              workflow.usesSegmentedPostProcessing,
+              let streamingParams = lastStreamingParams,
+              lastPreviewFollowsDictationEngine,
+              !postProcessingPipeline.hasPluginStepsBeforeLLMStep else {
+            return nil
+        }
+
+        let activeApp = capturedActiveApp ?? (name: nil, bundleId: nil, url: nil)
+        let outputFormat = WorkflowOutputFormatResolver.resolvedFormat(
+            storedFormat: effectiveOutputFormat,
+            bundleIdentifier: activeApp.bundleId,
+            url: activeApp.url
+        )
+        let languageSelection = streamingParams.languageSelection
+        let configuredLanguage = languageSelection.requestedLanguage
+        guard let request = workflowTextProcessingService.segmentedPromptRequest(
+            workflow: workflow,
+            fallbackTranslationTarget: effectiveTranslationTarget,
+            detectedLanguage: nil,
+            configuredLanguage: configuredLanguage,
+            resolvedOutputFormat: outputFormat
+        ) else {
+            return nil
+        }
+
+        // Mirror what the stop path does to the live result before the LLM step:
+        // number normalization at live-session finish, then the pipeline's built-in
+        // steps. A mismatch is caught by the prefix check at stop.
+        let pipeline = postProcessingPipeline
+        let normalizeNumbers = streamingParams.normalizeNumbers
+        let normalizationLanguages = TranscriptionNormalizationService.normalizationLanguages(
+            task: streamingParams.task,
+            detectedLanguage: nil,
+            configuredLanguage: configuredLanguage,
+            configuredLanguageCandidates: languageSelection.selectedCodes
+        )
+        let context = PostProcessingContext(
+            appName: activeApp.name,
+            bundleIdentifier: activeApp.bundleId,
+            url: activeApp.url,
+            language: configuredLanguage
+        )
+        let dictationContext = DictationRuntimeContext(
+            engineId: streamingParams.engineOverrideId ?? streamingParams.providerId,
+            modelId: modelManager.resolvedModelId(
+                engineOverrideId: streamingParams.engineOverrideId,
+                cloudModelOverride: streamingParams.cloudModelOverride
+            ),
+            configuredLanguage: configuredLanguage,
+            configuredLanguageCandidates: languageSelection.selectedCodes,
+            detectedLanguage: nil
+        )
+        let prepareInput: @MainActor (String) -> String = { text in
+            let normalized = TranscriptionNormalizationService.normalizeText(
+                text,
+                languages: normalizationLanguages,
+                normalizeNumbers: normalizeNumbers
+            )
+            return pipeline.textBeforeLLMStep(
+                normalized,
+                context: context,
+                dictationContext: dictationContext,
+                outputFormat: outputFormat,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
+        return (request, workflowSegmentationPolicy(for: request), prepareInput)
+    }
+
+    private func cancelIncrementalWorkflowPostProcessing() {
+        incrementalWorkflowPostProcessing?.cancel()
+        incrementalWorkflowPostProcessing = nil
+    }
+
+    /// Executes an action plugin and handles its result (feedback, clipboard URL, events).
+    private func executeActionPlugin(
+        _ plugin: any ActionPlugin,
+        pluginId: String,
+        text: String,
+        activeApp: (name: String?, bundleId: String?, url: String?),
+        language: String? = nil,
+        originalText: String? = nil
+    ) async throws {
+        let actionContext = ActionContext(
+            appName: activeApp.name,
+            bundleIdentifier: activeApp.bundleId,
+            url: activeApp.url,
+            language: language,
+            originalText: originalText ?? text
+        )
+        let actionResult = try await plugin.execute(input: text, context: actionContext)
+
+        guard actionResult.success else {
+            throw NSError(domain: "ActionPlugin", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: actionResult.message])
+        }
+
+        if let url = actionResult.url {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url, forType: .string)
+        }
+        actionFeedbackMessage = actionResult.message
+        actionFeedbackIcon = actionResult.icon ?? "checkmark.circle.fill"
+        actionDisplayDuration = actionResult.displayDuration ?? 3.5
+        EventBus.shared.emit(.actionCompleted(ActionCompletedPayload(
+            actionId: pluginId, success: true, message: actionResult.message,
+            url: actionResult.url, appName: activeApp.name, bundleIdentifier: activeApp.bundleId
+        )))
+    }
+
+    // MARK: - Workflow Palette
+
+    var canCopyLastTranscription: Bool {
+        recentTranscriptionStore.latestEntry(historyRecords: historyService.recentRecords) != nil
+    }
+
+    func copyLastTranscriptionToClipboard() {
+        guard let entry = recentTranscriptionStore.latestEntry(historyRecords: historyService.recentRecords) else { return }
+        let text = entry.finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        let pasteboard = pasteboardProvider()
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    func pasteLastTranscription() {
+        promptPaletteHandler.hide()
+        recentTranscriptionPaletteHandler.hide()
+        recentTranscriptionPaletteHandler.insertLatest(currentState: state)
+    }
+
+    func readBackLastTranscription() {
+        guard let text = lastTranscribedText else { return }
+        speechFeedbackService.readBack(text: text, language: lastTranscriptionLanguage)
+    }
+
+    // MARK: - Undo Last Dictation / Restore Raw Transcript (issue #999)
+
+    /// Deletes the text inserted by the most recent successful dictation.
+    /// Safe no-op with user feedback unless the exact inserted text is still
+    /// immediately before the caret in the same app and field.
+    func undoLastDictation() {
+        switch dictationUndoService.perform(.undo) {
+        case .success:
+            showNotchFeedback(
+                message: localizedAppText(
+                    "Last dictation undone.",
+                    de: "Letztes Diktat rückgängig gemacht."
+                ),
+                icon: "arrow.uturn.backward",
+                errorCategory: "insertion"
+            )
+        case .failed(let failure):
+            reportDictationUndoFailure(failure)
+        }
+    }
+
+    /// Replaces the most recent inserted post-processed text with its raw
+    /// transcript. Unavailable when raw and inserted text are identical.
+    func restoreRawTranscript() {
+        switch dictationUndoService.perform(.restore) {
+        case .success:
+            showNotchFeedback(
+                message: localizedAppText(
+                    "Raw transcript restored.",
+                    de: "Rohtext wiederhergestellt."
+                ),
+                icon: "text.badge.checkmark",
+                errorCategory: "insertion"
+            )
+        case .failed(let failure):
+            reportDictationUndoFailure(failure)
+        }
+    }
+
+    private func reportDictationUndoFailure(_ failure: DictationUndoService.Failure) {
+        switch state {
+        case .idle, .error:
+            showNotchFeedback(
+                message: failure.feedbackMessage,
+                icon: "exclamationmark.triangle",
+                isError: true,
+                errorCategory: "insertion"
+            )
+        case .recording, .processing, .inserting, .promptSelection, .promptProcessing:
+            // A rejected shortcut must not replace an active operation with an
+            // insertion-feedback timer that later cancels its recording/tasks.
+            errorLogService.addEntry(message: failure.feedbackMessage, category: "insertion")
+            accessibilityAnnouncementService.announceError(failure.feedbackMessage)
+            soundService.play(.error, enabled: soundFeedbackEnabled)
+        }
+    }
+
+    /// Keeps recent-transcription state and the history record consistent with
+    /// the text that remains in the document after a raw restore. The
+    /// historical transcription record itself is never erased by an undo.
+    private func reflectRawTranscriptRestore(id: UUID, rawText: String) {
+        recentTranscriptionStore.updateFinalText(id: id, finalText: rawText)
+        if let record = historyService.record(withID: id) {
+            historyService.updateRecord(record, finalText: rawText)
+        }
+        if let session = dictationSessions[id], session.status == .completed,
+           var transcription = session.transcription {
+            transcription.text = rawText
+            transcription.wordsCount = rawText.split(whereSeparator: \.isWhitespace).count
+            storeDictationSession(DictationSessionSnapshot(
+                id: session.id, status: session.status, transcription: transcription, error: session.error
+            ))
+        }
+        lastTranscribedText = rawText
+    }
+
+    var canRecoverLastRecording: Bool {
+        audioRecordingService.latestRecoveryRecordingURL != nil
+    }
+
+    func recoverLastRecording(openSettingsWindow: Bool = true) {
+        guard audioRecordingService.latestRecoveryRecordingURL != nil else { return }
+
+        if let navigationCoordinator = SettingsNavigationCoordinator.shared {
+            navigationCoordinator.navigate(to: .dictationRecovery)
+        }
+        if openSettingsWindow {
+            if Bundle.main.bundleIdentifier == "dev.vedant.kivi-combined" {
+                KiviAdvancedWindow.shared.show("recovery")
+            } else {
+                ManagedAppWindowOpener.shared.open(id: "settings")
+            }
+        }
+    }
+
+    func triggerWorkflowPalette() {
+        recentTranscriptionPaletteHandler.hide()
+        promptPaletteHandler.triggerSelection(currentState: state, soundFeedbackEnabled: soundFeedbackEnabled)
+    }
+
+    func processWorkflowHotkeyText(workflowId: UUID) {
+        recentTranscriptionPaletteHandler.hide()
+        promptPaletteHandler.hide()
+        guard let workflow = workflowService.workflow(id: workflowId) else { return }
+        promptPaletteHandler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: state,
+            soundFeedbackEnabled: soundFeedbackEnabled
+        )
+    }
+
+    func triggerRecentTranscriptionsPalette() {
+        promptPaletteHandler.hide()
+        recentTranscriptionPaletteHandler.triggerSelection(currentState: state)
+    }
+
+    private func startTargetAppCorrectionLearningIfNeeded(
+        insertedText: String,
+        baseline: TextInsertionService.FocusedTextObservation?,
+        contributionContext: CorrectionContributionContext?,
+        accessibilityObservationLease: TargetAppAccessibilityObservationLease?
+    ) -> Bool {
+        targetAppCorrectionLearningTask?.cancel()
+        targetAppCorrectionLearningTask = nil
+
+        let shouldLearn = shouldTrackTargetAppCorrectionLearning
+        if TargetAppCorrectionLearningService.isPrivateBuild && !shouldLearn { return false }
+        guard shouldLearn || contributionContext != nil else {
+            return false
+        }
+
+        targetAppCorrectionLearningTask = Task {
+            @MainActor [
+                weak self,
+                baseline,
+                insertedText,
+                contributionContext,
+                shouldLearn,
+                accessibilityObservationLease
+            ] in
+            defer {
+                accessibilityObservationLease?.end()
+                self?.clearTargetAppAccessibilityObservation(
+                    ifMatching: accessibilityObservationLease
+                )
+            }
+            guard let self else { return }
+            let result = await self.targetAppCorrectionLearningService.trackInsertion(
+                insertedText: insertedText,
+                baseline: baseline
+            )
+            guard !Task.isCancelled else { return }
+            self.targetAppCorrectionLearningTask = nil
+            if let contributionContext,
+               let correctionObservation = result.correctionObservation {
+                EventBus.shared.emit(.textCorrectionCommitted(TextCorrectionCommittedPayload(
+                    id: UUID(),
+                    capturedAt: Date(),
+                    originalText: insertedText,
+                    correctedText: correctionObservation.correctedInsertedText,
+                    language: contributionContext.language,
+                    engineId: contributionContext.engineId,
+                    modelId: contributionContext.modelId,
+                    appVersion: AppConstants.appVersion,
+                    appBuild: AppConstants.buildVersion,
+                    platformVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+                    commitSignal: correctionObservation.commitSignal?.contributionPayloadValue,
+                    sourceChannel: AppConstants.isDevelopment ? .development : .production
+                )))
+            }
+            guard shouldLearn, !result.learnedCorrections.isEmpty else { return }
+            self.showLearnedCorrectionsFeedback(result.learnedCorrections)
+        }
+        return true
+    }
+
+    private var improveTypeWhisperCaptureEnabled: Bool {
+        UserDefaults.standard.bool(forKey: UserDefaultsKeys.improveTypeWhisperCaptureEnabled)
+    }
+
+    private func cancelTargetAppCorrectionLearning() {
+        targetAppCorrectionLearningTask?.cancel()
+        targetAppCorrectionLearningTask = nil
+        targetAppCorrectionLearningService.stopDetection()
+        if !TargetAppCorrectionLearningService.isPrivateBuild {
+            targetAppCorrectionLearningService.dismissReview()
+        }
+        endTargetAppAccessibilityObservation()
+    }
+
+    private func beginTargetAppAccessibilityObservationIfNeeded(
+        bundleIdentifier: String?
+    ) {
+        if targetAppAccessibilityObservationLease != nil {
+            return
+        }
+        guard shouldTrackTargetAppCorrectionLearning
+                || improveTypeWhisperCaptureEnabled
+                || liveFieldTranscriptEnabled else {
+            return
+        }
+        targetAppAccessibilityObservationLease = textInsertionService
+            .beginChromiumAccessibilityObservation(bundleIdentifier: bundleIdentifier)
+    }
+
+    private func endTargetAppAccessibilityObservation() {
+        let lease = targetAppAccessibilityObservationLease
+        targetAppAccessibilityObservationLease = nil
+        lease?.end()
+    }
+
+    private func finishTargetAppAccessibilityObservation(
+        _ lease: TargetAppAccessibilityObservationLease?
+    ) {
+        lease?.end()
+        clearTargetAppAccessibilityObservation(ifMatching: lease)
+    }
+
+    private func clearTargetAppAccessibilityObservation(
+        ifMatching lease: TargetAppAccessibilityObservationLease?
+    ) {
+        guard let lease,
+              targetAppAccessibilityObservationLease === lease else {
+            return
+        }
+        targetAppAccessibilityObservationLease = nil
+    }
+
+    private func clearActionFeedbackAction() {
+        actionFeedbackActionTitle = nil
+        actionFeedbackAction = nil
+    }
+
+    private func showLearnedCorrectionsFeedback(_ learned: [LearnedDictionaryCorrection]) {
+        guard !learned.isEmpty else { return }
+
+        let message: String
+        if learned.count == 1, let correction = learned.first {
+            message = String.localizedStringWithFormat(
+                String(localized: "Saved to Dictionary: “%@” -> “%@”"),
+                correction.original,
+                correction.replacement
+            )
+        } else {
+            message = String.localizedStringWithFormat(
+                String(localized: "Saved %d corrections to Dictionary"),
+                learned.count
+            )
+        }
+
+        showNotchFeedback(
+            message: message,
+            icon: "wand.and.sparkles",
+            duration: 12.0,
+            action: .undoLearnedCorrections(learned)
+        )
+    }
+
+    func performActionFeedbackAction(openRecoverySettingsWindow: Bool = true) {
+        guard let actionFeedbackAction else { return }
+
+        switch actionFeedbackAction {
+        case .undoLearnedCorrections(let learnedCorrections):
+            dictionaryService.undoLearnedCorrections(learnedCorrections)
+            showNotchFeedback(
+                message: String(localized: "Correction learning undone"),
+                icon: "arrow.uturn.backward.circle.fill",
+                duration: 2.5
+            )
+        case .openDictationRecovery:
+            recoverLastRecording(openSettingsWindow: openRecoverySettingsWindow)
+        case .openSettings(let tab):
+            SettingsNavigationCoordinator.shared?.navigate(to: tab)
+            if openRecoverySettingsWindow {
+                ManagedAppWindowOpener.shared.open(id: "settings")
+            }
+        }
+    }
+
+    private func showNotchFeedback(
+        message: String,
+        icon: String,
+        duration: TimeInterval = 2.5,
+        isError: Bool = false,
+        errorCategory: String = "general",
+        action: ActionFeedbackAction? = nil,
+        noSpeech: Bool = false
+    ) {
+        isNoSpeechFeedback = noSpeech
+        actionFeedbackMessage = message
+        actionFeedbackIcon = icon
+        actionFeedbackIsError = isError
+        clearActionFeedbackAction()
+        actionFeedbackAction = action
+        actionFeedbackActionTitle = action?.title
+        actionDisplayDuration = duration
+        state = .inserting
+
+        if isError {
+            errorLogService.addEntry(message: message, category: errorCategory)
+        }
+
+        startActionFeedbackLifetime(duration: duration)
+    }
+
+    func setActionFeedbackHovered(_ hovered: Bool) {
+        guard state == .inserting, actionFeedbackMessage != nil else {
+            indicatorFeedbackLifetime.setHovered(false)
+            return
+        }
+        indicatorFeedbackLifetime.setHovered(hovered)
+    }
+
+    private func startActionFeedbackLifetime(duration: TimeInterval) {
+        insertingResetTask?.cancel()
+        insertingResetTask = nil
+        let shouldRemainPaused = indicatorFeedbackLifetime.isPaused
+        indicatorFeedbackLifetime.start(duration: duration) { [weak self] in
+            self?.resetDictationState()
+        }
+        if shouldRemainPaused {
+            indicatorFeedbackLifetime.setHovered(true)
+        }
+    }
+
+    private func scheduleInsertingReset(after delay: Duration) {
+        insertingResetTask?.cancel()
+        let shouldStartQueuedDictation = pendingHotkeyDictationStart != nil
+        insertingResetTask = Task {
+            if shouldStartQueuedDictation {
+                await Task.yield()
+            } else {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
+            resetDictationState()
+        }
+    }
+
+    func updateExternalStreamingDisplay(active: Bool) {
+        externalStreamingDisplayCount += active ? 1 : -1
+    }
+
+    private func showRecoveryAwareFeedback(
+        message: String,
+        icon: String,
+        duration: TimeInterval,
+        isError: Bool = false,
+        errorCategory: String = "general",
+        recoveryPreservation: DictationRecoveryPreservationResult,
+        fallbackAction: ActionFeedbackAction? = nil,
+        noSpeech: Bool = false
+    ) {
+        guard recoveryPreservation.newlyPreservedURL != nil else {
+            showNotchFeedback(
+                message: message,
+                icon: icon,
+                duration: noSpeech ? max(8, duration) : duration,
+                isError: isError,
+                errorCategory: errorCategory,
+                action: fallbackAction,
+                noSpeech: noSpeech
+            )
+            return
+        }
+
+        let recoveryMessage = String(localized: "The recording was saved to Dictation Recovery.")
+        showNotchFeedback(
+            message: "\(message)\n\(recoveryMessage)",
+            icon: icon,
+            duration: 12.0,
+            isError: isError,
+            errorCategory: errorCategory,
+            action: .openDictationRecovery,
+            noSpeech: noSpeech
+        )
+    }
+
+    nonisolated static func errorFeedbackDuration(message: String, baseDuration: TimeInterval) -> TimeInterval {
+        max(baseDuration, min(12.0, Double(message.count) / 25.0))
+    }
+
+    private func showError(
+        _ message: String,
+        category: String = "general",
+        recoveryPreservation: DictationRecoveryPreservationResult? = nil,
+        settingsTab: SettingsTab? = nil
+    ) {
+        if let token = selectionInstructionToken {
+            IntentSelectionEditor.shared.spokenFailure(message, token: token)
+            selectionInstructionToken = nil
+        }
+        soundService.play(.error, enabled: soundFeedbackEnabled)
+        let settingsAction = settingsTab.map(ActionFeedbackAction.openSettings)
+        // Setup errors need time to read and reach the button; transient errors stay brief.
+        // Long messages, such as a provider's own error text, get reading time on top.
+        let duration = Self.errorFeedbackDuration(
+            message: message,
+            baseDuration: settingsAction == nil ? 3.0 : 8.0
+        )
+        if let recoveryPreservation {
+            showRecoveryAwareFeedback(
+                message: message,
+                icon: "xmark.circle.fill",
+                duration: duration,
+                isError: true,
+                errorCategory: category,
+                recoveryPreservation: recoveryPreservation,
+                fallbackAction: settingsAction
+            )
+        } else {
+            showNotchFeedback(
+                message: message,
+                icon: "xmark.circle.fill",
+                duration: duration,
+                isError: true,
+                errorCategory: category,
+                action: settingsAction
+            )
+        }
+    }
+
+    /// Settings page where the user can fix a transcription setup error, or nil for transient failures.
+    static func settingsTab(forTranscriptionError error: Error) -> SettingsTab? {
+        if let failure = error as? AutomaticRecoveryFallbackFailure {
+            return settingsTab(forTranscriptionError: failure.primaryError)
+        }
+
+        if let transcriptionError = error as? TranscriptionEngineError {
+            switch transcriptionError {
+            case .noEngineSelected, .modelNotLoaded, .modelLoadFailed(_):
+                return .dictation
+            case .engineUnavailable(_, _), .appleSpeechModelNotLoaded:
+                return .integrations
+            case .transcriptionFailed(_), .modelDownloadFailed(_):
+                return nil
+            }
+        }
+
+        if let pluginError = error as? PluginTranscriptionError {
+            switch pluginError {
+            case .notConfigured, .invalidApiKey:
+                return .integrations
+            case .noModelSelected:
+                return .dictation
+            case .rateLimited, .fileTooLarge, .apiError(_), .networkError(_):
+                return nil
+            }
+        }
+
+        return nil
+    }
+
+    private func startRecordingTimer() {
+        recordingDuration = 0
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let start = self.recordingStartTime else { return }
+                self.recordingDuration = Date().timeIntervalSince(start)
+            }
+        }
+    }
+
+    private func stopRecordingTimer() {
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        recordingDuration = 0
+    }
+}
+
+enum ShortSpeechDecision: Equatable {
+    case discardTooShort
+    case discardNoSpeech
+    case transcribe
+
+    var logDescription: String {
+        switch self {
+        case .discardTooShort:
+            "discardTooShort"
+        case .discardNoSpeech:
+            "discardNoSpeech"
+        case .transcribe:
+            "transcribe"
+        }
+    }
+}
+
+func hasConfirmedTranscriptionResultText(_ result: TranscriptionResult?) -> Bool {
+    guard let result else { return false }
+    return !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
+enum DictationInsertionTextFormatter {
+    static func contextualInsertionEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: UserDefaultsKeys.appFormattingEnabled)
+    }
+
+    static func standaloneValueFinalPeriodCleanupEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: UserDefaultsKeys.stripFinalPeriodFromStandaloneValuesEnabled)
+    }
+
+    static func textForInsertion(
+        _ text: String,
+        insertionContext: TextInsertionService.InsertionContext? = nil,
+        contextualInsertionEnabled: Bool = true,
+        standaloneValueFinalPeriodCleanupEnabled: Bool = true
+    ) -> String {
+        guard contextualInsertionEnabled, let insertionContext else {
+            return text
+        }
+
+        let boundaries = insertionBoundaries(for: insertionContext)
+        var result = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isHighConfidenceMidSentenceInsertion(boundaries) {
+            result = lowercasingFirstWordIfSafe(result)
+        }
+        if shouldStripFinalPeriod(boundaries) {
+            result = strippingSingleFinalPeriod(result)
+        }
+        if shouldStripStandaloneValueFinalPeriod(
+            result,
+            boundaries: boundaries,
+            enabled: standaloneValueFinalPeriodCleanupEnabled
+        ) {
+            result = strippingSingleFinalPeriod(result)
+        }
+
+        if let previous = boundaries.previousCharacter,
+           let first = result.first,
+           shouldInsertSpace(between: previous, and: first) {
+            result = " " + result
+        }
+
+        if let next = boundaries.nextCharacter {
+            if let last = result.last,
+               shouldInsertSpace(between: last, and: next) {
+                result += " "
+            }
+        }
+
+        return result
+    }
+
+    private struct InsertionBoundaries {
+        let previousCharacter: Character?
+        let nextCharacter: Character?
+        let previousNonWhitespaceCharacter: Character?
+        let nextNonWhitespaceCharacter: Character?
+    }
+
+    private static func insertionBoundaries(
+        for context: TextInsertionService.InsertionContext
+    ) -> InsertionBoundaries {
+        guard let selectedRange = Range(context.selectedRange, in: context.value) else {
+            return InsertionBoundaries(
+                previousCharacter: context.previousCharacter,
+                nextCharacter: context.nextCharacter,
+                previousNonWhitespaceCharacter: nonWhitespaceCharacter(context.previousCharacter),
+                nextNonWhitespaceCharacter: nonWhitespaceCharacter(context.nextCharacter)
+            )
+        }
+
+        let previousCharacter = selectedRange.lowerBound > context.value.startIndex
+            ? context.value[context.value.index(before: selectedRange.lowerBound)]
+            : nil
+        let nextCharacter = selectedRange.upperBound < context.value.endIndex
+            ? context.value[selectedRange.upperBound]
+            : nil
+
+        return InsertionBoundaries(
+            previousCharacter: previousCharacter,
+            nextCharacter: nextCharacter,
+            previousNonWhitespaceCharacter: previousNonWhitespaceCharacter(
+                before: selectedRange.lowerBound,
+                in: context.value
+            ),
+            nextNonWhitespaceCharacter: nextNonWhitespaceCharacter(
+                after: selectedRange.upperBound,
+                in: context.value
+            )
+        )
+    }
+
+    private static func previousNonWhitespaceCharacter(
+        before index: String.Index,
+        in value: String
+    ) -> Character? {
+        var currentIndex = index
+        while currentIndex > value.startIndex {
+            let previousIndex = value.index(before: currentIndex)
+            let character = value[previousIndex]
+            if !isWhitespace(character) {
+                return character
+            }
+            currentIndex = previousIndex
+        }
+        return nil
+    }
+
+    private static func nextNonWhitespaceCharacter(
+        after index: String.Index,
+        in value: String
+    ) -> Character? {
+        var currentIndex = index
+        while currentIndex < value.endIndex {
+            let character = value[currentIndex]
+            if !isWhitespace(character) {
+                return character
+            }
+            currentIndex = value.index(after: currentIndex)
+        }
+        return nil
+    }
+
+    private static func nonWhitespaceCharacter(_ character: Character?) -> Character? {
+        guard let character, !isWhitespace(character) else { return nil }
+        return character
+    }
+
+    private static func isHighConfidenceMidSentenceInsertion(
+        _ boundaries: InsertionBoundaries
+    ) -> Bool {
+        guard let previous = boundaries.previousNonWhitespaceCharacter else { return false }
+        return isWordLike(previous)
+    }
+
+    private static func shouldStripFinalPeriod(_ boundaries: InsertionBoundaries) -> Bool {
+        guard isHighConfidenceMidSentenceInsertion(boundaries),
+              let next = boundaries.nextNonWhitespaceCharacter else {
+            return false
+        }
+        return isWordLike(next) || closingPunctuation.contains(next)
+    }
+
+    /// Strips a model-added final period when the whole transcript is a
+    /// standalone value (email address, URL, number, version string) dropped
+    /// into an empty field. Mutually exclusive with the mid-sentence rule
+    /// above — that one needs surrounding text, this one needs none — so a
+    /// period can only ever be stripped once.
+    private static func shouldStripStandaloneValueFinalPeriod(
+        _ text: String,
+        boundaries: InsertionBoundaries,
+        enabled: Bool
+    ) -> Bool {
+        guard enabled,
+              boundaries.previousNonWhitespaceCharacter == nil,
+              boundaries.nextNonWhitespaceCharacter == nil
+        else {
+            return false
+        }
+        return StandaloneValueFinalPeriodCleanup.shouldStripFinalPeriod(from: text)
+    }
+
+    /// Decides whether a transcript standing on its own is a value whose final
+    /// period was added by the model rather than dictated, as in
+    /// `name@example.com.` typed into an empty field.
+    ///
+    /// Conservative on purpose: only whole-text matches for email addresses,
+    /// bare-domain URLs, decimal numbers, phone numbers, and version strings
+    /// qualify. Abbreviations (`Dr.`, `U.S.`), prose, ambiguous numeric forms
+    /// such as dates, and URLs carrying a path, query, or fragment keep
+    /// their period — a dot is a legal part of those (RFC 3986 section 2.3).
+    private enum StandaloneValueFinalPeriodCleanup {
+        static func shouldStripFinalPeriod(from text: String) -> Bool {
+            guard text.hasSuffix("."), !text.hasSuffix("..") else { return false }
+            let candidate = String(text.dropLast())
+            guard !candidate.isEmpty else { return false }
+            if isAbbreviation(text) { return false }
+            if isDateLike(candidate) { return false }
+            return isEmailAddress(candidate)
+                || isWebAddress(candidate)
+                || isDecimalNumber(candidate)
+                || isVersionString(candidate)
+                || isPhoneNumber(candidate)
+        }
+
+        /// `Dr.`, `U.S.`, `e.g.`, `Dr.med.`, `Ph.D.` — never values. Each
+        /// dot-separated group is either a single letter or a known
+        /// abbreviation word, so `file.txt.` still counts as a value.
+        private static let abbreviationExpression = try? NSRegularExpression(
+            pattern: #"^(?:(?:[A-Za-z]|Dr|Mr|Mrs|Ms|No|St|Jr|Sr|Prof|Inc|Ltd|Co|etc|vs|bzw|ca|ggf|evtl|Nr|Tel|med|rer|nat|ing|dipl|phil|Ph)\.)+$"#,
+            options: [.caseInsensitive]
+        )
+
+        private static let emailExpression = try? NSRegularExpression(
+            pattern: #"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"#
+        )
+
+        /// Bare-domain URLs only: `example.com`, `www.example.com`,
+        /// `https://example.com`. A terminal dot directly after the host is
+        /// the classic model-added sentence period. Once a path, query, or
+        /// fragment is present the dot may belong to the resource
+        /// (`https://example.com/search?q=Dr.`), so it stays untouched.
+        private static let urlExpression = try? NSRegularExpression(
+            pattern: #"^(?:https?://|ftp://|www\.)?(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}(?::\d+)?$"#,
+            options: [.caseInsensitive]
+        )
+
+        /// `3.14`, `1,5`, `1,000.50`, `1.000,50` — both English and German forms.
+        private static let decimalExpression = try? NSRegularExpression(
+            pattern: #"^\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?$|^\d+[.,]\d+$"#
+        )
+
+        /// `19.04.2026`, `2026-09-27`, `27. 09. 2026` — ambiguous with
+        /// versions, so untouched. Whitespace around the separators is
+        /// accepted because dictation often inserts it (`27 / 09 / 2026`);
+        /// without it such dates would fall through to the phone-number
+        /// check and wrongly lose their period.
+        private static let dateExpression = try? NSRegularExpression(
+            pattern: #"^\d{1,2}\s*[./\-]\s*\d{1,2}\s*[./\-]\s*\d{2,4}$|^\d{4}\s*[./\-]\s*\d{1,2}\s*[./\-]\s*\d{1,2}$"#
+        )
+
+        private static let versionExpression = try? NSRegularExpression(
+            pattern: #"^v?\d+(?:\.\d+){2,}$"#,
+            options: [.caseInsensitive]
+        )
+
+        private static let phoneExpression = try? NSRegularExpression(
+            pattern: #"^[+\d(][\d\s\-/.()]*$"#
+        )
+
+        private static func isAbbreviation(_ text: String) -> Bool {
+            matches(abbreviationExpression, text)
+        }
+
+        private static func isEmailAddress(_ candidate: String) -> Bool {
+            matches(emailExpression, candidate)
+        }
+
+        private static func isWebAddress(_ candidate: String) -> Bool {
+            matches(urlExpression, candidate)
+        }
+
+        private static func isDecimalNumber(_ candidate: String) -> Bool {
+            matches(decimalExpression, candidate)
+        }
+
+        private static func isDateLike(_ candidate: String) -> Bool {
+            matches(dateExpression, candidate)
+        }
+
+        private static func isVersionString(_ candidate: String) -> Bool {
+            matches(versionExpression, candidate)
+        }
+
+        private static func isPhoneNumber(_ candidate: String) -> Bool {
+            guard matches(phoneExpression, candidate) else { return false }
+            return candidate.filter(\.isWholeNumber).count >= 6
+        }
+
+        private static func matches(_ expression: NSRegularExpression?, _ text: String) -> Bool {
+            guard let expression else { return false }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            return expression.firstMatch(in: text, options: [], range: range) != nil
+        }
+    }
+
+    private static func lowercasingFirstWordIfSafe(_ text: String) -> String {
+        var result = text
+        guard let wordRange = firstWordRange(in: result),
+              shouldLowercaseFirstWord(String(result[wordRange])) else {
+            return result
+        }
+
+        let firstIndex = wordRange.lowerBound
+        let nextIndex = result.index(after: firstIndex)
+        result.replaceSubrange(firstIndex..<nextIndex, with: String(result[firstIndex]).lowercased())
+        return result
+    }
+
+    private static func firstWordRange(in text: String) -> Range<String.Index>? {
+        var start = text.startIndex
+        while start < text.endIndex, isWhitespace(text[start]) {
+            start = text.index(after: start)
+        }
+        guard start < text.endIndex, isWordLike(text[start]) else {
+            return nil
+        }
+
+        var end = text.index(after: start)
+        while end < text.endIndex, isWordLike(text[end]) {
+            end = text.index(after: end)
+        }
+        return start..<end
+    }
+
+    private static func shouldLowercaseFirstWord(_ word: String) -> Bool {
+        guard word.count > 1,
+              let first = word.first,
+              isUppercaseLetter(first) else {
+            return false
+        }
+
+        let remainder = word.dropFirst()
+        guard remainder.contains(where: isLowercaseLetter) else {
+            return false
+        }
+        return !remainder.contains(where: isUppercaseLetter)
+    }
+
+    private static func strippingSingleFinalPeriod(_ text: String) -> String {
+        var result = text
+        var currentIndex = result.endIndex
+
+        while currentIndex > result.startIndex {
+            let previousIndex = result.index(before: currentIndex)
+            if isWhitespace(result[previousIndex]) {
+                currentIndex = previousIndex
+                continue
+            }
+
+            guard result[previousIndex] == "." else {
+                return result
+            }
+            if previousIndex > result.startIndex {
+                let beforePeriod = result.index(before: previousIndex)
+                guard result[beforePeriod] != "." else {
+                    return result
+                }
+            }
+            result.removeSubrange(previousIndex..<currentIndex)
+            return result
+        }
+
+        return result
+    }
+
+    private static func shouldInsertSpace(between left: Character, and right: Character) -> Bool {
+        if isWhitespace(left) || isWhitespace(right) {
+            return false
+        }
+        if closingPunctuation.contains(right) || openingPunctuation.contains(left) {
+            return false
+        }
+        if isCJKCharacter(left) && isCJKCharacter(right) {
+            return false
+        }
+        if isWordLike(left) && isWordLike(right) {
+            return true
+        }
+        if isWordLike(right) && punctuationThatTakesFollowingSpace.contains(left) {
+            return true
+        }
+        return false
+    }
+
+    private static let openingPunctuation: Set<Character> = ["(", "[", "{", "\"", "'", "“", "‘"]
+    private static let closingPunctuation: Set<Character> = [".", ",", "!", "?", ";", ":", ")", "]", "}", "\"", "'", "”", "’"]
+    private static let punctuationThatTakesFollowingSpace: Set<Character> = [".", ",", "!", "?", ";", ":", ")", "]", "}", "\"", "'", "”", "’"]
+    private static let cjkScriptCharacterRegex = try? NSRegularExpression(
+        pattern: #"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]"#
+    )
+
+    private static func isWordLike(_ character: Character) -> Bool {
+        character.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) }
+    }
+
+    private static func isCJKCharacter(_ character: Character) -> Bool {
+        let text = String(character)
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return cjkScriptCharacterRegex?.firstMatch(in: text, range: range) != nil
+    }
+
+    private static func isWhitespace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
+    private static func isUppercaseLetter(_ character: Character) -> Bool {
+        character.unicodeScalars.contains { CharacterSet.uppercaseLetters.contains($0) }
+    }
+
+    private static func isLowercaseLetter(_ character: Character) -> Bool {
+        character.unicodeScalars.contains { CharacterSet.lowercaseLetters.contains($0) }
+    }
+}
+
+// Upper bound of the "short dictation" window for the aggressive quiet-clip
+// policy. Issue #732: dictations of a few seconds were discarded as "no speech"
+// even with aggressive transcription enabled, because the aggressive path only
+// covered sub-second clips.
+private let aggressiveShortDictationMaxDuration: TimeInterval = 8.0
+
+// Peak level below which a clip counts as near-silence even in aggressive mode.
+// Matches the sub-second aggressive floor: the microphone boost path can still
+// make speech at this level transcribable, but anything quieter is noise.
+private let aggressiveQuietClipPeakFloor: Float = 0.003
+
+func classifyShortSpeech(
+    rawDuration: TimeInterval,
+    peakLevel: Float,
+    hasConfirmedText: Bool,
+    transcribeShortQuietClipsAggressively: Bool = true
+) -> ShortSpeechDecision {
+    guard rawDuration >= 0.04 else { return .discardTooShort }
+    if hasConfirmedText { return .transcribe }
+
+    if rawDuration < 1.0 {
+        // Bias toward transcribing short clips. False negatives here are worse than
+        // letting the recognizer return empty text for actual silence.
+        if peakLevel < aggressiveQuietClipPeakFloor {
+            return transcribeShortQuietClipsAggressively ? .transcribe : .discardNoSpeech
+        }
+        return .transcribe
+    }
+
+    if peakLevel < 0.006 {
+        // Aggressive mode extends the short-clip bias past the sub-second window:
+        // a quiet peak on a short dictation is more likely quiet speech than
+        // silence, and the recognizer returning empty text is a cheaper failure
+        // than discarding real speech. Near-silence is still discarded, and long
+        // recordings keep the strict threshold so extended silence isn't
+        // needlessly transcribed.
+        if transcribeShortQuietClipsAggressively,
+           rawDuration < aggressiveShortDictationMaxDuration,
+           peakLevel >= aggressiveQuietClipPeakFloor {
+            return .transcribe
+        }
+        return .discardNoSpeech
+    }
+    return .transcribe
+}
+
+func paddedSamplesForFinalTranscription(_ samples: [Float], rawDuration: TimeInterval) -> [Float] {
+    var paddedSamples = samples
+
+    if rawDuration < 0.75 {
+        let targetSampleCount = Int(0.75 * AudioRecordingService.targetSampleRate)
+        let padCount = max(0, targetSampleCount - samples.count)
+        paddedSamples.append(contentsOf: [Float](repeating: 0, count: padCount))
+    } else {
+        let tailPadCount = Int(0.3 * AudioRecordingService.targetSampleRate)
+        paddedSamples.append(contentsOf: [Float](repeating: 0, count: tailPadCount))
+    }
+
+    return paddedSamples
+}
+
+#if DEBUG
+extension DictationViewModel {
+    func transcribeFinalAudioForTesting(
+        audioSamples: [Float] = [],
+        languageSelection: LanguageSelection = LanguageSelection(storedValue: nil, nilBehavior: .auto),
+        task: TranscriptionTask = .transcribe,
+        primaryEngineId: String? = nil,
+        primaryCloudModelOverride: String? = nil
+    ) async throws -> (text: String, usedRecoveryFallback: Bool) {
+        let output = try await transcribeFinalAudio(
+            audioSamples: audioSamples,
+            languageSelection: languageSelection,
+            task: task,
+            primaryEngineId: primaryEngineId,
+            primaryCloudModelOverride: primaryCloudModelOverride,
+            prompt: nil,
+            dictionaryTermHints: [],
+            normalizeNumbers: nil
+        )
+        return (output.result.text, output.usedRecoveryFallback)
+    }
+}
+#endif

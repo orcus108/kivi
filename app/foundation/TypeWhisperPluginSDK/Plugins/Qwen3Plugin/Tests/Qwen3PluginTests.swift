@@ -1,0 +1,439 @@
+import XCTest
+import TypeWhisperPluginSDK
+import TypeWhisperPluginSDKTesting
+@testable import Qwen3Plugin
+
+final class Qwen3PluginTests: XCTestCase {
+    func testChunkTranscriberProcessesEveryChunkWithAnIndependentTokenBudget() throws {
+        let chunks = Array(0..<24)
+        var generatedChunks: [Int] = []
+
+        let result = try QwenChunkTranscriber.transcribe(
+            primaryChunks: chunks,
+            primaryTokenLimit: 2_048,
+            fallbackTokenLimit: 1_536,
+            makeFallbackChunks: { _ in
+                XCTFail("Fallback should not run for complete primary chunks")
+                return []
+            },
+            generatePrimary: { chunk in
+                generatedChunks.append(chunk)
+                return QwenChunkGeneration(
+                    text: "chunk-\(chunk)",
+                    language: "Chinese",
+                    generatedTokenCount: 100
+                )
+            },
+            generateFallback: { _ in
+                XCTFail("Fallback should not run for complete primary chunks")
+                return QwenChunkGeneration(text: "", language: nil, generatedTokenCount: 0)
+            }
+        )
+
+        // The cumulative 2,400 generated tokens exceed the old shared 2,048-token cap.
+        XCTAssertEqual(generatedChunks, chunks)
+        XCTAssertEqual(result.text, chunks.map { "chunk-\($0)" }.joined(separator: " "))
+        XCTAssertEqual(result.language, "Chinese")
+    }
+
+    func testChunkTranscriberRetriesCappedPrimaryChunkWithSmallerFallbackChunks() throws {
+        let result = try QwenChunkTranscriber.transcribe(
+            primaryChunks: [1],
+            primaryTokenLimit: 2_048,
+            fallbackTokenLimit: 1_536,
+            makeFallbackChunks: { _ in [10, 11] },
+            generatePrimary: { _ in
+                QwenChunkGeneration(
+                    text: "partial primary",
+                    language: "Chinese",
+                    generatedTokenCount: 2_048
+                )
+            },
+            generateFallback: { chunk in
+                QwenChunkGeneration(
+                    text: "fallback-\(chunk)",
+                    language: "Chinese",
+                    generatedTokenCount: 100
+                )
+            }
+        )
+
+        XCTAssertEqual(result.text, "fallback-10 fallback-11")
+        XCTAssertEqual(result.language, "Chinese")
+    }
+
+    func testChunkTranscriberReportsIncompleteWhenFallbackAlsoHitsTokenLimit() {
+        XCTAssertThrowsError(
+            try QwenChunkTranscriber.transcribe(
+                primaryChunks: [1],
+                primaryTokenLimit: 2_048,
+                fallbackTokenLimit: 1_536,
+                makeFallbackChunks: { _ in [10] },
+                generatePrimary: { _ in
+                    QwenChunkGeneration(
+                        text: "partial primary",
+                        language: "Chinese",
+                        generatedTokenCount: 2_048
+                    )
+                },
+                generateFallback: { _ in
+                    QwenChunkGeneration(
+                        text: "partial fallback",
+                        language: "Chinese",
+                        generatedTokenCount: 1_536
+                    )
+                }
+            )
+        ) { error in
+            XCTAssertEqual(error as? QwenChunkTranscriptionError, .incomplete)
+        }
+    }
+
+    func testChunkTranscriberReportsIncompleteWhenLoopedPrimaryFallbackHitsTokenLimit() {
+        let loopedPrimary = Array(repeating: "loop", count: 16).joined(separator: " ")
+        XCTAssertTrue(QwenTranscriptGuard.isLikelyLooped(loopedPrimary))
+
+        XCTAssertThrowsError(
+            try QwenChunkTranscriber.transcribe(
+                primaryChunks: [1],
+                primaryTokenLimit: 2_048,
+                fallbackTokenLimit: 1_536,
+                makeFallbackChunks: { _ in [10] },
+                generatePrimary: { _ in
+                    QwenChunkGeneration(
+                        text: loopedPrimary,
+                        language: "Chinese",
+                        generatedTokenCount: 100
+                    )
+                },
+                generateFallback: { _ in
+                    QwenChunkGeneration(
+                        text: "partial fallback",
+                        language: "Chinese",
+                        generatedTokenCount: 1_536
+                    )
+                }
+            )
+        ) { error in
+            XCTAssertEqual(error as? QwenChunkTranscriptionError, .incomplete)
+        }
+    }
+
+    func testAutoDetectDoesNotForceEnglish() {
+        XCTAssertNil(Qwen3Plugin.resolveLanguageName(nil))
+        XCTAssertNil(Qwen3Plugin.resolveLanguageName(""))
+        XCTAssertNil(Qwen3Plugin.resolveLanguageName("   "))
+    }
+
+    func testFrenchLanguageResolvesToQwenLanguageName() {
+        XCTAssertEqual(Qwen3Plugin.resolveLanguageName("fr"), "French")
+        XCTAssertEqual(Qwen3Plugin.languageCode(forQwenLanguageName: "French"), "fr")
+    }
+
+    func testUnsupportedLanguageDoesNotFallbackToEnglish() {
+        XCTAssertNil(Qwen3Plugin.resolveLanguageName("uk"))
+        XCTAssertNil(Qwen3Plugin.languageCode(forQwenLanguageName: "French,English"))
+    }
+
+    func testSupportedLanguagesMatchQwenASRLanguageSetWithTagalogAlias() {
+        XCTAssertEqual(
+            Qwen3Plugin.qwenSupportedLanguageCodes,
+            [
+                "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it",
+                "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv",
+                "da", "fi", "pl", "cs", "fil", "tl", "fa", "el", "ro", "hu",
+                "mk",
+            ]
+        )
+        XCTAssertEqual(Qwen3Plugin.resolveLanguageName("fil"), "Filipino")
+        XCTAssertEqual(Qwen3Plugin.resolveLanguageName("tl"), "Filipino")
+    }
+
+    func testContextFormatterIncludesExplicitPromptContext() {
+        let context = Qwen3Plugin.contextBiasString(from: " Use TypeWhisper and MLX spelling. ")
+
+        XCTAssertTrue(context.contains(Qwen3ContextBiasFormatter.baseInstruction))
+        XCTAssertTrue(context.contains("Use TypeWhisper and MLX spelling."))
+    }
+
+    func testContextFormatterIncludesBaseInstructionWithoutDictionaryTerms() {
+        XCTAssertEqual(
+            Qwen3Plugin.contextBiasString(from: nil),
+            Qwen3ContextBiasFormatter.baseInstruction
+        )
+    }
+
+    func testDictionaryTermsAreNotAdvertisedForQwen3Prompting() {
+        XCTAssertEqual(Qwen3Plugin().dictionaryTermsSupport, .unsupported)
+    }
+
+    func testFrenchTrailingOuiArtifactIsRemovedOnlyAfterSentencePunctuation() {
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: "Je vais envoyer le fichier. oui",
+                languageName: "French"
+            ),
+            "Je vais envoyer le fichier."
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: "Je vais envoyer le fichier. Oui.",
+                languageName: "French"
+            ),
+            "Je vais envoyer le fichier."
+        )
+    }
+
+    func testFrenchTrailingOuiArtifactIsRemovedAfterLongBarePhrase() {
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: "Je vais envoyer le fichier oui",
+                languageName: "French"
+            ),
+            "Je vais envoyer le fichier"
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: "Je vais envoyer le fichier, oui.",
+                languageName: "French"
+            ),
+            "Je vais envoyer le fichier"
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: "Je vais envoyer le fichier Oui!",
+                languageName: "French"
+            ),
+            "Je vais envoyer le fichier"
+        )
+    }
+
+    func testFrenchTrailingOuiGuardPreservesRealOuiUsages() {
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(from: "Oui.", languageName: "French"),
+            "Oui."
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(from: "Je pense que oui.", languageName: "French"),
+            "Je pense que oui."
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(from: "Je suis certain que oui.", languageName: "French"),
+            "Je suis certain que oui."
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(from: "Je confirme oui.", languageName: "French"),
+            "Je confirme oui."
+        )
+        XCTAssertEqual(
+            QwenTranscriptGuard.removingLikelyTrailingArtifact(from: "I will send it. oui", languageName: "English"),
+            "I will send it. oui"
+        )
+    }
+
+    func testModelCatalogIncludesRefreshedMLXVariants() {
+        XCTAssertEqual(
+            Qwen3Plugin.availableModels.map(\.id),
+            [
+                "qwen3-asr-0.6b-4bit",
+                "qwen3-asr-0.6b-5bit",
+                "qwen3-asr-0.6b-6bit",
+                "qwen3-asr-0.6b-8bit",
+                "qwen3-asr-0.6b-bf16",
+                "qwen3-asr-1.7b-4bit",
+                "qwen3-asr-1.7b-5bit",
+                "qwen3-asr-1.7b-6bit",
+                "qwen3-asr-1.7b-8bit",
+                "qwen3-asr-1.7b-bf16",
+            ]
+        )
+    }
+
+    func testModelCatalogIncludesRecommendationGuidance() {
+        let modelsById = Dictionary(
+            uniqueKeysWithValues: Qwen3Plugin.availableModels.map { ($0.id, $0) }
+        )
+
+        XCTAssertEqual(modelsById["qwen3-asr-0.6b-6bit"]?.recommendation, .lowMemory)
+        XCTAssertEqual(modelsById["qwen3-asr-1.7b-6bit"]?.recommendation, .balanced)
+        XCTAssertEqual(modelsById["qwen3-asr-1.7b-8bit"]?.recommendation, .highQuality)
+        XCTAssertTrue(Qwen3Plugin.availableModels.allSatisfy { !$0.usageHint.isEmpty })
+        XCTAssertEqual(
+            Qwen3Plugin.availableModels.filter { $0.recommendation != nil }.map(\.id),
+            [
+                "qwen3-asr-0.6b-6bit",
+                "qwen3-asr-1.7b-6bit",
+                "qwen3-asr-1.7b-8bit",
+            ]
+        )
+    }
+
+    func testRestoreCandidatesUseDownloadedSelectedModelWithoutLoadedModel() throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first { $0.id == "qwen3-asr-1.7b-8bit" })
+        let host = try PluginTestHostServices(
+            defaults: ["selectedModel": model.id],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+        try makeDownloadedModelDirectory(model, host: host)
+
+        XCTAssertNil(host.userDefault(forKey: "loadedModel"))
+        XCTAssertEqual(plugin.selectedModelId, model.id)
+        XCTAssertEqual(plugin.downloadedModels.map(\.id), [model.id])
+        XCTAssertEqual(plugin.restoreCandidateModelIds(allowDownloads: false), [model.id])
+    }
+
+    func testDownloadedModelSelectionIsRestoreableWithoutDownloadingFallbacks() throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first { $0.id == "qwen3-asr-1.7b-8bit" })
+        let host = try PluginTestHostServices(shouldRestoreLoadedModelsPassively: false)
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+        try makeDownloadedModelDirectory(model, host: host)
+
+        XCTAssertTrue(plugin.shouldRestoreDownloadedSelection(model.id, previousLoadedModelId: nil))
+        XCTAssertFalse(plugin.shouldRestoreDownloadedSelection(model.id, previousLoadedModelId: model.id))
+        XCTAssertEqual(plugin.restoreCandidateModelIds(preferredModelId: model.id, allowDownloads: false), [model.id])
+    }
+
+    func testRestoreCandidatesFallBackToSoleDownloadedModelWithoutSelection() throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first { $0.id == "qwen3-asr-1.7b-8bit" })
+        let host = try PluginTestHostServices(shouldRestoreLoadedModelsPassively: false)
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+        try makeDownloadedModelDirectory(model, host: host)
+
+        XCTAssertNil(plugin.selectedModelId)
+        XCTAssertEqual(plugin.downloadedModels.map(\.id), [model.id])
+        XCTAssertEqual(plugin.restoreCandidateModelIds(allowDownloads: false), [model.id])
+    }
+
+    func testUndownloadedModelSelectionDoesNotRestoreOrDownload() throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first { $0.id == "qwen3-asr-1.7b-8bit" })
+        let host = try PluginTestHostServices(shouldRestoreLoadedModelsPassively: false)
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+        plugin.selectModel(model.id)
+
+        XCTAssertEqual(plugin.selectedModelId, model.id)
+        XCTAssertEqual(host.userDefault(forKey: "selectedModel") as? String, model.id)
+        XCTAssertFalse(plugin.shouldRestoreDownloadedSelection(model.id, previousLoadedModelId: nil))
+        XCTAssertTrue(plugin.restoreCandidateModelIds(preferredModelId: model.id, allowDownloads: false).isEmpty)
+        XCTAssertNil(host.userDefault(forKey: "loadedModel"))
+    }
+
+    func testRestoreCandidatesDoNotDefaultToUndownloadedModel() throws {
+        let host = try PluginTestHostServices(shouldRestoreLoadedModelsPassively: false)
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+
+        XCTAssertNil(plugin.selectedModelId)
+        XCTAssertTrue(plugin.downloadedModels.isEmpty)
+        XCTAssertTrue(plugin.restoreCandidateModelIds(allowDownloads: false).isEmpty)
+    }
+
+    func testDeleteDownloadedModelRemovesCacheAndClearsSelection() async throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first)
+        let host = try PluginTestHostServices(
+            defaults: ["selectedModel": model.id],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        let plugin = Qwen3Plugin()
+
+        plugin.activate(host: host)
+        host.setUserDefault(model.id, forKey: "loadedModel")
+
+        let modelDirectory = try makeDownloadedModelDirectory(model, host: host)
+        let canonicalDirectory = try makeCanonicalModelDirectory(model, host: host)
+        let cacheRoot = canonicalDirectory.deletingLastPathComponent().deletingLastPathComponent()
+        let cacheName = "models--" + model.repoId.replacingOccurrences(of: "/", with: "--")
+        let metadataDirectory = host.pluginDataDirectory
+            .appendingPathComponent("models/.metadata/\(cacheName)", isDirectory: true)
+        let lockDirectory = host.pluginDataDirectory
+            .appendingPathComponent("models/.locks/\(cacheName)", isDirectory: true)
+        try write("metadata", to: metadataDirectory.appendingPathComponent("entry"))
+        try write("lock", to: lockDirectory.appendingPathComponent("entry.lock"))
+
+        XCTAssertEqual(plugin.downloadedModels.map(\.id), [model.id])
+
+        try await plugin.deleteDownloadedModel(model.id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: modelDirectory.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheRoot.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataDirectory.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lockDirectory.path))
+        XCTAssertNil(plugin.selectedModelId)
+        XCTAssertNil(host.userDefault(forKey: "selectedModel"))
+        XCTAssertNil(host.userDefault(forKey: "loadedModel"))
+    }
+
+    func testCanonicalSnapshotIsRecognizedAndActivationRemovesEquivalentLegacyCopy() throws {
+        let model = try XCTUnwrap(Qwen3Plugin.availableModels.first)
+        let host = try PluginTestHostServices(shouldRestoreLoadedModelsPassively: false)
+        let legacyDirectory = try makeDownloadedModelDirectory(model, host: host)
+        _ = try makeCanonicalModelDirectory(model, host: host, tokenizerFormat: .vocabAndMerges)
+
+        let plugin = Qwen3Plugin()
+        plugin.activate(host: host)
+
+        XCTAssertEqual(plugin.downloadedModels.map(\.id), [model.id])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyDirectory.path))
+    }
+
+    @discardableResult
+    private func makeDownloadedModelDirectory(
+        _ model: Qwen3ModelDef,
+        host: PluginTestHostServices
+    ) throws -> URL {
+        let modelDirectory = host.pluginDataDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("mlx-audio", isDirectory: true)
+            .appendingPathComponent(model.repoId.replacingOccurrences(of: "/", with: "_"), isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try write("{}", to: modelDirectory.appendingPathComponent("config.json"))
+        try write("{}", to: modelDirectory.appendingPathComponent("vocab.json"))
+        try write("#version: 0.2\na b", to: modelDirectory.appendingPathComponent("merges.txt"))
+        try write("weights", to: modelDirectory.appendingPathComponent("model.safetensors"))
+        return modelDirectory
+    }
+
+    private enum TokenizerFormat {
+        case tokenizerJSON
+        case vocabAndMerges
+    }
+
+    @discardableResult
+    private func makeCanonicalModelDirectory(
+        _ model: Qwen3ModelDef,
+        host: PluginTestHostServices,
+        tokenizerFormat: TokenizerFormat = .tokenizerJSON
+    ) throws -> URL {
+        let commit = String(repeating: "a", count: 40)
+        let cacheName = "models--" + model.repoId.replacingOccurrences(of: "/", with: "--")
+        let repository = host.pluginDataDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(cacheName, isDirectory: true)
+        let snapshot = repository.appendingPathComponent("snapshots/\(commit)", isDirectory: true)
+        try write(commit + "\n", to: repository.appendingPathComponent("refs/main"))
+        try write("{}", to: snapshot.appendingPathComponent("config.json"))
+        try write("weights", to: snapshot.appendingPathComponent("model.safetensors"))
+        switch tokenizerFormat {
+        case .tokenizerJSON:
+            try write("{}", to: snapshot.appendingPathComponent("tokenizer.json"))
+        case .vocabAndMerges:
+            try write("{}", to: snapshot.appendingPathComponent("vocab.json"))
+            try write("#version: 0.2\na b", to: snapshot.appendingPathComponent("merges.txt"))
+        }
+        return snapshot
+    }
+
+    private func write(_ contents: String, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: url)
+    }
+}

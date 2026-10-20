@@ -1,0 +1,1540 @@
+import Foundation
+import CoreML
+import OSLog
+import SwiftUI
+import FluidAudio
+@_spi(FirstPartyPlugins) import TypeWhisperPluginSDK
+
+private actor AsyncTranscriptionGate {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func withLock<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        guard isLocked else {
+            isLocked = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        guard !waiters.isEmpty else {
+            isLocked = false
+            return
+        }
+
+        let next = waiters.removeFirst()
+        next.resume()
+    }
+}
+
+// MARK: - Plugin Entry Point
+
+@objc(ParakeetPlugin)
+final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscriptionEnginePlugin, DictionaryTermsCapabilityProviding, TranscriptPreviewFallbackPolicyProviding, PluginSettingsActivityReporting, PassiveModelRestoreProviding, @unchecked Sendable {
+    static let pluginId = "com.typewhisper.parakeet"
+    static let pluginName = "Parakeet"
+    static let vocabularyAssetFileName = "parakeet_vocab.json"
+    private static let logger = Logger(subsystem: "com.typewhisper.plugin.parakeet", category: "Transcription")
+    private static let shortClipConfidenceThreshold: Float = 0.55
+    private static let shortClipConfidenceGateDuration: TimeInterval = 1.0
+    private static let fluidAudioProgressMinimumSampleCount = 240_000
+    typealias VocabularyAssetFetcher = @Sendable (_ url: URL, _ description: String) async throws -> Data
+
+    fileprivate var host: HostServices?
+    fileprivate var asrManager: AsrManager?
+    fileprivate var loadedAsrModels: AsrModels?
+    fileprivate var loadedModelId: String?
+    fileprivate var _selectedModelId: String?
+    var modelState: ParakeetModelState = .notLoaded
+    fileprivate var downloadProgress: Double = 0
+    fileprivate var selectedVersion: ParakeetVersion = .v3
+    fileprivate var _hfToken: String?
+    var restoresModelOnActivate = true
+
+    // Vocabulary Boosting
+    fileprivate var ctcModels: CtcModels?
+    fileprivate var ctcTokenizer: CtcTokenizer?
+    fileprivate var ctcSpotter: CtcKeywordSpotter?
+    fileprivate var customVocabulary: CustomVocabularyContext?
+    fileprivate var vocabularyRescorer: VocabularyRescorer?
+    fileprivate var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
+    fileprivate var vocabularyBoostingEnabled: Bool = false
+    private let transcriptionGate = AsyncTranscriptionGate()
+    var ctcModelState: CtcModelState = .notDownloaded
+    var lastConfiguredPrompt: String?
+    var lastBoostingTermCount: Int = 0
+
+    private let passiveRestoreController = PluginPassiveModelRestoreController()
+    private let modelLoadGate = PluginLocalInferenceGate()
+
+    func requestPassiveModelRestore() {
+        passiveRestoreController.request { [weak self] in
+            guard let self, self.restoresModelOnActivate else { return }
+            await self.restoreLoadedModel(allowDownloads: false, passively: true)
+        }
+    }
+
+    required override init() {
+        super.init()
+    }
+
+    func activate(host: HostServices) {
+        self.host = host
+        _selectedModelId = host.userDefault(forKey: "selectedModel") as? String
+        _hfToken = PluginHuggingFaceTokenHelper.loadToken(from: host)
+        vocabularyBoostingEnabled = host.userDefault(forKey: "vocabularyBoostingEnabled") as? Bool ?? false
+        if let versionString = host.userDefault(forKey: "selectedVersion") as? String,
+           let version = ParakeetVersion(rawValue: versionString) {
+            selectedVersion = version
+        }
+        if let selectedModelId = _selectedModelId,
+           let version = ParakeetVersion.from(modelId: selectedModelId) {
+            selectedVersion = version
+        } else if let persistedLoadedModel = host.userDefault(forKey: "loadedModel") as? String,
+                  !persistedLoadedModel.isEmpty {
+            _selectedModelId = persistedLoadedModel
+            host.setUserDefault(persistedLoadedModel, forKey: "selectedModel")
+            if let version = ParakeetVersion.from(modelId: persistedLoadedModel) {
+                selectedVersion = version
+            }
+        }
+        if restoresModelOnActivate, host.shouldRestoreLoadedModelsPassively {
+            requestPassiveModelRestore()
+        }
+    }
+
+    func deactivate() {
+        passiveRestoreController.cancel()
+        clearVocabularyBoostingState(resetModelState: true)
+        asrManager = nil
+        loadedAsrModels = nil
+        loadedModelId = nil
+        _selectedModelId = nil
+        modelState = .notLoaded
+        _hfToken = nil
+        host = nil
+    }
+
+    // MARK: - TranscriptionEnginePlugin
+
+    var providerId: String { "parakeet" }
+    var providerDisplayName: String { "Parakeet" }
+
+    var isConfigured: Bool {
+        asrManager != nil && loadedModelId != nil
+    }
+
+    var canDismissSettingsAfterSetup: Bool {
+        if case .ready = modelState {
+            return true
+        }
+        return false
+    }
+
+    var transcriptionModels: [PluginModelInfo] {
+        ParakeetVersion.allCases.map { version in
+            let def = version.modelDef
+            return PluginModelInfo(
+                id: def.id,
+                displayName: def.displayName,
+                sizeDescription: def.sizeDescription,
+                languageCount: version.languageCount
+            )
+        }
+    }
+
+    var selectedModelId: String? { _selectedModelId }
+    var allowsTranscriptPreviewFallback: Bool { true }
+    var supportsStreaming: Bool { true }
+
+    func selectModel(_ modelId: String) {
+        guard let version = ParakeetVersion.from(modelId: modelId) else { return }
+        _selectedModelId = modelId
+        host?.setUserDefault(modelId, forKey: "selectedModel")
+        if version == selectedVersion && loadedModelId == modelId { return }
+        Task {
+            unloadModel(clearPersistence: false)
+            selectedVersion = version
+            _selectedModelId = modelId
+            host?.setUserDefault(modelId, forKey: "selectedModel")
+            host?.setUserDefault(version.rawValue, forKey: "selectedVersion")
+            await loadModel()
+        }
+    }
+
+    var supportsTranslation: Bool { false }
+    var dictionaryTermsSupport: DictionaryTermsSupport {
+        vocabularyBoostingEnabled ? .supported : .requiresPluginSetting
+    }
+
+    var supportedLanguages: [String] {
+        selectedVersion.supportedLanguages
+    }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?
+    ) async throws -> PluginTranscriptionResult {
+        try await transcribe(
+            audio: audio,
+            language: language,
+            translate: translate,
+            prompt: prompt,
+            onProgress: { _ in true },
+            onSourceProgress: { _ in true }
+        )
+    }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        onProgress: @Sendable @escaping (String) -> Bool,
+        onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
+    ) async throws -> PluginTranscriptionResult {
+        try await transcriptionGate.withLock {
+            try await transcribeSerially(
+                audio: audio,
+                language: language,
+                translate: translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress,
+                onSourceProgress: onSourceProgress
+            )
+        }
+    }
+
+    private func transcribeSerially(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        onProgress: @Sendable @escaping (String) -> Bool,
+        onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
+    ) async throws -> PluginTranscriptionResult {
+        guard let asrManager else {
+            throw PluginTranscriptionError.notConfigured
+        }
+
+        if translate {
+            throw PluginTranscriptionError.apiError("Parakeet does not support translation")
+        }
+
+        if vocabularyBoostingEnabled {
+            await configureBoostingIfNeeded(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        }
+
+        let normalizedSamples = PluginAudioUtils.paddedSamples(
+            audio.samples,
+            minimumDuration: 1.0,
+            sampleRate: 16_000
+        )
+        let fluidLanguage = Self.fluidAudioLanguage(for: language)
+        var decoderState = TdtDecoderState.make(decoderLayers: await asrManager.decoderLayerCount)
+        let progressTask: Task<Void, Never>? = if Self.shouldObserveSourceProgress(sampleCount: normalizedSamples.count) {
+            Task { [asrManager, duration = audio.duration, onSourceProgress] in
+                let stream = await asrManager.transcriptionProgressStream
+                do {
+                    for try await fraction in stream {
+                        guard !Task.isCancelled else { break }
+                        guard let progress = Self.sourceProgress(fromFraction: fraction, totalDuration: duration) else {
+                            continue
+                        }
+                        if !onSourceProgress(progress) {
+                            break
+                        }
+                    }
+                } catch {
+                    // The transcription task reports the underlying error; progress is best-effort.
+                }
+            }
+        } else {
+            nil
+        }
+        defer { progressTask?.cancel() }
+
+        let result = try await asrManager.transcribe(
+            normalizedSamples,
+            decoderState: &decoderState,
+            language: fluidLanguage
+        )
+        let finalResult = await applyVocabularyRescoringIfNeeded(
+            to: result,
+            audioSamples: normalizedSamples
+        )
+        let trimmedText = finalResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if audio.duration < Self.shortClipConfidenceGateDuration {
+            Self.logger.info(
+                "Short clip transcription: rawDuration=\(String(format: "%.3f", audio.duration), privacy: .public)s, confidence=\(String(format: "%.3f", finalResult.confidence), privacy: .public), textLength=\(trimmedText.count, privacy: .public)"
+            )
+        }
+
+        guard PluginAudioUtils.shouldAcceptShortClipTranscription(
+            audioDuration: audio.duration,
+            confidence: finalResult.confidence,
+            minimumDuration: Self.shortClipConfidenceGateDuration,
+            minimumConfidence: Self.shortClipConfidenceThreshold
+        ) else {
+            Self.logger.info(
+                "Discarding low-confidence short clip: rawDuration=\(String(format: "%.3f", audio.duration), privacy: .public)s, confidence=\(String(format: "%.3f", finalResult.confidence), privacy: .public)"
+            )
+            return PluginTranscriptionResult(text: "", detectedLanguage: nil, segments: [])
+        }
+
+        let segments: [PluginTranscriptionSegment]
+        if let tokenTimings = finalResult.tokenTimings, !tokenTimings.isEmpty {
+            segments = Self.groupTokensIntoSegments(tokenTimings)
+        } else {
+            segments = []
+        }
+
+        _ = onProgress(finalResult.text)
+        return PluginTranscriptionResult(text: finalResult.text, detectedLanguage: nil, segments: segments)
+    }
+
+    static func sourceProgress(
+        fromFraction fraction: Double,
+        totalDuration: TimeInterval
+    ) -> PluginTranscriptionSourceProgress? {
+        guard fraction.isFinite,
+              totalDuration.isFinite,
+              totalDuration > 0 else {
+            return nil
+        }
+        let clampedFraction = min(max(fraction, 0), 1)
+        return PluginTranscriptionSourceProgress(
+            processedDuration: totalDuration * clampedFraction,
+            totalDuration: totalDuration
+        )
+    }
+
+    static func shouldObserveSourceProgress(sampleCount: Int) -> Bool {
+        sampleCount > fluidAudioProgressMinimumSampleCount
+    }
+
+    private static func fluidAudioLanguage(for language: String?) -> Language? {
+        guard let language else { return nil }
+        let primaryCode = language
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .first
+            .map(String.init)
+
+        guard let primaryCode, !primaryCode.isEmpty else { return nil }
+        return Language(rawValue: primaryCode)
+    }
+    // MARK: - Token-to-Segment Grouping
+
+    private static func groupTokensIntoSegments(_ tokenTimings: [TokenTiming]) -> [PluginTranscriptionSegment] {
+        // Phase 1: Group sub-word tokens into words
+        struct WordTiming {
+            let word: String
+            let start: Double
+            let end: Double
+        }
+
+        var words: [WordTiming] = []
+        var currentWord = ""
+        var wordStart: Double = 0
+        var wordEnd: Double = 0
+
+        for timing in tokenTimings {
+            let token = timing.token
+            if token.isEmpty || token == "<blank>" || token == "<pad>" { continue }
+
+            let startsNewWord = isWordBoundary(token) || currentWord.isEmpty
+
+            if startsNewWord && !currentWord.isEmpty {
+                let trimmed = currentWord.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty {
+                    words.append(WordTiming(word: trimmed, start: wordStart, end: wordEnd))
+                }
+                currentWord = ""
+            }
+
+            if startsNewWord {
+                currentWord = stripWordBoundaryPrefix(token)
+                wordStart = timing.startTime
+            } else {
+                currentWord += token
+            }
+            wordEnd = timing.endTime
+        }
+
+        let lastTrimmed = currentWord.trimmingCharacters(in: .whitespaces)
+        if !lastTrimmed.isEmpty {
+            words.append(WordTiming(word: lastTrimmed, start: wordStart, end: wordEnd))
+        }
+
+        guard !words.isEmpty else { return [] }
+
+        // Phase 2: Group words into sentence segments (split at sentence-ending punctuation or pause > 0.8s)
+        let sentenceEndings: Set<Character> = [".", "?", "!"]
+        let pauseThreshold: Double = 0.8
+
+        var segments: [PluginTranscriptionSegment] = []
+        var segmentWords: [String] = []
+        var segmentStart: Double = words[0].start
+        var segmentEnd: Double = words[0].end
+
+        for i in 0..<words.count {
+            let word = words[i]
+            segmentWords.append(word.word)
+            segmentEnd = word.end
+
+            let isSentenceEnd = word.word.last.map { sentenceEndings.contains($0) } ?? false
+            let hasLongPause = i + 1 < words.count && (words[i + 1].start - word.end) > pauseThreshold
+            let isLast = i == words.count - 1
+
+            if isSentenceEnd || hasLongPause || isLast {
+                let text = segmentWords.joined(separator: " ")
+                segments.append(PluginTranscriptionSegment(text: text, start: segmentStart, end: segmentEnd))
+                segmentWords = []
+                if i + 1 < words.count {
+                    segmentStart = words[i + 1].start
+                }
+            }
+        }
+
+        return segments
+    }
+
+    // MARK: - Vocabulary Boosting
+
+    fileprivate func downloadCtcModel() async {
+        ctcModelState = .downloading
+        do {
+            applyHuggingFaceTokenToEnvironment()
+            let spaceReservation = try await reserveCtcDownloadSpace()
+            defer { spaceReservation?.release() }
+            let models = try await CtcModels.downloadAndLoad(variant: .ctc110m)
+            let cacheDir = CtcModels.defaultCacheDirectory(for: .ctc110m)
+            let tokenizer = try await CtcTokenizer.load(from: cacheDir)
+            ctcModels = models
+            ctcTokenizer = tokenizer
+            ctcModelState = .ready
+        } catch {
+            ctcModelState = .error(error.localizedDescription)
+        }
+    }
+
+    static func vocabularyHints(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) -> [PluginDictionaryTermHint] {
+        if !dictionaryTermHints.isEmpty {
+            return PluginDictionaryTerms.normalizedTermHints(from: dictionaryTermHints)
+        }
+        return PluginDictionaryTerms.termHints(fromPrompt: prompt)
+    }
+
+    static func vocabularySignature(from hints: [PluginDictionaryTermHint]) -> String? {
+        guard !hints.isEmpty else { return nil }
+        return hints.map {
+            let threshold = $0.ctcMinSimilarity.map { String(format: "%.4f", Double($0)) } ?? "auto"
+            return "\($0.text)|\(threshold)"
+        }.joined(separator: "\u{1F}")
+    }
+
+    private func configureBoostingIfNeeded(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint] = []
+    ) async {
+        guard vocabularyBoostingEnabled else { return }
+
+        let termHints = Self.vocabularyHints(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        let signature = Self.vocabularySignature(from: termHints)
+        if signature == lastConfiguredPrompt && (signature != nil || customVocabulary == nil) { return }
+        lastConfiguredPrompt = signature
+
+        guard !termHints.isEmpty else {
+            clearConfiguredVocabulary()
+            return
+        }
+
+        if ctcModels == nil {
+            await downloadCtcModel()
+        }
+        guard let ctcModels, let ctcTokenizer else {
+            lastConfiguredPrompt = nil
+            return
+        }
+
+        let terms = termHints.compactMap { hint -> CustomVocabularyTerm? in
+            let text = hint.text
+            let ids = ctcTokenizer.encode(text)
+            guard !ids.isEmpty else { return nil }
+            return Self.customVocabularyTerm(
+                from: hint,
+                ctcTokenIds: ids
+            )
+        }
+
+        guard !terms.isEmpty else {
+            clearConfiguredVocabulary()
+            return
+        }
+
+        let cappedTerms = Array(terms.prefix(256))
+        let vocab = CustomVocabularyContext(terms: cappedTerms)
+        let blankId = ctcModels.vocabulary.count
+        let spotter = CtcKeywordSpotter(models: ctcModels, blankId: blankId)
+        let ctcModelDir = CtcModels.defaultCacheDirectory(for: ctcModels.variant)
+        do {
+            let rescorer = try await VocabularyRescorer.create(
+                spotter: spotter,
+                vocabulary: vocab,
+                // Acoustic-only rescue can inject unrelated short dictionary words.
+                // Keep the text-similarity gate, including per-term overrides.
+                config: VocabularyRescorer.Config(spotterRescueEnabled: false),
+                ctcModelDirectory: ctcModelDir
+            )
+            customVocabulary = vocab
+            ctcSpotter = spotter
+            vocabularyRescorer = rescorer
+            vocabSizeConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: cappedTerms.count)
+            lastBoostingTermCount = cappedTerms.count
+        } catch {
+            clearConfiguredVocabulary()
+            lastBoostingTermCount = 0
+            lastConfiguredPrompt = nil
+        }
+    }
+
+    static func customVocabularyTerm(
+        from hint: PluginDictionaryTermHint,
+        ctcTokenIds: [Int]
+    ) -> CustomVocabularyTerm {
+        CustomVocabularyTerm(
+            text: hint.text,
+            weight: 10.0,
+            ctcTokenIds: ctcTokenIds,
+            minSimilarity: hint.ctcMinSimilarity
+        )
+    }
+
+    private func applyVocabularyRescoringIfNeeded(
+        to result: ASRResult,
+        audioSamples: [Float]
+    ) async -> ASRResult {
+        guard vocabularyBoostingEnabled,
+              let spotter = ctcSpotter,
+              let rescorer = vocabularyRescorer,
+              let vocab = customVocabulary,
+              let tokenTimings = result.tokenTimings,
+              !tokenTimings.isEmpty
+        else {
+            return result
+        }
+
+        do {
+            let spotResult = try await spotter.spotKeywordsWithLogProbs(
+                audioSamples: audioSamples,
+                customVocabulary: vocab,
+                minScore: nil
+            )
+            guard !spotResult.logProbs.isEmpty else { return result }
+
+            let vocabConfig = vocabSizeConfig
+                ?? ContextBiasingConstants.rescorerConfig(forVocabSize: vocab.terms.count)
+            let rescoreOutput = rescorer.ctcTokenRescore(
+                transcript: result.text,
+                tokenTimings: tokenTimings,
+                logProbs: spotResult.logProbs,
+                frameDuration: spotResult.frameDuration,
+                cbw: vocabConfig.cbw,
+                marginSeconds: 0.5,
+                minSimilarity: max(vocabConfig.minSimilarity, vocab.minSimilarity)
+            )
+
+            guard rescoreOutput.wasModified else { return result }
+            // The upstream span search can shorten an already-correct phrase,
+            // e.g. "uses GitHub Actions" to "GitHub Actions". Its public output
+            // has no replacement ranges, so preserve the original transcript if
+            // any applied replacement would delete text around an existing term.
+            guard !rescoreOutput.replacements.contains(where: { replacement in
+                replacement.shouldReplace && replacement.replacementWord.map {
+                    Self.removesTextAroundExistingTerm(original: replacement.originalWord, replacement: $0)
+                } == true
+            }) else { return result }
+
+            let detectedTerms = spotResult.detections.map(\.term.text)
+            let appliedTerms = rescoreOutput.replacements.compactMap { replacement in
+                replacement.shouldReplace ? replacement.replacementWord : nil
+            }
+            Self.logger.info(
+                "Vocabulary rescoring applied \(rescoreOutput.replacements.count) replacement(s)"
+            )
+            return result.withRescoring(
+                text: rescoreOutput.text,
+                detected: detectedTerms,
+                applied: appliedTerms
+            )
+        } catch {
+            Self.logger.warning("Vocabulary rescoring failed: \(error.localizedDescription)")
+            return result
+        }
+    }
+
+    static func removesTextAroundExistingTerm(original: String, replacement: String) -> Bool {
+        // Ignore spelling separators so compounds and split names are protected
+        // too, while capitalization/spacing-only corrections remain possible.
+        func lettersAndNumbers(_ text: String) -> String {
+            String(text.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            ).filter { $0.isLetter || $0.isNumber })
+        }
+        let source = lettersAndNumbers(original)
+        let term = lettersAndNumbers(replacement)
+        return !term.isEmpty && source != term && source.contains(term)
+    }
+
+    func setBoostingEnabled(_ enabled: Bool) {
+        guard vocabularyBoostingEnabled != enabled else { return }
+        vocabularyBoostingEnabled = enabled
+        host?.setUserDefault(enabled, forKey: "vocabularyBoostingEnabled")
+        if !enabled {
+            clearConfiguredVocabulary()
+        }
+        host?.notifyCapabilitiesChanged()
+    }
+
+    private func clearConfiguredVocabulary() {
+        ctcSpotter = nil
+        customVocabulary = nil
+        vocabularyRescorer = nil
+        vocabSizeConfig = nil
+        lastConfiguredPrompt = nil
+        lastBoostingTermCount = 0
+    }
+
+    private func clearVocabularyBoostingState(resetModelState: Bool = false) {
+        clearConfiguredVocabulary()
+        ctcModels = nil
+        ctcTokenizer = nil
+        if resetModelState {
+            ctcModelState = .notDownloaded
+        }
+    }
+
+    // MARK: - Model Management
+
+    fileprivate func loadModel(version: ParakeetVersion? = nil, passively: Bool = false) async {
+        let version = version ?? selectedVersion
+        try? await modelLoadGate.withLock { [self] in
+            guard host != nil else { return }
+            if passively {
+                let vocabularyURL = Self.vocabularyAssetDirectory(for: version)
+                    .appendingPathComponent(Self.vocabularyAssetFileName)
+                guard host?.shouldRestoreLoadedModelsPassively == true, !isConfigured,
+                      isModelDownloaded(version: version),
+                      Self.vocabularyAssetExists(at: vocabularyURL) else { return }
+            }
+            guard !(isConfigured && loadedModelId == version.modelDef.id) else { return }
+            await performModelLoad(version: version, allowDownloads: !passively)
+        }
+    }
+
+    private func performModelLoad(version: ParakeetVersion, allowDownloads: Bool) async {
+        modelState = .downloading
+        downloadProgress = 0.1
+
+        do {
+            applyHuggingFaceTokenToEnvironment()
+            let models: AsrModels
+            if allowDownloads {
+                let spaceReservation = isModelDownloaded(version: version)
+                    ? nil
+                    : try await reserveDownloadSpace(for: version)
+                defer { spaceReservation?.release() }
+                try await ensureVocabularyAsset(for: version)
+                models = try await AsrModels.downloadAndLoad(version: version.asrModelVersion)
+            } else {
+                models = try Self.loadInstalledModels(version: version)
+            }
+            downloadProgress = 0.7
+
+            // Keep the pre-0.15.7 chunk context: the new v3 default changes
+            // punctuation at chunk boundaries in paired long-form recordings.
+            let manager = AsrManager(config: ASRConfig(melChunkContext: true))
+            try await manager.loadModels(models)
+            downloadProgress = 1.0
+
+            try Task.checkCancellation()
+            guard host != nil else { return }
+            selectedVersion = version
+            asrManager = manager
+            loadedAsrModels = models
+            loadedModelId = version.modelDef.id
+            _selectedModelId = version.modelDef.id
+            modelState = .ready
+
+            host?.setUserDefault(version.modelDef.id, forKey: "selectedModel")
+            host?.setUserDefault(version.modelDef.id, forKey: "loadedModel")
+            host?.setUserDefault(version.rawValue, forKey: "selectedVersion")
+            host?.notifyCapabilitiesChanged()
+
+            // Optional vocabulary preparation remains on the explicit/first-use path;
+            // FluidAudio's CTC loader may repair its cache by downloading assets.
+            if vocabularyBoostingEnabled, allowDownloads {
+                let cacheDir = CtcModels.defaultCacheDirectory(for: .ctc110m)
+                if CtcModels.modelsExist(at: cacheDir) {
+                    await downloadCtcModel()
+                }
+            }
+        } catch is CancellationError {
+            if host != nil { modelState = isConfigured ? .ready : .notLoaded }
+            return
+        } catch {
+            modelState = .error(error.localizedDescription)
+            downloadProgress = 0
+        }
+    }
+
+    /// FluidAudio's high-level loaders can delete and re-download a corrupt cache,
+    /// even when every file exists. Passive restore must use local Core ML loading.
+    static func loadInstalledModels(version: ParakeetVersion, directory: URL? = nil) throws -> AsrModels {
+        let directory = directory ?? AsrModels.defaultCacheDirectory(for: version.asrModelVersion)
+        let vocabularyURL = directory.appendingPathComponent(ModelNames.ASR.vocabularyFile)
+        let tokens = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: vocabularyURL))
+        var vocabulary: [Int: String] = [:]
+        for (key, token) in tokens {
+            if let id = Int(key) { vocabulary[id] = token }
+        }
+        guard !vocabulary.isEmpty else {
+            throw AsrModelsError.loadingFailed("Installed vocabulary is empty")
+        }
+        let configuration = AsrModels.defaultConfiguration()
+        let preprocessorConfiguration = MLModelConfiguration()
+        preprocessorConfiguration.computeUnits = .cpuOnly
+        preprocessorConfiguration.allowLowPrecisionAccumulationOnGPU = true
+        let jointFile = version.asrModelVersion.isV3Family ? ModelNames.ASR.jointV3File : ModelNames.ASR.jointFile
+        return try AsrModels(
+            encoder: MLModel(contentsOf: directory.appendingPathComponent(ModelNames.ASR.encoderFile), configuration: configuration),
+            preprocessor: MLModel(contentsOf: directory.appendingPathComponent(ModelNames.ASR.preprocessorFile), configuration: preprocessorConfiguration),
+            decoder: MLModel(contentsOf: directory.appendingPathComponent(ModelNames.ASR.decoderFile), configuration: configuration),
+            joint: MLModel(contentsOf: directory.appendingPathComponent(jointFile), configuration: configuration),
+            configuration: configuration,
+            vocabulary: vocabulary,
+            version: version.asrModelVersion
+        )
+    }
+
+    static func vocabularyAssetURL(for version: ParakeetVersion) -> URL {
+        URL(string: "https://huggingface.co/\(version.repository.remotePath)/resolve/main/\(vocabularyAssetFileName)")!
+    }
+
+    static func vocabularyAssetDirectory(for version: ParakeetVersion) -> URL {
+        AsrModels.defaultCacheDirectory(for: version.asrModelVersion)
+    }
+
+    func ensureVocabularyAsset(
+        for version: ParakeetVersion,
+        targetDirectory: URL? = nil,
+        fetcher: VocabularyAssetFetcher = { url, description in
+            try await ParakeetPlugin.downloadVocabularyAsset(from: url, description: description)
+        }
+    ) async throws {
+        let directory = targetDirectory ?? Self.vocabularyAssetDirectory(for: version)
+        let targetURL = directory.appendingPathComponent(Self.vocabularyAssetFileName, isDirectory: false)
+        guard !Self.vocabularyAssetExists(at: targetURL) else { return }
+
+        let vocabularyURL = Self.vocabularyAssetURL(for: version)
+        let description = "\(version.modelDef.displayName) vocabulary"
+        let data: Data
+        do {
+            data = try await fetcher(vocabularyURL, description)
+        } catch {
+            throw ParakeetVocabularyAssetError.downloadFailed(version: version, underlying: error)
+        }
+        guard !data.isEmpty else {
+            throw ParakeetVocabularyAssetError.emptyDownload(version: version)
+        }
+
+        let fileManager = FileManager.default
+        var installFailureURL = directory
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let temporaryURL = directory.appendingPathComponent(
+                ".\(Self.vocabularyAssetFileName).\(UUID().uuidString).tmp",
+                isDirectory: false
+            )
+            installFailureURL = temporaryURL
+            do {
+                try data.write(to: temporaryURL, options: .atomic)
+                if Self.vocabularyAssetExists(at: targetURL) {
+                    try? fileManager.removeItem(at: temporaryURL)
+                    return
+                }
+                installFailureURL = targetURL
+                if fileManager.fileExists(atPath: targetURL.path) {
+                    try fileManager.removeItem(at: targetURL)
+                }
+                try fileManager.moveItem(at: temporaryURL, to: targetURL)
+            } catch {
+                try? fileManager.removeItem(at: temporaryURL)
+                throw error
+            }
+        } catch {
+            throw ParakeetVocabularyAssetError.installFailed(
+                version: version,
+                path: installFailureURL,
+                underlying: error
+            )
+        }
+    }
+
+    private static func vocabularyAssetExists(at url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else {
+            return false
+        }
+        return size.intValue > 0
+    }
+
+    private static func downloadVocabularyAsset(from url: URL, description: String) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 600
+        if let token = currentHuggingFaceToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await PluginHTTPClient.data(for: request, resourceTimeout: 600)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ParakeetVocabularyAssetHTTPError(description: description, statusCode: nil)
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw ParakeetVocabularyAssetHTTPError(
+                description: description,
+                statusCode: httpResponse.statusCode
+            )
+        }
+        return data
+    }
+
+    private static func currentHuggingFaceToken() -> String? {
+        for key in PluginHuggingFaceTokenHelper.environmentKeys {
+            if let token = PluginHuggingFaceTokenHelper.normalizedToken(ProcessInfo.processInfo.environment[key]) {
+                return token
+            }
+        }
+        return nil
+    }
+
+    @objc func triggerAutoUnload() { unloadModel(clearPersistence: false) }
+
+    /// Test hook: when true, restore triggers publish the synchronous in-flight
+    /// mark without spawning the async restore task, so tests can assert on the
+    /// mark deterministically instead of racing the task's completion.
+    var suppressAsyncRestoreForTests = false
+
+    @objc func triggerRestoreModel() {
+        markRestoreInFlight()
+        guard !suppressAsyncRestoreForTests else { return }
+        Task {
+            await restoreLoadedModel(allowDownloads: true)
+            finishRestoreTrigger()
+        }
+    }
+
+    @objc(triggerRestoreModelForModel:)
+    func triggerRestoreModel(forModel modelId: NSString?) {
+        guard let modelId = modelId.map(String.init),
+              let version = ParakeetVersion.from(modelId: modelId) else {
+            return
+        }
+        if loadedModelId != nil, loadedModelId != modelId {
+            unloadModel(clearPersistence: false)
+        }
+        _selectedModelId = modelId
+        selectedVersion = version
+        host?.setUserDefault(modelId, forKey: "selectedModel")
+        host?.setUserDefault(version.rawValue, forKey: "selectedVersion")
+        markRestoreInFlight()
+        guard !suppressAsyncRestoreForTests else { return }
+        Task {
+            await loadModel()
+            finishRestoreTrigger()
+        }
+    }
+
+    /// Marks a restore as in-flight synchronously. The host extends its restore
+    /// wait past the base window only while the plugin reports an activity, and
+    /// task scheduling can delay the unstructured task above before it publishes
+    /// its first state update. Without this mark, the host can time out and
+    /// report "no model loaded" for a restore that is still starting.
+    private func markRestoreInFlight() {
+        guard !isConfigured else { return }
+        modelState = .downloading
+        downloadProgress = 0
+    }
+
+    /// Resolves the in-flight restore mark once the restore task finishes. A
+    /// successful load already recorded `.ready` and a failed load already
+    /// recorded the underlying `.error`. Only a restore that produced nothing
+    /// (e.g. nothing was persisted to restore) needs an explicit error, so the
+    /// host surfaces it instead of polling a stale activity until its wait
+    /// expires.
+    private func finishRestoreTrigger() {
+        guard host != nil else { return }
+        switch modelState {
+        case .ready, .error:
+            return
+        case .notLoaded, .downloading:
+            break
+        }
+        modelState = isConfigured ? .ready : .error("No previously loaded model to restore.")
+    }
+
+    func unloadModel(clearPersistence: Bool = true) {
+        clearVocabularyBoostingState(resetModelState: true)
+        asrManager = nil
+        loadedAsrModels = nil
+        loadedModelId = nil
+        modelState = .notLoaded
+        downloadProgress = 0
+        if clearPersistence {
+            host?.setUserDefault(nil, forKey: "loadedModel")
+        }
+        host?.notifyCapabilitiesChanged()
+    }
+
+    func restoreLoadedModel(allowDownloads: Bool = true, passively: Bool = false) async {
+        guard !Task.isCancelled else { return }
+        if passively {
+            guard host?.shouldRestoreLoadedModelsPassively == true, !isConfigured else { return }
+        }
+        guard let savedModelId = host?.userDefault(forKey: "loadedModel") as? String else { return }
+        let version = ParakeetVersion.from(modelId: savedModelId) ?? selectedVersion
+        guard allowDownloads || isModelDownloaded(version: version) else { return }
+        await loadModel(version: version, passively: passively)
+    }
+
+    /// FluidAudio skips complete files and resumes `.partial` files in the cache
+    /// directory, so those bytes count toward the download instead of being deleted.
+    private func reserveDownloadSpace(for version: ParakeetVersion) async throws -> PluginDownloadSpaceReservation? {
+        let cacheDir = AsrModels.defaultCacheDirectory(for: version.asrModelVersion)
+        return try await PluginDownloadDiskSpace.reserveHuggingFaceDownload(
+            repositoryID: version.repository.remotePath,
+            matching: version.requiredModelFiles.sorted().map { "\($0)/*" } + ["*vocab*.json"],
+            token: _hfToken,
+            destination: cacheDir,
+            trackedDirectory: cacheDir,
+            localRepositoryRoot: cacheDir,
+            modelName: version.modelDef.displayName
+        )
+    }
+
+    private func reserveCtcDownloadSpace() async throws -> PluginDownloadSpaceReservation? {
+        let cacheDir = CtcModels.defaultCacheDirectory(for: .ctc110m)
+        guard !CtcModels.modelsExist(at: cacheDir) else { return nil }
+        return try await PluginDownloadDiskSpace.reserveHuggingFaceDownload(
+            repositoryID: CtcModelVariant.ctc110m.repo.remotePath,
+            matching: ModelNames.CTC.requiredModels.sorted().map { "\($0)/*" } + [ModelNames.CTC.vocabularyPath],
+            token: _hfToken,
+            destination: cacheDir,
+            trackedDirectory: cacheDir,
+            localRepositoryRoot: cacheDir,
+            modelName: "Parakeet CTC 110M"
+        )
+    }
+
+    fileprivate func isModelDownloaded(version: ParakeetVersion) -> Bool {
+        let cacheDir = AsrModels.defaultCacheDirectory(for: version.asrModelVersion)
+        return AsrModels.modelsExist(at: cacheDir, version: version.asrModelVersion)
+    }
+
+    // MARK: - Settings View
+
+    var currentSettingsActivity: PluginSettingsActivity? {
+        switch modelState {
+        case .notLoaded, .ready:
+            break
+        case .downloading:
+            return PluginSettingsActivity(
+                message: "Downloading model",
+                progress: downloadProgress
+            )
+        case .error(let message):
+            return PluginSettingsActivity(message: message, isError: true)
+        }
+
+        guard vocabularyBoostingEnabled else { return nil }
+
+        switch ctcModelState {
+        case .notDownloaded, .ready:
+            return nil
+        case .downloading:
+            return PluginSettingsActivity(message: "Downloading vocabulary model")
+        case .error(let message):
+            return PluginSettingsActivity(message: message, isError: true)
+        }
+    }
+
+    var settingsView: AnyView? {
+        AnyView(ParakeetSettingsView(plugin: self))
+    }
+
+    var huggingFaceToken: String? { _hfToken }
+
+    func setHuggingFaceToken(_ token: String) {
+        _hfToken = PluginHuggingFaceTokenHelper.saveToken(token, to: host)
+    }
+
+    func clearHuggingFaceToken() {
+        _hfToken = nil
+        PluginHuggingFaceTokenHelper.clearToken(from: host)
+    }
+
+    func validateHuggingFaceToken(
+        _ token: String,
+        dataFetcher: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = PluginHTTPClient.data
+    ) async -> Bool {
+        await PluginHuggingFaceTokenHelper.validateToken(token, dataFetcher: dataFetcher)
+    }
+
+    func applyHuggingFaceTokenToEnvironment() {
+        PluginHuggingFaceTokenHelper.applyTokenToEnvironment(_hfToken)
+    }
+}
+
+// MARK: - Model Version
+
+enum ParakeetVersion: String, CaseIterable {
+    case v2
+    case v3
+    case ultra
+
+    var asrModelVersion: AsrModelVersion {
+        switch self {
+        case .v2: return .v2
+        case .v3: return .v3
+        case .ultra: return .ultra
+        }
+    }
+
+    var repository: Repo {
+        switch self {
+        case .v2: return .parakeetV2
+        case .v3: return .parakeetV3
+        case .ultra: return .parakeetUltra
+        }
+    }
+
+    /// Model folders `AsrModels.download` fetches with its default int8 encoder.
+    var requiredModelFiles: Set<String> {
+        switch self {
+        case .v2: return ModelNames.ASR.requiredModels
+        case .v3, .ultra: return ModelNames.ASR.requiredModelsV3()
+        }
+    }
+
+    var modelDef: ParakeetModelDef {
+        switch self {
+        case .v2:
+            return ParakeetModelDef(
+                id: "parakeet-tdt-0.6b-v2",
+                displayName: "Parakeet TDT v2",
+                sizeDescription: "~600 MB",
+                ramRequirement: "8 GB+"
+            )
+        case .v3:
+            return ParakeetModelDef(
+                id: "parakeet-tdt-0.6b-v3",
+                displayName: "Parakeet TDT v3",
+                sizeDescription: "~600 MB",
+                ramRequirement: "8 GB+"
+            )
+        case .ultra:
+            return ParakeetModelDef(
+                id: "parakeet-ultra",
+                displayName: "Parakeet Ultra",
+                sizeDescription: "~630 MB",
+                ramRequirement: "8 GB+"
+            )
+        }
+    }
+
+    var supportedLanguages: [String] {
+        switch self {
+        case .v2:
+            return ["en"]
+        case .v3, .ultra:
+            return ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"]
+        }
+    }
+
+    var languageCount: Int {
+        supportedLanguages.count
+    }
+
+    func settingsDescription(bundle: Bundle) -> String {
+        switch self {
+        case .v2:
+            return String(localized: "NVIDIA Parakeet TDT V2 - extremely fast on Apple Silicon. English only, highest recall. No API key required.", bundle: bundle)
+        case .v3:
+            return String(localized: "NVIDIA Parakeet TDT - extremely fast on Apple Silicon. 25 European languages, no API key required.", bundle: bundle)
+        case .ultra:
+            return String(localized: "Moondream Parakeet Ultra - Parakeet TDT v3 trained further for higher accuracy. 25 European languages, no API key required.", bundle: bundle)
+        }
+    }
+
+    static func from(modelId: String) -> ParakeetVersion? {
+        allCases.first { $0.modelDef.id == modelId }
+    }
+}
+
+// MARK: - Model Types
+
+struct ParakeetModelDef {
+    let id: String
+    let displayName: String
+    let sizeDescription: String
+    let ramRequirement: String
+}
+
+enum ParakeetModelState: Equatable {
+    case notLoaded
+    case downloading
+    case ready
+    case error(String)
+}
+
+enum CtcModelState: Equatable {
+    case notDownloaded
+    case downloading
+    case ready
+    case error(String)
+}
+
+private struct ParakeetVocabularyAssetHTTPError: LocalizedError, Sendable {
+    let description: String
+    let statusCode: Int?
+
+    var errorDescription: String? {
+        guard let statusCode else {
+            return "Invalid HTTP response while downloading \(description)"
+        }
+        return "HTTP \(statusCode) while downloading \(description)"
+    }
+}
+
+private enum ParakeetVocabularyAssetError: LocalizedError {
+    case downloadFailed(version: ParakeetVersion, underlying: Error)
+    case emptyDownload(version: ParakeetVersion)
+    case installFailed(version: ParakeetVersion, path: URL, underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .downloadFailed(let version, let underlying):
+            return "Failed to download Parakeet vocabulary file for \(version.modelDef.displayName): \(underlying.localizedDescription)"
+        case .emptyDownload(let version):
+            return "Failed to download Parakeet vocabulary file for \(version.modelDef.displayName): downloaded file was empty"
+        case .installFailed(let version, let path, let underlying):
+            return "Failed to install Parakeet vocabulary file for \(version.modelDef.displayName) at \(path.path): \(underlying.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Settings View
+
+private struct ParakeetSettingsView: View {
+    let plugin: ParakeetPlugin
+    private let bundle = Bundle(for: ParakeetPlugin.self)
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.pluginSettingsClose) private var closeSettings
+    @State private var selectedVersion: ParakeetVersion = .v3
+    @State private var modelState: ParakeetModelState = .notLoaded
+    @State private var downloadProgress: Double = 0
+    @State private var selectedModelDownloaded = false
+    @State private var hfTokenInput = ""
+    @State private var showHfToken = false
+    @State private var isValidatingToken = false
+    @State private var tokenValidationResult: Bool?
+    @State private var boostingEnabled: Bool = false
+    @State private var ctcModelState: CtcModelState = .notDownloaded
+    @State private var boostingTermCount: Int = 0
+
+    private let pollTimer = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
+
+    private var trimmedHfTokenInput: String {
+        hfTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var storedHfToken: String {
+        plugin._hfToken?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var hasStoredHfToken: Bool {
+        !storedHfToken.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Parakeet")
+                    .font(.headline)
+
+                Text(selectedVersion.settingsDescription(bundle: bundle))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Hugging Face Token", bundle: bundle)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    Text("Optional. Increases download rate limits. Free at huggingface.co/settings/tokens", bundle: bundle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack {
+                        if showHfToken {
+                            TextField("hf_...", text: $hfTokenInput)
+                                .textFieldStyle(.roundedBorder)
+                        } else {
+                            SecureField("hf_...", text: $hfTokenInput)
+                                .textFieldStyle(.roundedBorder)
+                        }
+
+                        Button {
+                            showHfToken.toggle()
+                        } label: {
+                            Image(systemName: showHfToken ? "eye.slash" : "eye")
+                        }
+                        .buttonStyle(.borderless)
+
+                        if hasStoredHfToken {
+                            Button(String(localized: "Remove", bundle: bundle)) {
+                                hfTokenInput = ""
+                                tokenValidationResult = nil
+                                isValidatingToken = false
+                                plugin.clearHuggingFaceToken()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
+                        Button(String(localized: "Save", bundle: bundle)) {
+                            validateAndSaveHuggingFaceToken()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(trimmedHfTokenInput.isEmpty || isValidatingToken)
+                    }
+
+                    if isValidatingToken {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Validating token...", bundle: bundle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let tokenValidationResult {
+                        HStack(spacing: 4) {
+                            Image(systemName: tokenValidationResult ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(tokenValidationResult ? .green : .red)
+                            Text(
+                                tokenValidationResult
+                                    ? String(localized: "Valid Hugging Face Token", bundle: bundle)
+                                    : String(localized: "Invalid Hugging Face Token", bundle: bundle)
+                            )
+                            .font(.caption)
+                            .foregroundStyle(tokenValidationResult ? .green : .red)
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Model version picker
+                HStack {
+                    Text("Model Version", bundle: bundle)
+                    Spacer()
+                    Picker("", selection: $selectedVersion) {
+                        ForEach(ParakeetVersion.allCases, id: \.self) { version in
+                            Text(version.modelDef.displayName).tag(version)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .disabled(modelState == .downloading)
+                }
+
+                // Model info and action
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(selectedVersion.modelDef.displayName)
+                            .font(.body)
+                        Text("\(selectedVersion.modelDef.sizeDescription) - RAM: \(selectedVersion.modelDef.ramRequirement)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    switch modelState {
+                    case .notLoaded:
+                        Button(
+                            selectedModelDownloaded
+                                ? String(localized: "Load", bundle: bundle)
+                                : String(localized: "Download & Load", bundle: bundle)
+                        ) {
+                            modelState = .downloading
+                            downloadProgress = 0.05
+                            Task {
+                                await plugin.loadModel()
+                                syncViewStateFromPlugin()
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                    case .downloading:
+                        HStack(spacing: 8) {
+                            ProgressView(value: downloadProgress)
+                                .frame(width: 80)
+                            Text("\(Int(downloadProgress * 100))%")
+                                .font(.caption)
+                                .monospacedDigit()
+                        }
+
+                    case .ready:
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Button(String(localized: "Unload", bundle: bundle)) {
+                                plugin.unloadModel()
+                                modelState = plugin.modelState
+                                ctcModelState = plugin.ctcModelState
+                                boostingTermCount = 0
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
+                    case .error(let message):
+                        VStack(alignment: .trailing, spacing: 4) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                                Text(message)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Button(String(localized: "Retry", bundle: bundle)) {
+                                modelState = .downloading
+                                Task {
+                                    await plugin.loadModel()
+                                    syncViewStateFromPlugin()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+
+                if case .ready = modelState {
+                    Divider()
+                    vocabularyBoostingSection
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+
+            if plugin.canDismissSettingsAfterSetup {
+                Divider()
+
+                HStack {
+                    Spacer()
+
+                    Button(String(localized: "Done", bundle: bundle)) {
+                        finishSetupAndClose()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                }
+                .padding()
+                .background(.bar)
+            }
+        }
+        .onAppear {
+            syncViewStateFromPlugin()
+            if let token = plugin._hfToken, !token.isEmpty {
+                hfTokenInput = token
+            }
+        }
+        .onChange(of: selectedVersion) { _, newVersion in
+            guard newVersion != plugin.selectedVersion else { return }
+            plugin.selectedVersion = newVersion
+            plugin.host?.setUserDefault(newVersion.rawValue, forKey: "selectedVersion")
+            selectedModelDownloaded = plugin.isModelDownloaded(version: newVersion)
+            if plugin.loadedModelId != nil {
+                // Reload with new version
+                modelState = .downloading
+                downloadProgress = 0.05
+                Task {
+                    plugin.unloadModel(clearPersistence: false)
+                    await plugin.loadModel()
+                    syncViewStateFromPlugin()
+                }
+            }
+        }
+        .onReceive(pollTimer) { _ in
+            syncViewStateFromPlugin()
+        }
+        .onChange(of: hfTokenInput) { _, newValue in
+            let trimmedValue = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedValue != storedHfToken {
+                tokenValidationResult = nil
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var vocabularyBoostingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Vocabulary Boosting", bundle: bundle)
+                .font(.subheadline)
+                .fontWeight(.medium)
+
+            Text("Improves recognition of custom terms from your Dictionary using a secondary CTC model.", bundle: bundle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: $boostingEnabled) {
+                Text("Enable Vocabulary Boosting", bundle: bundle)
+            }
+            .onChange(of: boostingEnabled) { _, newValue in
+                plugin.setBoostingEnabled(newValue)
+                ctcModelState = plugin.ctcModelState
+            }
+
+            if boostingEnabled {
+                HStack(spacing: 6) {
+                    switch ctcModelState {
+                    case .notDownloaded:
+                        Image(systemName: "arrow.down.circle")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                        Text("CTC model (~100 MB) - downloads automatically on first use, or:", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button(String(localized: "Download Now", bundle: bundle)) {
+                            Task {
+                                await plugin.downloadCtcModel()
+                                syncViewStateFromPlugin()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+
+                    case .downloading:
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Downloading CTC model...", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                    case .ready:
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                        if boostingTermCount > 0 {
+                            Text("Ready - \(boostingTermCount) terms loaded", bundle: bundle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("Ready - add terms in Dictionary settings", bundle: bundle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                    case .error(let message):
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Button(String(localized: "Retry", bundle: bundle)) {
+                            Task {
+                                await plugin.downloadCtcModel()
+                                syncViewStateFromPlugin()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                }
+            }
+        }
+    }
+
+    private func syncViewStateFromPlugin() {
+        selectedVersion = plugin.selectedVersion
+        modelState = plugin.modelState
+        downloadProgress = plugin.downloadProgress
+        selectedModelDownloaded = plugin.isModelDownloaded(version: plugin.selectedVersion)
+        boostingEnabled = plugin.vocabularyBoostingEnabled
+        ctcModelState = plugin.ctcModelState
+        boostingTermCount = plugin.lastBoostingTermCount
+    }
+
+    private func validateAndSaveHuggingFaceToken() {
+        let trimmedToken = trimmedHfTokenInput
+        guard !trimmedToken.isEmpty else { return }
+
+        isValidatingToken = true
+        tokenValidationResult = nil
+
+        Task {
+            let isValid = await plugin.validateHuggingFaceToken(trimmedToken)
+            await MainActor.run {
+                isValidatingToken = false
+                tokenValidationResult = isValid
+                if isValid {
+                    plugin.setHuggingFaceToken(trimmedToken)
+                    hfTokenInput = trimmedToken
+                }
+            }
+        }
+    }
+
+    private func finishSetupAndClose() {
+        plugin.host?.notifyCapabilitiesChanged()
+        if let closeSettings {
+            closeSettings()
+        } else {
+            dismiss()
+        }
+    }
+}

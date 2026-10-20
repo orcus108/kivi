@@ -1,0 +1,408 @@
+import SwiftUI
+
+struct OverlayTranscriptPreviewState: Equatable {
+    let isRecording: Bool
+    let previewEnabled: Bool
+    let isRecorder: Bool
+    let externalStreamingDisplayCount: Int
+    let partialText: String
+    let textExpanded: Bool
+
+    var suppressStreamingText: Bool {
+        !isRecorder && externalStreamingDisplayCount > 0
+    }
+
+    var showTranscriptPreview: Bool {
+        previewEnabled && !suppressStreamingText
+    }
+
+    var hasTranscriptSection: Bool {
+        isRecording && showTranscriptPreview
+    }
+
+    var transcriptBodyVisible: Bool {
+        hasTranscriptSection && textExpanded
+    }
+
+    var shouldExpandForCurrentText: Bool {
+        hasTranscriptSection && !partialText.isEmpty && !textExpanded
+    }
+}
+
+struct OverlayIndicatorSurface<Content: View>: View {
+    let theme: IndicatorTheme
+    let content: Content
+
+    init(theme: IndicatorTheme = .classic, @ViewBuilder content: () -> Content) {
+        self.theme = theme
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .indicatorSurface(
+                theme: theme,
+                shape: RoundedRectangle(cornerRadius: 24, style: .continuous)
+            )
+    }
+}
+
+/// Pill-shaped overlay indicator that appears centered on the screen.
+/// Supports top and bottom positioning.
+struct OverlayIndicatorView: View {
+    @ObservedObject private var viewModel = DictationViewModel.shared
+    @ObservedObject private var recorder = AudioRecorderViewModel.shared
+    @ObservedObject private var preview = IndicatorPreviewSession.shared
+    @ObservedObject private var countdownModel: CalendarMeetingCountdownModel
+    @Environment(\.colorScheme) private var systemColorScheme
+    @State private var textExpanded = false
+    @State private var dotPulse = false
+    @State private var revealScale: CGFloat = 1
+
+    private let contentPadding: CGFloat = 20
+    private let sizing: IndicatorSizing = .overlay
+    private var closedWidth: CGFloat { 280 }
+
+    init(countdownModel: CalendarMeetingCountdownModel) {
+        _countdownModel = ObservedObject(wrappedValue: countdownModel)
+    }
+
+    private var presentation: IndicatorPresentationData {
+        IndicatorPresentationData.make(dictation: viewModel, recorder: recorder, preview: preview)
+    }
+
+    private var countdownPresentation: CalendarMeetingCountdownPresentation? {
+        countdownModel.presentation
+    }
+
+    private var hasActionFeedback: Bool {
+        presentation.state == .inserting && presentation.actionFeedbackMessage != nil
+    }
+
+    private var hasCancelWarning: Bool {
+        presentation.cancelWarningMessage != nil
+    }
+
+    private var transcriptPreviewState: OverlayTranscriptPreviewState {
+        OverlayTranscriptPreviewState(
+            isRecording: presentation.state == .recording,
+            previewEnabled: viewModel.indicatorTranscriptPreviewEnabled,
+            isRecorder: presentation.isRecorder,
+            externalStreamingDisplayCount: presentation.externalStreamingDisplayCount,
+            partialText: presentation.partialText,
+            textExpanded: textExpanded
+        )
+    }
+
+    private var showTranscriptPreview: Bool {
+        transcriptPreviewState.showTranscriptPreview
+    }
+
+    private var hasTranscriptSection: Bool {
+        transcriptPreviewState.hasTranscriptSection
+    }
+
+    private var transcriptBodyVisible: Bool {
+        transcriptPreviewState.transcriptBodyVisible
+    }
+
+    private var currentWidth: CGFloat {
+        if countdownPresentation != nil {
+            return max(closedWidth, IndicatorFeedbackPanelLayout.feedbackWidth)
+        }
+        if hasCancelWarning { return max(closedWidth, IndicatorFeedbackPanelLayout.feedbackWidth) }
+        if transcriptBodyVisible { return max(closedWidth, 400) }
+        if hasActionFeedback { return max(closedWidth, actionFeedbackBody.width) }
+        return closedWidth
+    }
+
+    private var actionFeedbackBody: IndicatorFeedbackPanelLayout.FeedbackBody {
+        IndicatorFeedbackPanelLayout.feedbackBody(
+            for: .overlay,
+            message: presentation.actionFeedbackMessage,
+            actionTitle: presentation.actionFeedbackActionTitle
+        )
+    }
+
+    private var isTop: Bool {
+        viewModel.overlayPosition == .top
+    }
+
+    private var transcriptFontSize: CGFloat {
+        viewModel.indicatorTranscriptPreviewFontSize(for: .overlay)
+    }
+
+    private var transcriptExpandedHeight: CGFloat {
+        viewModel.indicatorTranscriptPreviewExpandedHeight(for: .overlay)
+    }
+
+    var body: some View {
+        OverlayIndicatorSurface(theme: viewModel.indicatorTheme) {
+            Group {
+                if let countdownPresentation,
+                   countdownPresentation.kind.isStart {
+                    countdownIndicator(countdownPresentation)
+                } else {
+                    VStack(alignment: .center, spacing: 0) {
+                        if isTop {
+                            statusBar
+                                .frame(height: IndicatorFeedbackPanelLayout.overlayStatusHeight)
+                                .frame(maxWidth: .infinity)
+                            expandableContent
+                        } else {
+                            expandableContent
+                            statusBar
+                                .frame(height: IndicatorFeedbackPanelLayout.overlayStatusHeight)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                }
+            }
+            .frame(width: currentWidth)
+        }
+        .shadow(color: .black.opacity(0.3 * viewModel.indicatorTheme.shadowOpacityScale), radius: 10, y: 5)
+        .scaleEffect(revealScale, anchor: isTop ? .top : .bottom)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: isTop ? .top : .bottom)
+        // Classic and Light pin their scheme so semantic colors match the surface
+        // regardless of the hosting appearance. Glass follows the system.
+        .environment(\.colorScheme, viewModel.indicatorTheme.preferredColorScheme ?? systemColorScheme)
+        .onHover { hovered in
+            guard hasActionFeedback else { return }
+            viewModel.setActionFeedbackHovered(hovered)
+        }
+        .animation(IndicatorMotion.expand, value: textExpanded)
+        .animation(IndicatorMotion.expand, value: currentWidth)
+        .animation(.easeInOut(duration: 0.2), value: presentation.state)
+        // Matches the ~30 Hz (33ms) level-publish throttle shared by both
+        // audio level sources (AudioRecordingService's dictation pipeline and
+        // AudioRecorderService's Recorder tab) — a shorter duration here
+        // finishes each segment before the next value lands, producing a
+        // tiny stutter instead of a continuous glide.
+        .animation(.linear(duration: 0.033), value: presentation.audioLevel)
+        .onChange(of: presentation.partialText) {
+            if presentation.source == .preview, presentation.partialText.isEmpty {
+                // The preview loop restarts: collapse so the expand animation replays.
+                withAnimation(IndicatorMotion.expand) {
+                    textExpanded = false
+                }
+            } else {
+                expandTranscriptPreviewIfNeeded()
+            }
+        }
+        .onChange(of: presentation.source) {
+            // A real session replacing the preview starts with an empty
+            // transcript; the preview taking over again shows what it has.
+            withAnimation(IndicatorMotion.expand) {
+                textExpanded = presentation.source == .preview && !presentation.partialText.isEmpty
+            }
+        }
+        .onChange(of: presentation.state) {
+            if presentation.state == .recording {
+                IndicatorMotion.popIn($revealScale)
+                withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                    dotPulse = true
+                }
+                expandTranscriptPreviewIfNeeded()
+            } else {
+                dotPulse = false
+                textExpanded = false
+            }
+        }
+        .onChange(of: transcriptPreviewState.suppressStreamingText) {
+            if !showTranscriptPreview {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    textExpanded = false
+                }
+            } else {
+                expandTranscriptPreviewIfNeeded()
+            }
+        }
+        .onChange(of: viewModel.indicatorTranscriptPreviewEnabled) {
+            if showTranscriptPreview {
+                expandTranscriptPreviewIfNeeded()
+            } else {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    textExpanded = false
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 1.0), value: dotPulse)
+        .accessibilityElement(
+            children: countdownPresentation != nil
+                || presentation.actionFeedbackActionTitle != nil ? .contain : .combine
+        )
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private func expandTranscriptPreviewIfNeeded() {
+        guard transcriptPreviewState.shouldExpandForCurrentText else { return }
+        withAnimation(.easeOut(duration: 0.25)) {
+            textExpanded = true
+        }
+    }
+
+    private var accessibilityLabel: String {
+        if let countdownPresentation {
+            return countdownPresentation.kind.headline
+        }
+        if let warning = presentation.cancelWarningMessage {
+            return warning
+        }
+
+        if let feedback = presentation.actionFeedbackMessage, presentation.state == .inserting {
+            return feedback
+        }
+
+        switch presentation.state {
+        case .idle, .promptSelection, .promptProcessing:
+            return String(localized: "Idle")
+        case .recording:
+            return presentation.recordingStatusLabel
+        case .processing:
+            return String(localized: "Processing transcription")
+        case .inserting:
+            return String(localized: "Inserting text")
+        case .error(let message):
+            return String(localized: "Error - \(message)")
+        }
+    }
+
+    // MARK: - Expandable content (text + action feedback)
+
+    @ViewBuilder
+    private var expandableContent: some View {
+        if let countdownPresentation {
+            countdownIndicator(countdownPresentation)
+        } else if hasCancelWarning {
+            IndicatorActionFeedback(
+                message: presentation.cancelWarningMessage ?? "",
+                icon: "exclamationmark.triangle.fill",
+                isError: false,
+                iconColor: .yellow,
+                contentPadding: contentPadding
+            )
+        } else if isTop {
+            // Top position: text expands downward, action feedback below text
+            if hasTranscriptSection {
+                IndicatorExpandableText(
+                    text: presentation.partialText,
+                    fontSize: transcriptFontSize,
+                    expandedHeight: transcriptExpandedHeight,
+                    expanded: textExpanded,
+                    contentPadding: contentPadding
+                )
+            }
+
+            if hasActionFeedback {
+                IndicatorActionFeedback(
+                    message: presentation.actionFeedbackMessage ?? "",
+                    icon: presentation.actionFeedbackIcon,
+                    isError: presentation.actionFeedbackIsError,
+                    iconColor: nil,
+                    contentPadding: contentPadding,
+                    actionTitle: presentation.actionFeedbackActionTitle,
+                    onAction: presentation.actionFeedbackActionTitle == nil ? nil : {
+                        viewModel.performActionFeedbackAction()
+                    },
+                    remainingFraction: presentation.actionFeedbackRemainingFraction,
+                    bodyHeight: actionFeedbackBody.height,
+                    lineLimit: actionFeedbackBody.lineLimit
+                )
+                .overlay(alignment: .top) {
+                    Divider().background(Color.primary.opacity(0.1))
+                }
+            }
+        } else {
+            // Bottom position: action feedback on top, text above status bar
+            if hasActionFeedback {
+                IndicatorActionFeedback(
+                    message: presentation.actionFeedbackMessage ?? "",
+                    icon: presentation.actionFeedbackIcon,
+                    isError: presentation.actionFeedbackIsError,
+                    iconColor: nil,
+                    contentPadding: contentPadding,
+                    actionTitle: presentation.actionFeedbackActionTitle,
+                    onAction: presentation.actionFeedbackActionTitle == nil ? nil : {
+                        viewModel.performActionFeedbackAction()
+                    },
+                    remainingFraction: presentation.actionFeedbackRemainingFraction,
+                    bodyHeight: actionFeedbackBody.height,
+                    lineLimit: actionFeedbackBody.lineLimit
+                )
+                .overlay(alignment: .bottom) {
+                    Divider().background(Color.primary.opacity(0.1))
+                }
+            }
+
+            if hasTranscriptSection {
+                IndicatorExpandableText(
+                    text: presentation.partialText,
+                    fontSize: transcriptFontSize,
+                    expandedHeight: transcriptExpandedHeight,
+                    expanded: textExpanded,
+                    contentPadding: contentPadding
+                )
+            }
+        }
+    }
+
+    private func countdownIndicator(
+        _ countdownPresentation: CalendarMeetingCountdownPresentation
+    ) -> some View {
+        MeetingAutomationCountdownIndicator(
+            model: countdownModel,
+            presentation: countdownPresentation,
+            contentPadding: contentPadding
+        )
+    }
+
+    // MARK: - Status bar
+
+    @ViewBuilder
+    private var statusBar: some View {
+        HStack(spacing: 12) {
+            IndicatorLeftStatus(
+                presentation: presentation,
+                sizing: sizing,
+                dotPulse: dotPulse,
+                hasActionFeedback: hasActionFeedback
+            )
+
+            if case .recording = presentation.state {
+                if presentation.isPreparingMicrophone {
+                    IndicatorPreparingLabel(presentation: presentation, sizing: sizing)
+                } else {
+                    IndicatorRecordingContent(
+                        presentation: presentation,
+                        content: viewModel.notchIndicatorLeftContent,
+                        sizing: sizing,
+                        dotPulse: dotPulse
+                    )
+                }
+            }
+
+            Spacer()
+
+            if case .recording = presentation.state {
+                if !presentation.isPreparingMicrophone {
+                    IndicatorRecordingContent(
+                        presentation: presentation,
+                        content: viewModel.notchIndicatorRightContent,
+                        sizing: sizing,
+                        dotPulse: dotPulse
+                    )
+                }
+            } else if case .processing = presentation.state {
+                if let phase = presentation.processingPhase {
+                    Text(phase)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.primary.opacity(0.7))
+                }
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.primary)
+            }
+        }
+        .padding(.horizontal, 20)
+    }
+}

@@ -1,0 +1,458 @@
+import SwiftUI
+
+/// Notch-extending indicator that visually expands the MacBook notch area.
+/// Three-zone layout: left ear | center (notch spacer) | right ear.
+/// Both sides are configurable (indicator, timer, waveform, clock, battery).
+/// Expands wider and downward to show streaming partial text.
+/// Blue glow emanates from the notch shape, reacting to audio level.
+struct NotchIndicatorView: View {
+    @ObservedObject private var viewModel = DictationViewModel.shared
+    @ObservedObject private var recorder = AudioRecorderViewModel.shared
+    @ObservedObject private var preview = IndicatorPreviewSession.shared
+    @ObservedObject private var countdownModel: CalendarMeetingCountdownModel
+    @ObservedObject var geometry: NotchGeometry
+    @Environment(\.colorScheme) private var systemColorScheme
+    @State private var textExpanded = false
+    @State private var dotPulse = false
+
+    private let contentPadding: CGFloat = 28
+    private let sizing: IndicatorSizing = .notch
+    private let processingBodyHeight: CGFloat = 28
+    private let feedbackBodyHeight = IndicatorFeedbackPanelLayout.feedbackBodyHeight
+
+    init(
+        geometry: NotchGeometry,
+        countdownModel: CalendarMeetingCountdownModel
+    ) {
+        self.geometry = geometry
+        _countdownModel = ObservedObject(wrappedValue: countdownModel)
+    }
+
+    private var presentation: IndicatorPresentationData {
+        IndicatorPresentationData.make(dictation: viewModel, recorder: recorder, preview: preview)
+    }
+
+    private var countdownPresentation: CalendarMeetingCountdownPresentation? {
+        countdownModel.presentation
+    }
+
+    private var closedWidth: CGFloat {
+        if case .recording = presentation.state {
+            if presentation.isPreparingMicrophone {
+                return NotchIndicatorLayout.preparingClosedWidth(
+                    hasNotch: geometry.hasNotch,
+                    notchWidth: geometry.notchWidth,
+                    label: presentation.recordingStatusLabel
+                )
+            }
+            return NotchIndicatorLayout.recordingClosedWidth(
+                hasNotch: geometry.hasNotch,
+                notchWidth: geometry.notchWidth,
+                leftContent: viewModel.notchIndicatorLeftContent,
+                rightContent: viewModel.notchIndicatorRightContent,
+                recordingDuration: presentation.recordingDuration,
+                activeRuleName: presentation.activeRuleName
+            )
+        }
+
+        return NotchIndicatorLayout.closedWidth(hasNotch: geometry.hasNotch, notchWidth: geometry.notchWidth)
+    }
+
+    private var leftStatusSpacing: CGFloat {
+        guard case .recording = presentation.state else {
+            return 0
+        }
+        if presentation.isPreparingMicrophone {
+            return NotchIndicatorLayout.leftContentSpacing
+        }
+
+        let leftContentWidth = NotchIndicatorLayout.recordingContentWidth(
+            viewModel.notchIndicatorLeftContent,
+            recordingDuration: presentation.recordingDuration,
+            activeRuleName: presentation.activeRuleName
+        )
+        return leftContentWidth > 0 ? NotchIndicatorLayout.leftContentSpacing : 0
+    }
+
+    private var suppressStreamingText: Bool {
+        !presentation.isRecorder && presentation.externalStreamingDisplayCount > 0
+    }
+
+    private var hasActionFeedback: Bool {
+        presentation.state == .inserting && presentation.actionFeedbackMessage != nil
+    }
+
+    private var hasCancelWarning: Bool {
+        presentation.cancelWarningMessage != nil
+    }
+
+    private var hasProcessingPhase: Bool {
+        presentation.state == .processing && presentation.processingPhase != nil
+    }
+
+    private var showTranscriptPreview: Bool {
+        viewModel.indicatorTranscriptPreviewEnabled && !suppressStreamingText
+    }
+
+    private var hasTranscriptSection: Bool {
+        presentation.state == .recording && showTranscriptPreview
+    }
+
+    private var transcriptBodyVisible: Bool {
+        presentation.state == .recording && showTranscriptPreview && textExpanded
+    }
+
+    private var expansionMode: NotchExpansionMode {
+        if countdownPresentation != nil { return .feedback }
+        if hasCancelWarning { return .feedback }
+        if transcriptBodyVisible { return .transcript }
+        if hasActionFeedback { return .feedback }
+        if hasProcessingPhase { return .processing }
+        return .closed
+    }
+
+    private var currentWidth: CGFloat {
+        let width = NotchIndicatorLayout.containerWidth(closedWidth: closedWidth, mode: expansionMode)
+        guard expansionMode == .feedback, hasActionFeedback, countdownPresentation == nil, !hasCancelWarning else {
+            return width
+        }
+        return max(width, actionFeedbackBody.width)
+    }
+
+    private var bottomCornerRadius: CGFloat {
+        switch expansionMode {
+        case .closed:
+            return 14
+        case .processing:
+            return 18
+        case .transcript, .feedback:
+            return 24
+        }
+    }
+
+    private var transcriptBodyHeight: CGFloat {
+        hasTranscriptSection && textExpanded ? viewModel.indicatorTranscriptPreviewExpandedHeight(for: .notch) : 0
+    }
+
+    private var transcriptFontSize: CGFloat {
+        viewModel.indicatorTranscriptPreviewFontSize(for: .notch)
+    }
+
+    private var expandedBodyHeight: CGFloat {
+        if countdownPresentation != nil {
+            return feedbackBodyHeight
+        }
+        if hasCancelWarning {
+            return feedbackBodyHeight
+        }
+        if hasTranscriptSection {
+            return transcriptBodyHeight
+        }
+        if hasProcessingPhase {
+            return processingBodyHeight
+        }
+        if hasActionFeedback {
+            return actionFeedbackBody.height
+        }
+        return 0
+    }
+
+    private var actionFeedbackBody: IndicatorFeedbackPanelLayout.FeedbackBody {
+        IndicatorFeedbackPanelLayout.feedbackBody(
+            for: .notch,
+            message: presentation.actionFeedbackMessage,
+            actionTitle: presentation.actionFeedbackActionTitle,
+            notchClosedWidth: closedWidth
+        )
+    }
+
+    private var presentationRevealScale: CGFloat {
+        geometry.isPresented ? 1 : 0.001
+    }
+
+    private var presentationOpacity: Double {
+        geometry.isPresented ? 1 : 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            notchCap
+            expandedBody
+        }
+        .frame(width: currentWidth)
+        .background(alignment: .top) { notchBackground }
+        .clipShape(NotchShape(bottomCornerRadius: bottomCornerRadius))
+        .mask(alignment: .top) {
+            Rectangle()
+                .scaleEffect(x: 1, y: presentationRevealScale, anchor: .top)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .opacity(presentationOpacity)
+        .onHover { hovered in
+            guard hasActionFeedback else { return }
+            viewModel.setActionFeedbackHovered(hovered)
+        }
+        .animation(.easeOut(duration: 0.22), value: geometry.isPresented)
+        // A light spring so the body visibly grows out of the notch instead of sliding.
+        .animation(IndicatorMotion.expand, value: currentWidth)
+        .animation(IndicatorMotion.expand, value: expandedBodyHeight)
+        .animation(.easeInOut(duration: 0.18), value: presentation.state)
+        // Matches the ~30 Hz (33ms) level-publish throttle shared by both
+        // audio level sources (AudioRecordingService's dictation pipeline and
+        // AudioRecorderService's Recorder tab) — a shorter duration here
+        // finishes each segment before the next value lands, producing a
+        // tiny stutter instead of a continuous glide.
+        .animation(.linear(duration: 0.033), value: presentation.audioLevel)
+        .onChange(of: presentation.partialText) {
+            if presentation.source == .preview, presentation.partialText.isEmpty {
+                // The preview loop restarts: collapse so the expand animation replays.
+                withAnimation(IndicatorMotion.expand) {
+                    textExpanded = false
+                }
+            } else if showTranscriptPreview, !presentation.partialText.isEmpty, !textExpanded {
+                withAnimation(.easeOut(duration: 0.24)) {
+                    textExpanded = true
+                }
+            }
+        }
+        .onChange(of: presentation.source) {
+            // A real session replacing the preview starts with an empty
+            // transcript; the preview taking over again shows what it has.
+            withAnimation(IndicatorMotion.expand) {
+                textExpanded = presentation.source == .preview
+                    && showTranscriptPreview
+                    && !presentation.partialText.isEmpty
+            }
+        }
+        .onChange(of: presentation.state) {
+            if presentation.state == .recording {
+                withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                    dotPulse = true
+                }
+            } else {
+                dotPulse = false
+                textExpanded = false
+            }
+        }
+        .onChange(of: suppressStreamingText) {
+            if !showTranscriptPreview {
+                withAnimation(.easeOut(duration: 0.24)) {
+                    textExpanded = false
+                }
+            }
+        }
+        .onChange(of: viewModel.indicatorTranscriptPreviewEnabled) {
+            if showTranscriptPreview, presentation.state == .recording, !presentation.partialText.isEmpty {
+                withAnimation(.easeOut(duration: 0.24)) {
+                    textExpanded = true
+                }
+            } else if !showTranscriptPreview {
+                withAnimation(.easeOut(duration: 0.24)) {
+                    textExpanded = false
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 1.0), value: dotPulse)
+        .accessibilityElement(
+            children: countdownPresentation != nil
+                || presentation.actionFeedbackActionTitle != nil ? .contain : .combine
+        )
+        .accessibilityLabel(notchAccessibilityLabel)
+    }
+
+    private var notchAccessibilityLabel: String {
+        if let countdownPresentation {
+            return countdownPresentation.kind.headline
+        }
+        switch presentation.state {
+        case .idle, .promptSelection, .promptProcessing:
+            return String(localized: "Idle")
+        case .recording:
+            if let warning = presentation.cancelWarningMessage {
+                return warning
+            }
+            return presentation.recordingStatusLabel
+        case .processing:
+            if let warning = presentation.cancelWarningMessage {
+                return warning
+            }
+            return String(localized: "Processing transcription")
+        case .inserting:
+            if let feedback = presentation.actionFeedbackMessage {
+                return feedback
+            }
+            return String(localized: "Inserting text")
+        case .error(let message):
+            return String(localized: "Error - \(message)")
+        }
+    }
+
+    // MARK: - Status bar (three-zone layout)
+
+    private var notchCap: some View {
+        statusBar
+            .frame(width: currentWidth, height: geometry.notchHeight)
+            .frame(maxWidth: .infinity)
+            // The cap is always black, so its content always renders dark.
+            .environment(\.colorScheme, .dark)
+    }
+
+    private var theme: IndicatorTheme {
+        viewModel.indicatorTheme
+    }
+
+    /// The cap always extends the hardware notch in black. Classic keeps the
+    /// whole shape black, the other themes draw their surface behind the
+    /// expanded body only.
+    @ViewBuilder
+    private var notchBackground: some View {
+        if theme == .classic {
+            Color.black
+        } else {
+            Color.black.frame(height: geometry.notchHeight)
+        }
+    }
+
+    private var expandedBodyShape: UnevenRoundedRectangle {
+        UnevenRoundedRectangle(
+            bottomLeadingRadius: bottomCornerRadius,
+            bottomTrailingRadius: bottomCornerRadius,
+            style: .continuous
+        )
+    }
+
+    @ViewBuilder
+    private var expandedBody: some View {
+        if theme == .classic {
+            expandedBodyFrame
+                .environment(\.colorScheme, .dark)
+        } else {
+            expandedBodyFrame
+                .indicatorSurface(theme: theme, shape: expandedBodyShape)
+                // Classic and Light pin their scheme, Glass inherits the system
+                // appearance from the panel.
+                .environment(\.colorScheme, theme.preferredColorScheme ?? systemColorScheme)
+        }
+    }
+
+    private var expandedBodyFrame: some View {
+        expandedBodyContent
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(height: expandedBodyHeight, alignment: .top)
+            .clipped()
+            .opacity(expandedBodyHeight > 0 ? 1 : 0)
+    }
+
+    @ViewBuilder
+    private var expandedBodyContent: some View {
+        if let countdownPresentation {
+            MeetingAutomationCountdownIndicator(
+                model: countdownModel,
+                presentation: countdownPresentation,
+                contentPadding: contentPadding
+            )
+        } else if hasCancelWarning {
+            IndicatorActionFeedback(
+                message: presentation.cancelWarningMessage ?? "",
+                icon: "exclamationmark.triangle.fill",
+                isError: false,
+                iconColor: .yellow,
+                contentPadding: contentPadding
+            )
+        } else if hasTranscriptSection {
+            IndicatorExpandableText(
+                text: presentation.partialText,
+                fontSize: transcriptFontSize,
+                expandedHeight: viewModel.indicatorTranscriptPreviewExpandedHeight(for: .notch),
+                expanded: true,
+                contentPadding: 34
+            )
+            .opacity(textExpanded ? 1 : 0.72)
+        } else if hasProcessingPhase {
+            Text(presentation.processingPhase ?? "")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(0.7))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+        } else if hasActionFeedback {
+            IndicatorActionFeedback(
+                message: presentation.actionFeedbackMessage ?? "",
+                icon: presentation.actionFeedbackIcon,
+                isError: presentation.actionFeedbackIsError,
+                iconColor: nil,
+                contentPadding: contentPadding,
+                actionTitle: presentation.actionFeedbackActionTitle,
+                onAction: presentation.actionFeedbackActionTitle == nil ? nil : {
+                    viewModel.performActionFeedbackAction()
+                },
+                remainingFraction: presentation.actionFeedbackRemainingFraction,
+                bodyHeight: actionFeedbackBody.height,
+                lineLimit: actionFeedbackBody.lineLimit
+            )
+        } else {
+            Color.clear
+        }
+    }
+
+    @ViewBuilder
+    private var statusBar: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: leftStatusSpacing) {
+                IndicatorLeftStatus(
+                    presentation: presentation,
+                    sizing: sizing,
+                    dotPulse: dotPulse,
+                    hasActionFeedback: hasActionFeedback
+                )
+                leftContent
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .padding(.leading, NotchIndicatorLayout.leadingInset)
+
+            if geometry.hasNotch {
+                Color.clear
+                    .frame(width: geometry.notchWidth)
+            }
+
+            rightContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                .padding(.trailing, NotchIndicatorLayout.trailingInset)
+        }
+    }
+
+    // MARK: - Configurable content
+
+    @ViewBuilder
+    private var leftContent: some View {
+        if case .recording = presentation.state {
+            if presentation.isPreparingMicrophone {
+                IndicatorPreparingLabel(presentation: presentation, sizing: sizing)
+            } else {
+                IndicatorRecordingContent(
+                    presentation: presentation,
+                    content: viewModel.notchIndicatorLeftContent,
+                    sizing: sizing,
+                    dotPulse: dotPulse
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var rightContent: some View {
+        if case .recording = presentation.state {
+            if !presentation.isPreparingMicrophone {
+                IndicatorRecordingContent(
+                    presentation: presentation,
+                    content: viewModel.notchIndicatorRightContent,
+                    sizing: sizing,
+                    dotPulse: dotPulse
+                )
+            }
+        } else if case .processing = presentation.state {
+            ProgressView()
+                .controlSize(.mini)
+                .tint(.white)
+        }
+    }
+}

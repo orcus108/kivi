@@ -1,0 +1,208 @@
+import Foundation
+
+/// Central registry for all UserDefaults keys used throughout the app.
+/// Prevents typo-induced bugs and makes keys discoverable via autocomplete.
+enum UserDefaultsKeys {
+    // MARK: - Dictation
+    static let audioDuckingEnabled = "audioDuckingEnabled"
+    static let audioDuckingLevel = "audioDuckingLevel"
+    static let soundFeedbackEnabled = "soundFeedbackEnabled"
+    static let soundRecordingStarted = "soundRecordingStarted"
+    static let soundTranscriptionSuccess = "soundTranscriptionSuccess"
+    static let soundError = "soundError"
+    static let indicatorStyle = "indicatorStyle"
+    static let indicatorTheme = "indicatorTheme"
+    static let indicatorVisibleInScreenCaptures = "indicatorVisibleInScreenCaptures"
+    static let indicatorTranscriptPreviewEnabled = "indicatorTranscriptPreviewEnabled"
+    static let liveFieldTranscriptEnabled = "liveFieldTranscriptEnabled"
+    static let indicatorTranscriptPreviewFontSizeOffset = "indicatorTranscriptPreviewFontSizeOffset"
+    static let livePreviewEngineId = "livePreviewEngineId"
+    static let preserveClipboard = "preserveClipboard"
+    static let mediaPauseEnabled = "mediaPauseEnabled"
+    static let dictationHotkeysPaused = "dictationHotkeysPaused"
+    static let transcribeShortQuietClipsAggressively = "transcribeShortQuietClipsAggressively"
+    static let microphoneBoostEnabled = "microphoneBoostEnabled"
+    static let cancellationBehavior = "cancellationBehavior"
+    // Legacy preference, retained for migration and old settings backups.
+    static let requireSecondEscapeToCancelRecording = "requireSecondEscapeToCancelRecording"
+
+    // MARK: - Hotkey (JSON-encoded UnifiedHotkey per slot, legacy mirror for first binding)
+    static let hybridHotkey = "hybridHotkey"
+    static let pttHotkey = "pttHotkey"
+    static let toggleHotkey = "toggleHotkey"
+    static let promptPaletteHotkey = "promptPaletteHotkey"
+    static let recentTranscriptionsHotkey = "recentTranscriptionsHotkey"
+    static let copyLastTranscriptionHotkey = "copyLastTranscriptionHotkey"
+    static let pasteLastTranscriptionHotkey = "pasteLastTranscriptionHotkey"
+    static let recorderToggleHotkey = "recorderToggleHotkey"
+    static let undoLastDictationHotkey = "undoLastDictationHotkey"
+    static let restoreRawTranscriptHotkey = "restoreRawTranscriptHotkey"
+
+    // MARK: - Hotkeys (JSON-encoded [UnifiedHotkey] per slot)
+    static let hybridHotkeys = "hybridHotkeys"
+    static let pttHotkeys = "pttHotkeys"
+    static let toggleHotkeys = "toggleHotkeys"
+    static let promptPaletteHotkeys = "promptPaletteHotkeys"
+    static let recentTranscriptionsHotkeys = "recentTranscriptionsHotkeys"
+    static let copyLastTranscriptionHotkeys = "copyLastTranscriptionHotkeys"
+    static let pasteLastTranscriptionHotkeys = "pasteLastTranscriptionHotkeys"
+    static let recorderToggleHotkeys = "recorderToggleHotkeys"
+    static let undoLastDictationHotkeys = "undoLastDictationHotkeys"
+    static let restoreRawTranscriptHotkeys = "restoreRawTranscriptHotkeys"
+
+    // MARK: - Model / Engine
+    static let selectedEngine = "selectedEngine"
+    static let selectedModelId = "selectedModelId"
+    static let loadedModelIds = "loadedModelIds"
+    static let modelAutoUnloadSeconds = "modelAutoUnloadSeconds"
+
+    // MARK: - Settings
+    static let selectedLanguage = "selectedLanguage"
+    static let selectedTask = "selectedTask"
+    static let translationEnabled = "translationEnabled"
+    static let translationTargetLanguage = "translationTargetLanguage"
+    static let preferredAppLanguage = "preferredAppLanguage"
+
+    // MARK: - API Server
+    static let apiServerEnabled = "apiServerEnabled"
+    static let apiServerPort = "apiServerPort"
+    static let apiServerRequiresAuthentication = "apiServerRequiresAuthentication"
+    static let updateChannel = "updateChannel"
+
+    // MARK: - Audio Device
+    static let selectedInputDeviceUID = "selectedInputDeviceUID"
+    static let inputDevicePriorityList = "inputDevicePriorityList"
+    static let airPodsInstantStartEnabled = "airPodsInstantStartEnabled"
+
+    // MARK: - Home / Setup
+    static let setupWizardCompleted = "setupWizardCompleted"
+    static let setupWizardCurrentStep = "setupWizardCurrentStep"
+    /// Exact provider/model selections tested through the real dictation path.
+    /// Older provider-only records cannot establish which model was tested.
+    static let setupWizardTestedSelections = "setupWizardTestedSelections"
+    /// Dev-tool launch mode that defers startup reads of privacy-protected app data.
+    static let devPrivacyQuietMode = "devPrivacyQuietMode"
+
+    // MARK: - Dictionary
+    static let activatedTermPacks = "activatedTermPacks" // Legacy - kept for migration cleanup
+    static let activatedTermPackStates = "activatedTermPackStates"
+    static let termPackRegistryLastUpdateCheck = "termPackRegistryLastUpdateCheck"
+    static let selectedIndustryPreset = "selectedIndustryPreset"
+    static let targetAppCorrectionLearningEnabled = "targetAppCorrectionLearningEnabled"
+    static let targetAppCorrectionLearningLatestAttempt = "targetAppCorrectionLearningLatestAttempt"
+
+    // MARK: - Calendar Meeting Automation (machine-local; intentionally not synced/exported)
+    static let calendarMeetingStartMode = "calendarMeetingStartMode"
+    static let calendarMeetingAutoStopEnabled = "calendarMeetingAutoStopEnabled"
+    static let calendarMeetingSelectedCalendarIDs = "calendarMeetingSelectedCalendarIDs"
+    static let calendarMeetingCalendarSelectionInitialized = "calendarMeetingCalendarSelectionInitialized"
+    static let calendarMeetingEnabledProviderIDs = "calendarMeetingEnabledProviderIDs"
+    static let calendarMeetingSuppressedOccurrenceDigests = "calendarMeetingSuppressedOccurrenceDigests"
+    static let calendarMeetingReminderRequestDigests = "calendarMeetingReminderRequestDigests"
+    static let calendarMeetingNotificationsConfigured = "calendarMeetingNotificationsConfigured"
+
+    // MARK: - History
+    static let historyEnabled = "historyEnabled"
+    static let historyRetentionDays = "historyRetentionDays"
+    static let saveAudioWithHistory = "saveAudioWithHistory"
+
+    // MARK: - Notch Indicator
+    static let overlayPosition = "overlayPosition"
+    static let notchIndicatorVisibility = "notchIndicatorVisibility"
+    static let notchIndicatorLeftContent = "notchIndicatorLeftContent"
+    static let notchIndicatorRightContent = "notchIndicatorRightContent"
+    static let notchIndicatorDisplay = "notchIndicatorDisplay"
+
+    // MARK: - Appearance
+    static let showMenuBarIcon = "showMenuBarIcon"
+    static let dockIconBehaviorWhenMenuBarHidden = "dockIconBehaviorWhenMenuBarHidden"
+    static let menuBarIconHiddenAlertShown = "menuBarIconHiddenAlertShown"
+
+    // MARK: - Memory
+    static let memoryEnabled = "memoryEnabled"
+    static let memoryExtractionProvider = "memoryExtractionProvider"
+    static let memoryExtractionModel = "memoryExtractionModel"
+    static let memoryMinTextLength = "memoryMinTextLength"
+    static let memoryExtractionPrompt = "memoryExtractionPrompt"
+    static let memoryCaptureScope = "memoryCaptureScope"
+
+    // MARK: - Formatting
+    static let appFormattingEnabled = "appFormattingEnabled"
+    static let stripFinalPeriodFromStandaloneValuesEnabled = "stripFinalPeriodFromStandaloneValuesEnabled"
+    static let transcriptionNumberNormalizationEnabled = "transcriptionNumberNormalizationEnabled"
+    static let transcriptionNumberNormalizationMinimumValue = "transcriptionNumberNormalizationMinimumValue"
+    static let dictationPunctuationProfiles = "dictationPunctuationProfiles"
+
+    // MARK: - Accessibility
+    static let spokenFeedbackEnabled = "spokenFeedbackEnabled"
+    static let spokenFeedbackProviderId = "spokenFeedbackProviderId"
+
+    // MARK: - Plugin Registry
+    static let pluginRegistryLastFetch = "pluginRegistryLastFetch"
+    static let selectedIntegrationTab = "selectedIntegrationTab"
+    static let improveTypeWhisperCaptureEnabled = "plugin.com.typewhisper.improve.collectCorrections"
+
+    // MARK: - Recorder
+    static let recorderMicEnabled = "recorderMicEnabled"
+    static let recorderSystemAudioEnabled = "recorderSystemAudioEnabled"
+    static let recorderOutputFormat = "recorderOutputFormat"
+    static let recorderTranscriptionEnabled = "recorderTranscriptionEnabled"
+    static let recorderLivePreviewEnabled = "recorderLivePreviewEnabled"
+    static let recorderTranscriptionEngine = "recorderTranscriptionEngine"
+    static let recorderTranscriptionModel = "recorderTranscriptionModel"
+    static let recorderTranscriptionLanguage = "recorderTranscriptionLanguage"
+    static let recorderMicDuckingMode = "recorderMicDuckingMode"
+    static let recorderTrackMode = "recorderTrackMode"
+
+    // MARK: - File Transcription
+    static let fileTranscriptionEngine = "fileTranscriptionEngine"
+    static let fileTranscriptionModel = "fileTranscriptionModel"
+    static let fileTranscriptionLanguage = "fileTranscriptionLanguage"
+
+    // MARK: - Dictation Recovery
+    static let dictationRecoveryEngine = "dictationRecoveryEngine"
+    static let dictationRecoveryModel = "dictationRecoveryModel"
+    static let dictationRecoveryLanguage = "dictationRecoveryLanguage"
+    static let dictationRecoveryAutomaticFallbackEnabled = "dictationRecoveryAutomaticFallbackEnabled"
+    static let dictationRecoveryHedgeEnabled = "dictationRecoveryHedgeEnabled"
+    static let dictationRecoveryHedgeThresholdSeconds = "dictationRecoveryHedgeThresholdSeconds"
+    static let dictationRecoveryRetentionDays = "dictationRecoveryRetentionDays"
+
+    // MARK: - Watch Folder
+    static let watchFolderBookmark = "watchFolderBookmark"
+    static let watchFolderOutputBookmark = "watchFolderOutputBookmark"
+    static let watchFolderOutputFormat = "watchFolderOutputFormat"
+    static let watchFolderDeleteSource = "watchFolderDeleteSource"
+    static let watchFolderAutoStart = "watchFolderAutoStart"
+    static let watchFolderLanguage = "watchFolderLanguage"
+    static let watchFolderEngine = "watchFolderEngine"
+    static let watchFolderModel = "watchFolderModel"
+
+    // MARK: - Workflows
+    static let llmFallbackPriorityList = "llmFallbackPriorityList"
+    // Legacy values retained solely as migration inputs for llmFallbackPriorityList.
+    static let workflowDefaultLLMProviderId = "workflowDefaultLLMProviderId"
+    static let workflowDefaultLLMCloudModel = "workflowDefaultLLMCloudModel"
+    static let workflowShortTranscriptionMinimumWords = "workflowShortTranscriptionMinimumWords"
+
+    // MARK: - Licensing
+    static let managedLicenseKey = "ManagedLicenseKey"
+    static let usageIntent = "usageIntent"
+    static let userType = "userType"
+    static let licenseStatus = "licenseStatus"
+    static let licenseTier = "licenseTier"
+    static let lastLicenseValidation = "lastLicenseValidation"
+    static let licenseIsLifetime = "licenseIsLifetime"
+    static let welcomeSheetShown = "welcomeSheetShown"
+    static let workUsagePromptDismissed = "workUsagePromptDismissed"
+    static let lastSeenReleaseFingerprint = "lastSeenReleaseFingerprint"
+    static let lastAcknowledgedPostUpdatePromptRelease = "lastAcknowledgedPostUpdatePromptRelease"
+    static let iOSCompanionPromoCampaign = "iOSCompanionPromoCampaign"
+
+    // MARK: - Supporter
+    static let supporterTier = "supporterTier"
+    static let supporterStatus = "supporterStatus"
+    static let lastSupporterValidation = "lastSupporterValidation"
+    static let supporterDiscordClaimStatus = "supporterDiscordClaimStatus"
+    static let supporterDiscordSessionId = "supporterDiscordSessionId"
+}

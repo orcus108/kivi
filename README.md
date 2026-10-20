@@ -1,93 +1,50 @@
-# Intent
+# Kivi — an independent macOS interaction study
 
-A native macOS voice playground for exploring what happens after speech recognition. Free local Whisper transcription, with an interchangeable engine boundary. No account, API key, or subscription.
+A working native macOS prototype exploring what happens around dictation: correcting a take, making preferred spellings stick, shaping text for its destination, and recovering when speech recognition produces nothing useful.
 
-## Run
+Built by Vedant Misra as a product and engineering study inspired by Kivi. This is an independent project, with no affiliation with or endorsement from Sarvam AI or TypeWhisper.
 
-Open `~/Applications/Intent.app` after building (`dist/Intent.app` links there). On first use:
+## What I worked on
 
-1. In Setup, allow Microphone and Accessibility. macOS may require reopening the app after granting Accessibility.
-2. Click **Download & prepare** if the local model has not already been installed. Initial setup needs internet and downloads the multilingual Whisper model and tokenizer. Subsequent launches use the installed model locally.
-3. Put the cursor in an editable field, hold **Option + Space**, speak, and release. Escape cancels. Control + Space is available in Setup if the default conflicts with another app.
+The speech-to-text foundation comes from **[TypeWhisper](https://github.com/TypeWhisper/typewhisper-mac)**, pinned to `v1.7.1`. I did not build the underlying recognition engines. My work adds a Kivi-inspired SwiftUI interface and modifies the surrounding interaction and text-processing flows:
 
-Shortcut registration uses macOS global hotkeys and does not require Accessibility. The window footer reports registration failures rather than assuming the shortcut is available. Accessibility is still required for insertion into other apps. Grant permissions once for the new stable signing identity; actual retention across the next rebuild remains to be checked.
+- **Correction and personalization:** preferred vocabulary, spelling corrections, reviewed correction learning, and reusable spoken shortcuts.
+- **Text processing:** typed input for testing, local cleanup and structure, app-specific style choices, and a Literal mode.
+- **Selection editing:** keep the original, preview a rewrite, explicitly apply it, check for document/selection changes, and guard Undo. Copying remains available if insertion cannot be verified.
+- **Recovery:** clear no-speech feedback, retry, and access to a saved take when recovery is enabled.
+- **Everyday interaction:** compact dictionary and shortcut dialogs, deletion confirmation, page/greeting transitions that respect reduced motion, and paged history with background search/export.
 
-The app stays in the menu bar and shows a tiny 36 × 6 point dark bar above the Dock even when idle. Hover to reveal microphone and pencil buttons. Click the microphone for dictation or the pencil to edit selected text. Click stop to finish or × to cancel. The pill does not take keyboard focus away from your editor. You can hide the idle pill in Setup; recording feedback still appears while active.
+Start with [the contribution map](docs/CONTRIBUTIONS.md) for source locations and [verification](docs/VERIFICATION.md) for evidence and limits.
 
-Drag the pill left or right to reposition it. Its height stays fixed, it stays within the screen edges, and its horizontal position is remembered across launches and recording-state changes. A drag is distinct from a click to record.
+## Source layout
 
-Choose **Re-centre pill** from Intent's menu bar popup to move it back to the centre and reset the saved horizontal position.
-
-Open the main window from the menu bar to copy or edit the latest result, retry a failed take, export audio, or clear it. Recording is limited to three minutes per take. The microphone follows the Mac's system input setting.
-
-## Clipboard experiment
-
-In Experiments, enable **Clipboard reference**. Copy text, then include “clip clip” in your dictation. The text clipboard is captured at the beginning of the take and substituted literally at the cue. All clipboard takes open a preview for manual copying. This experiment does not send messages or execute commands.
-
-You can also type a corrected transcript in Experiments and run substitution without recording. Keep those results separate from live voice tests.
-
-## Voice editing
-
-Select text in an editable field in another app, hover over the pill and click its pencil (or choose **Edit selected text** in the menu bar). Say an instruction such as “Make this shorter, keeping the dates,” then click stop. Review the original, instruction and proposed edit in **Voice edit**. You can correct the instruction and Rewrite, adjust the result, Apply, dismiss, or copy either version.
-
-Rewrites use the existing local Ollama service at `127.0.0.1:11434` and `llama3.2:latest`. Keep Ollama running; install the model with `ollama pull llama3.2` if needed. Setup includes **Check editor**. No API key is required. Requests reject redirects and do not use a configured web proxy.
-
-Apply restores the original app and checks the focused field, selected text, selection range and full document when available. It uses direct Accessibility selection replacement; unsupported fields offer copying. Undo is available only when a full document snapshot is available and the document still matches the applied edit. Original text remains in the preview for manual recovery. Previews are kept in memory, not persisted across quitting. Model output can still change meaning; review before applying.
-
-To explore the application layer without recording, paste sample text into **Voice edit**, type an instruction and click **Rewrite**. This mode offers copying rather than applying to another app. Selections are limited to 8,000 characters; instructions to 1,000.
-
-## Build and checks
-
-Requires Apple Silicon, macOS 14+, and Xcode's Swift tools. This prototype has been built on macOS 26.5.1.
-
-```sh
-zsh scripts/build.sh
-swift test
+```text
+app/
+  foundation/                 modified TypeWhisper source, tests and upstream notices
+    TypeWhisper/KiviUI/       Kivi interface, adapters and local editor routing
+    TypeWhisper/Services/     transcription, text processing, insertion and recovery
+    TypeWhisperTests/         regression coverage
+  scripts/                    public source build and test commands
+docs/                         contribution map, verification and publication scope
 ```
 
-The build script signs in a temporary directory and installs in `~/Applications/Intent.app`, outside iCloud Documents to avoid Finder metadata disrupting signing. `dist/Intent.app` is a link to that installation. It uses a reusable local signing identity and refuses ad-hoc fallback. Keep the bundle identifier and signing key consistent. This is a local development build, not a notarized distribution.
+This repository is a reviewed source snapshot. Older prototypes, private development notes, personal recordings, installed-app data, model weights, credentials and signing materials are excluded. The private development history remains local; the public snapshot continues from the repository's previously public history.
 
-### Signing setup
+## Build and test
 
-`scripts/setup_signing.py` creates the **Intent Local Development** certificate and its private key in a dedicated keychain under `~/Library/Application Support/IntentSigning/`, outside this repository and iCloud Documents. It restores the original keychain search list and permits codesign to use the key. It does not add certificate trust.
-
-The identity and code-signing-only trust have been enabled on this Mac with explicit user approval. Its public certificate is also in the login keychain so validation can find it normally; the private key stays in the dedicated keychain. The signing script temporarily adds that keychain to the search list and restores the original list afterward. No website trust, system trust roots, or privacy database entries are changed.
-
-Different debug and release executables were signed and verified against each other's designated requirement. Grant Microphone and Accessibility once for this identity, then check that the next rebuild keeps them. Actual permission persistence has not yet been verified. On a new Mac, run `scripts/setup_signing.py` and explicitly approve adding this public certificate's code-signing-only trust before building.
-
-To test the same speech engine on an existing audio file without microphone access:
+Requires macOS on Apple Silicon, Xcode with its command-line tools, Python 3, and network access for the locked Swift packages. From the repository root:
 
 ```sh
-.build/release/Intent --transcribe /absolute/path/to/audio.wav
+zsh app/scripts/build.sh
+zsh app/scripts/test.sh
 ```
 
-To test the same local editor with UTF-8 text files:
+The build compiles an **unsigned source-review app** in `/private/tmp/kivi-public-source-build`. It does not install, launch or replace Kivi, Kivi Dev or TypeWhisper. The internal Xcode scheme/product is still named TypeWhisper to preserve the upstream project structure.
 
-```sh
-.build/release/Intent --rewrite /absolute/path/to/source.txt /absolute/path/to/instruction.txt
-```
+**This is not a one-command replica of my signed laptop installation.** Original Kivi artwork, fonts, compiled assets and sounds are not distributed here. Missing optional images fall back or are omitted, and custom fonts may fall back to system fonts. Local recognition/editing requires separately installed models; the local editor integration expects Ollama and a `qwen3:1.7b` model. The private installation's resource provisioning, signing identity and preference import are deliberately excluded. No API key is required for the local path; optional cloud integrations remain in the foundation source.
 
-## Implementation and limits
+## Attribution and license
 
-- `SpeechEngine.swift`: replaceable speech interface, local model download/cache and transcription. SDK pinned in Package.resolved.
-- `Model.swift`: recording, state, cancellation, recovery and experiment orchestration.
-- `Insertion.swift`: configurable global shortcut, focused-element checks, Accessibility insertion with paste fallback. A focus mismatch opens recovery instead of pasting elsewhere. Password fields are excluded.
-- `Selection.swift`: selection snapshots, drift protection, direct replacement and guarded undo.
-- `TextEditor.swift`: local Ollama editing client and structured result validation.
-- `Interface.swift`: setup, dictation, voice editing, experiments and nonactivating recording indicator.
+The modified TypeWhisper-based source is shared under **GPL-3.0-or-later**; see [LICENSE](LICENSE). Upstream copyright, commercial-license information and [trademark notices](app/foundation/TRADEMARK.md) are retained. [Provenance and modification notes](app/foundation/UPSTREAM.md) distinguish the foundation from the added work.
 
-Whisper supplies transcription and punctuation. This build does **not** yet reproduce Wispr's advanced cleanup, spoken self-correction, list formatting, automatic learning, or app-specific styles. Vocabulary entries are recognition hints, not guaranteed corrections. Hinglish quality and daily-use latency remain to be evaluated with Vedant.
-
-Some editors do not support Accessibility text writes, so the fallback synthesizes a normal paste. Paste dispatch is not proof the editor accepted it; review the result. Clipboard data is restored shortly afterward unless another application changed it in the meantime. Cross-app reliability must be checked with Accessibility enabled in the actual target fields.
-
-## Data
-
-Model files and the most recent unfinished audio take live in `~/Library/Application Support/Intent/`. Initial setup contacts Hugging Face for public files. Audio and text inference stay on this Mac. Preferences and vocabulary use macOS UserDefaults. No analytics or continuous recording.
-
-The current take survives an app restart for recovery. It is removed on successful insertion/copy, Clear, or when a new take replaces it. There is no transcript history database. Quit during model download may leave partial cached files; setup can be retried.
-
-See BUILD_BRIEF.md for the milestone and FRICTION_LOG.md for research notes.
-
-## Continuing development
-
-Start with [STATUS.md](STATUS.md) for the current milestone and handoff. [AGENTS.md](AGENTS.md) contains concise instructions for coding agents. [WORKFLOW.md](WORKFLOW.md) includes reusable prompts, chat boundaries, and the next manual verification checklist. [VERIFICATION.md](VERIFICATION.md) records evidence and unverified behavior; it is not a claim that all acceptance criteria passed.
+Kivi and Sarvam names identify the inspiration for this study. Their branding and original media are not offered under this repository's source license. No compiled app or original Kivi asset bundle is published.

@@ -1,0 +1,1624 @@
+import Foundation
+import SwiftUI
+import HuggingFace
+import MLX
+import MLXAudioSTT
+@_spi(FirstPartyPlugins) import TypeWhisperPluginSDK
+
+// MARK: - Plugin Entry Point
+
+@objc(Qwen3Plugin)
+final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModelCatalogProviding, PluginCustomModelImporting, DictionaryTermsCapabilityProviding, PluginSettingsActivityReporting, PluginDownloadedModelManaging, PluginRuntimeMemoryDiagnosticsReporting, PassiveModelRestoreProviding, @unchecked Sendable {
+    static let pluginId = "com.typewhisper.qwen3"
+    static let pluginName = "Qwen3 ASR"
+
+    fileprivate var host: HostServices?
+    fileprivate var _selectedModelId: String?
+    fileprivate var model: Qwen3ASRModel?
+    fileprivate var loadedModelId: String?
+    private let activationLock = NSRecursiveLock()
+    private var _activationID = UUID()
+    private var activationID: UUID {
+        get { activationLock.withLock { _activationID } }
+        set { activationLock.withLock { _activationID = newValue } }
+    }
+    @MainActor private var isImportingModel = false
+    fileprivate var _hfToken: String?
+
+    // Observable state for settings UI
+    fileprivate var modelState: Qwen3ModelState = .notLoaded
+
+    private static let primaryParams = STTGenerateParameters(
+        maxTokens: 2048,
+        temperature: 0.0,
+        language: nil,
+        chunkDuration: 30.0,
+        minChunkDuration: 1.0
+    )
+
+    private static let fallbackParams = STTGenerateParameters(
+        maxTokens: 1536,
+        temperature: 0.0,
+        language: nil,
+        chunkDuration: 15.0,
+        minChunkDuration: 1.0
+    )
+
+    private static let modelRequirements = PluginHuggingFaceModelStore.Requirements(
+        requiredFiles: ["config.json"],
+        alternativeFileGroups: [["tokenizer.json"], ["vocab.json", "merges.txt"]],
+        weightFileExtensions: ["safetensors"]
+    )
+    private static let modelDownloadPatterns = ["*.safetensors", "*.json", "*.txt", "*.wav"]
+
+    private let passiveRestoreController = PluginPassiveModelRestoreController()
+    let modelLoadGate = PluginLocalInferenceGate()
+    private var _explicitModelLoadTask: Task<Void, Never>?
+    private(set) var explicitModelLoadTask: Task<Void, Never>? {
+        get { activationLock.withLock { _explicitModelLoadTask } }
+        set { activationLock.withLock { _explicitModelLoadTask = newValue } }
+    }
+    private var _genericModelLoadTask: Task<Void, Never>?
+    private(set) var genericModelLoadTask: Task<Void, Never>? {
+        get { activationLock.withLock { _genericModelLoadTask } }
+        set { activationLock.withLock { _genericModelLoadTask = newValue } }
+    }
+
+    func requestPassiveModelRestore() {
+        passiveRestoreController.request { [weak self] in
+            guard let self else { return }
+            await self.restoreLoadedModel(allowDownloads: false, passively: true)
+        }
+    }
+
+    required override init() {
+        super.init()
+    }
+
+    func activate(host: HostServices) {
+        activationLock.withLock {
+            activationID = UUID()
+            self.host = host
+            if let store = customModelStore {
+                Task.detached(priority: .utility) { try? store.recoverAbandonedImports() }
+            }
+            _selectedModelId = host.userDefault(forKey: "selectedModel") as? String
+            _hfToken = PluginHuggingFaceTokenHelper.loadToken(from: host)
+            cleanupRedundantModelCopies()
+
+            if shouldRestoreLoadedModelsPassively {
+                requestPassiveModelRestore()
+            }
+        }
+    }
+
+    func deactivate() {
+        activationLock.withLock {
+            genericModelLoadTask?.cancel()
+            genericModelLoadTask = nil
+            explicitModelLoadTask?.cancel()
+            explicitModelLoadTask = nil
+            passiveRestoreController.cancel()
+            activationID = UUID()
+            model = nil
+            loadedModelId = nil
+            modelState = .notLoaded
+            Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
+            host = nil
+        }
+    }
+
+    // Imported files are owned by this plugin, separate from the built-in model cache.
+    fileprivate var customModelStore: PluginCustomModelStore? {
+        host.map { PluginCustomModelStore(directory: $0.pluginDataDirectory.appendingPathComponent("custom-models")) }
+    }
+
+    fileprivate var allModelDefinitions: [Qwen3ModelDef] {
+        Self.availableModels + (customModelStore?.models() ?? []).map(Self.importedDefinition)
+    }
+
+    private static func importedDefinition(_ model: PluginCustomModelStore.Model) -> Qwen3ModelDef {
+        Qwen3ModelDef(id: model.id, displayName: model.displayName, repoId: model.id,
+            sizeDescription: model.sizeDescription, ramRequirement: "—", usageHint: "Imported model")
+    }
+
+    var supportedImportModelTypes: Set<String> { ["qwen3_asr"] }
+
+    @MainActor
+    func importModel(_ candidate: PluginModelImportCandidate, token: String?) async throws -> PluginModelInfo {
+        guard !isImportingModel, modelState != .loading else { throw PluginModelImportError.busy }
+        guard let store = customModelStore else { throw PluginTranscriptionError.notConfigured }
+        isImportingModel = true
+        let previousState = modelState
+        let previousLoadedModelID = loadedModelId
+        let previousSelectedModelID = _selectedModelId
+        let previousPersistedLoadedID = host?.userDefault(forKey: "loadedModel") as? String
+        let previousPersistedSelectedID = host?.userDefault(forKey: "selectedModel") as? String
+        let generation = activationID
+        modelState = .loading
+        defer { isImportingModel = false }
+        var importedID: String?
+        do {
+            let imported = try await store.add(candidate, supportedTypes: supportedImportModelTypes,
+                requirements: Self.modelRequirements, token: token ?? _hfToken,
+                validation: { [self] imported in
+                    try await validateImportedModel(imported, generation: generation)
+                })
+            importedID = imported.id
+            host?.notifyCapabilitiesChanged()
+            try Task.checkCancellation()
+            guard generation == activationID, host != nil else { throw CancellationError() }
+            return PluginModelInfo(id: imported.id, displayName: imported.displayName,
+                sizeDescription: imported.sizeDescription, downloaded: true, loaded: true)
+        } catch {
+            if let importedID { try? store.remove(importedID) }
+            if generation == activationID {
+                if loadedModelId != previousLoadedModelID {
+                    // Validation released the old runtime or loaded a model
+                    // whose files rolled back. Leave the engine unloaded.
+                    model = nil
+                    loadedModelId = nil
+                    host?.setUserDefault(nil, forKey: "loadedModel")
+                    modelState = .notLoaded
+                } else {
+                    host?.setUserDefault(previousPersistedLoadedID, forKey: "loadedModel")
+                    modelState = previousState
+                }
+                _selectedModelId = previousSelectedModelID
+                host?.setUserDefault(previousPersistedSelectedID, forKey: "selectedModel")
+                host?.notifyCapabilitiesChanged()
+            }
+            throw error
+        }
+    }
+
+    @MainActor
+    private func validateImportedModel(_ imported: PluginCustomModelStore.Model, generation: UUID) async throws {
+        try Task.checkCancellation()
+        guard generation == activationID, host != nil else { throw CancellationError() }
+        try await loadModel(Self.importedDefinition(imported), notifyHost: false, expectedGeneration: generation)
+        guard generation == activationID, host != nil else { throw CancellationError() }
+    }
+
+    // MARK: - TranscriptionEnginePlugin
+
+    var providerId: String { "qwen3" }
+    var providerDisplayName: String { "Qwen3 ASR (MLX)" }
+
+    var isConfigured: Bool {
+        model != nil && loadedModelId != nil
+    }
+
+    var shouldRestoreLoadedModelsPassively: Bool {
+        host?.shouldRestoreLoadedModelsPassively ?? true
+    }
+
+    var transcriptionModels: [PluginModelInfo] {
+        guard let loadedModelId else { return [] }
+        return allModelDefinitions
+            .filter { $0.id == loadedModelId }
+            .map { PluginModelInfo(id: $0.id, displayName: $0.displayName) }
+    }
+
+    var availableModels: [PluginModelInfo] {
+        allModelDefinitions.map { def in
+            PluginModelInfo(
+                id: def.id,
+                displayName: def.displayName,
+                sizeDescription: def.sizeDescription,
+                downloaded: hasDownloadedModel(def),
+                loaded: def.id == loadedModelId
+            )
+        }
+    }
+
+    var downloadedModels: [PluginModelInfo] {
+        allModelDefinitions
+            .filter { $0.id.hasPrefix("custom-") || hasDownloadedModel($0) }
+            .map { def in
+                PluginModelInfo(
+                    id: def.id,
+                    displayName: def.displayName,
+                    sizeDescription: def.sizeDescription,
+                    downloaded: true,
+                    loaded: def.id == loadedModelId
+                )
+            }
+    }
+
+    func deleteDownloadedModel(_ modelId: String) async throws {
+        try activationLock.withLock {
+            guard modelState != .loading else { throw PluginModelImportError.busy }
+            guard let modelDef = allModelDefinitions.first(where: { $0.id == modelId }) else { return }
+
+            if _selectedModelId == modelId || host?.userDefault(forKey: "loadedModel") as? String == modelId {
+                // A task queued on modelLoadGate has not set .loading yet.
+                // Invalidate it before removing files it could redownload.
+                activationID = UUID()
+                genericModelLoadTask?.cancel()
+                genericModelLoadTask = nil
+                explicitModelLoadTask?.cancel()
+                explicitModelLoadTask = nil
+                passiveRestoreController.cancel()
+            }
+            if loadedModelId == modelId {
+                unloadModel(clearPersistence: true)
+            }
+            if _selectedModelId == modelId {
+                _selectedModelId = nil
+                host?.setUserDefault(nil, forKey: "selectedModel")
+            }
+            if host?.userDefault(forKey: "loadedModel") as? String == modelId {
+                host?.setUserDefault(nil, forKey: "loadedModel")
+            }
+
+            try deleteModelFiles(modelDef)
+            host?.notifyCapabilitiesChanged()
+        }
+    }
+
+    var supportedLanguages: [String] {
+        Self.qwenSupportedLanguageCodes
+    }
+
+    var selectedModelId: String? { _selectedModelId }
+
+    func selectModel(_ modelId: String) {
+        activationLock.withLock {
+            let previousLoadedModelId = loadedModelId
+            if _selectedModelId != modelId || (previousLoadedModelId != nil && previousLoadedModelId != modelId) {
+                // A metadata-only selection must not initialize the GPU merely
+                // to clear an empty cache. Pending loads still get invalidated.
+                unloadModel(clearPersistence: true, clearRuntimeCache: model != nil || modelState == .loading)
+            }
+            _selectedModelId = modelId
+            host?.setUserDefault(modelId, forKey: "selectedModel")
+
+            guard shouldRestoreDownloadedSelection(modelId, previousLoadedModelId: previousLoadedModelId) else {
+                return
+            }
+
+            let generation = activationID
+            Task { await restoreLoadedModel(allowDownloads: false, preferredModelId: modelId, expectedGeneration: generation) }
+        }
+    }
+
+    var supportsTranslation: Bool { false }
+    var dictionaryTermsSupport: DictionaryTermsSupport { .unsupported }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?
+    ) async throws -> PluginTranscriptionResult {
+        try await PluginLocalInferenceGate.shared.withLock { [self] in
+            guard let model else {
+                throw PluginTranscriptionError.notConfigured
+            }
+            defer { Self.clearRuntimeCache() }
+
+            let audioArray = MLXArray(audio.samples)
+            let languageName = Self.resolveLanguageName(language)
+            let context = Self.contextBiasString(from: prompt)
+
+            // mlx-audio-swift treats maxTokens as one shared budget across every
+            // internally generated chunk. Split here so long files receive a fresh
+            // generation budget per chunk instead of silently stopping at the cap.
+            let primaryChunks = splitAudioIntoChunks(
+                audioArray,
+                sampleRate: Self.sampleRate,
+                chunkDuration: Self.primaryParams.chunkDuration,
+                minChunkDuration: Self.primaryParams.minChunkDuration
+            ).map(\.0)
+
+            let transcript = try QwenChunkTranscriber.transcribe(
+                primaryChunks: primaryChunks,
+                primaryTokenLimit: Self.primaryParams.maxTokens,
+                fallbackTokenLimit: Self.fallbackParams.maxTokens,
+                makeFallbackChunks: { chunk in
+                    splitAudioIntoChunks(
+                        chunk,
+                        sampleRate: Self.sampleRate,
+                        chunkDuration: Self.fallbackParams.chunkDuration,
+                        minChunkDuration: Self.fallbackParams.minChunkDuration
+                    ).map(\.0)
+                },
+                generatePrimary: { chunk in
+                    Self.generateSingleChunk(
+                        model: model,
+                        audio: chunk,
+                        params: Self.primaryParams,
+                        context: context,
+                        language: languageName
+                    )
+                },
+                generateFallback: { chunk in
+                    Self.generateSingleChunk(
+                        model: model,
+                        audio: chunk,
+                        params: Self.fallbackParams,
+                        context: "",
+                        language: languageName
+                    )
+                }
+            )
+
+            let resultLanguageName = transcript.language ?? languageName
+            let cleanedText = QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: transcript.text,
+                languageName: resultLanguageName
+            )
+            let detectedLanguage = Self.languageCode(forQwenLanguageName: resultLanguageName) ?? language
+
+            return PluginTranscriptionResult(text: cleanedText, detectedLanguage: detectedLanguage)
+        }
+    }
+
+    // MARK: - Model Management
+
+    fileprivate func loadModel(_ modelDef: Qwen3ModelDef, passively: Bool = false,
+                               notifyHost: Bool = true, expectedGeneration: UUID? = nil) async throws {
+        let generation = expectedGeneration ?? activationID
+        try await modelLoadGate.withLock { [self] in
+            try Task.checkCancellation()
+            guard generation == activationID, host != nil else { throw CancellationError() }
+            if passively {
+                guard host?.shouldRestoreLoadedModelsPassively == true, !isConfigured else { return }
+            }
+            guard !(isConfigured && loadedModelId == modelDef.id) else { return }
+            try await performModelLoad(modelDef, allowDownloads: !passively, notifyHost: notifyHost, generation: generation)
+        }
+    }
+
+    private func performModelLoad(_ modelDef: Qwen3ModelDef, allowDownloads: Bool,
+                                  notifyHost: Bool, generation: UUID) async throws {
+        try activationLock.withLock {
+            try Task.checkCancellation()
+            guard generation == activationID, host != nil else { throw CancellationError() }
+            modelState = .loading
+        }
+        do {
+            let modelsDir = host?.pluginDataDirectory.appendingPathComponent("models")
+                ?? FileManager.default.temporaryDirectory
+            try? FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+
+            let modelDirectory: URL
+            if let existing = usableModelDirectory(for: modelDef, modelsDirectory: modelsDir) {
+                modelDirectory = existing
+            } else {
+                guard allowDownloads else {
+                    modelState = .notLoaded
+                    return
+                }
+                guard !modelDef.id.hasPrefix("custom-") else {
+                    throw PluginModelImportError.invalidModel("Imported files are missing. Remove and import the model again.")
+                }
+                removeIncompleteModelIfNeeded(modelDef, modelsDirectory: modelsDir)
+                guard let repoID = Repo.ID(rawValue: modelDef.repoId) else {
+                    throw NSError(
+                        domain: "Qwen3Plugin",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Invalid repository ID: \(modelDef.repoId)"]
+                    )
+                }
+                let spaceReservation = try await PluginDownloadDiskSpace.reserveHuggingFaceDownload(
+                    repositoryID: modelDef.repoId,
+                    matching: Self.modelDownloadPatterns,
+                    token: _hfToken,
+                    destination: modelsDir,
+                    trackedDirectory: PluginHuggingFaceModelStore(modelsDirectory: modelsDir)
+                        .repositoryCacheDirectory(for: modelDef.repoId),
+                    // HubClient downloads through URLSession's temporary directory.
+                    stagingDirectory: FileManager.default.temporaryDirectory,
+                    modelName: modelDef.displayName
+                )
+                defer { spaceReservation?.release() }
+                let client = HubClient(
+                    host: HubClient.defaultHost,
+                    bearerToken: PluginHuggingFaceTokenHelper.normalizedToken(_hfToken),
+                    cache: HubCache(cacheDirectory: modelsDir)
+                )
+                do {
+                    modelDirectory = try await client.downloadSnapshot(
+                        of: repoID,
+                        matching: Self.modelDownloadPatterns
+                    )
+                    guard PluginHuggingFaceModelStore(modelsDirectory: modelsDir).isUsableModelDirectory(
+                        modelDirectory,
+                        requirements: Self.modelRequirements
+                    ) else {
+                        throw NSError(
+                            domain: "Qwen3Plugin",
+                            code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "Downloaded model is incomplete: \(modelDef.repoId)"]
+                        )
+                    }
+                } catch {
+                    removeIncompleteModelIfNeeded(modelDef, modelsDirectory: modelsDir)
+                    throw error
+                }
+            }
+            // Release the previous runtime before constructing its replacement.
+            // Keep its files and selection so a failed import can be retried.
+            try activationLock.withLock {
+                try Task.checkCancellation()
+                guard generation == activationID, host != nil else { throw CancellationError() }
+                model = nil
+                loadedModelId = nil
+            }
+            try await PluginLocalInferenceGate.shared.withLock {
+                try Task.checkCancellation()
+                Stream.gpu.synchronize()
+                Memory.clearCache()
+            }
+            try Task.checkCancellation()
+            guard generation == activationID, host != nil else { throw CancellationError() }
+            let loaded = try await Qwen3ASRModel.fromModelDirectory(modelDirectory)
+
+            try activationLock.withLock {
+                try Task.checkCancellation()
+                guard generation == activationID, host != nil else { throw CancellationError() }
+                model = loaded
+                loadedModelId = modelDef.id
+                _selectedModelId = modelDef.id
+                host?.setUserDefault(modelDef.id, forKey: "selectedModel")
+                host?.setUserDefault(modelDef.id, forKey: "loadedModel")
+                modelState = .ready(modelDef.id)
+                if notifyHost { host?.notifyCapabilitiesChanged() }
+            }
+        } catch is CancellationError {
+            if generation == activationID, host != nil {
+                modelState = loadedModelId.map { .ready($0) } ?? .notLoaded
+            }
+            throw CancellationError()
+        } catch {
+            if generation == activationID { modelState = .error(error.localizedDescription) }
+            throw error
+        }
+    }
+
+    @objc func triggerAutoUnload() { unloadModel(clearPersistence: false) }
+    @objc func triggerRestoreModel() {
+        activationLock.withLock {
+            guard !isConfigured, modelState != .loading, explicitModelLoadTask == nil else { return }
+            genericModelLoadTask?.cancel()
+            let generation = activationID
+            genericModelLoadTask = Task {
+                guard !Task.isCancelled, generation == activationID, host != nil else { return }
+                await restoreLoadedModel(allowDownloads: false, expectedGeneration: generation)
+            }
+        }
+    }
+    @objc(triggerRestoreModelForModel:) func triggerRestoreModel(forModel modelId: NSString?) {
+        activationLock.withLock {
+            guard let preferredModelId = modelId.map(String.init),
+                  allModelDefinitions.contains(where: { $0.id == preferredModelId }) else {
+                return
+            }
+            if loadedModelId != nil, loadedModelId != preferredModelId {
+                unloadModel(clearPersistence: true)
+            }
+            if loadedModelId == nil,
+               host?.userDefault(forKey: "loadedModel") as? String != preferredModelId {
+                host?.setUserDefault(nil, forKey: "loadedModel")
+            }
+            _selectedModelId = preferredModelId
+            host?.setUserDefault(preferredModelId, forKey: "selectedModel")
+            // Supersede the previous request synchronously, before either task runs.
+            genericModelLoadTask?.cancel()
+            genericModelLoadTask = nil
+            explicitModelLoadTask?.cancel()
+            activationID = UUID()
+            if isConfigured, loadedModelId == preferredModelId {
+                // Superseding an import can keep this already-loaded runtime.
+                modelState = .ready(preferredModelId)
+            }
+            let generation = activationID
+            explicitModelLoadTask = Task {
+                defer {
+                    activationLock.withLock {
+                        if generation == activationID { explicitModelLoadTask = nil }
+                    }
+                }
+                guard !Task.isCancelled, generation == activationID, host != nil else { return }
+                await restoreLoadedModel(allowDownloads: true, preferredModelId: preferredModelId, expectedGeneration: generation)
+            }
+        }
+    }
+
+    func unloadModel(clearPersistence: Bool = true, clearRuntimeCache: Bool = true) {
+        activationLock.withLock {
+            // Reject pending imports and loads before they can repopulate an unloaded engine.
+            activationID = UUID()
+            genericModelLoadTask?.cancel()
+            genericModelLoadTask = nil
+            explicitModelLoadTask?.cancel()
+            explicitModelLoadTask = nil
+            model = nil
+            loadedModelId = nil
+            modelState = .notLoaded
+            if clearRuntimeCache { Self.scheduleRuntimeCacheClearWhenInferenceIsIdle() }
+            if clearPersistence {
+                host?.setUserDefault(nil, forKey: "loadedModel")
+            }
+            host?.notifyCapabilitiesChanged()
+        }
+    }
+
+    fileprivate func deleteModelFiles(_ modelDef: Qwen3ModelDef) throws {
+        if modelDef.id.hasPrefix("custom-") {
+            try customModelStore?.remove(modelDef.id)
+            return
+        }
+        guard let modelsDir = host?.pluginDataDirectory.appendingPathComponent("models") else { return }
+        try PluginHuggingFaceModelStore(modelsDirectory: modelsDir).deleteModelFiles(
+            for: modelDef.repoId,
+            legacyDirectories: [legacyModelDirectory(for: modelDef, modelsDirectory: modelsDir)]
+        )
+    }
+
+    func restoreLoadedModel(allowDownloads: Bool = false, passively: Bool = false, expectedGeneration: UUID? = nil) async {
+        let generation = expectedGeneration ?? activationID
+        guard !Task.isCancelled, generation == activationID else { return }
+        if passively {
+            guard host?.shouldRestoreLoadedModelsPassively == true, !isConfigured else { return }
+        }
+        await restoreLoadedModel(allowDownloads: allowDownloads, preferredModelId: nil, passively: passively, expectedGeneration: generation)
+    }
+
+    func restoreLoadedModel(allowDownloads: Bool = false, preferredModelId: String?, passively: Bool = false,
+                            expectedGeneration: UUID? = nil) async {
+        let generation = expectedGeneration ?? activationID
+        guard !Task.isCancelled, generation == activationID else { return }
+        for modelId in restoreCandidateModelIds(
+            preferredModelId: preferredModelId,
+            allowDownloads: allowDownloads
+        ) {
+            guard let modelDef = allModelDefinitions.first(where: { $0.id == modelId }) else {
+                continue
+            }
+            guard !Task.isCancelled, generation == activationID else { return }
+            do {
+                try await loadModel(modelDef, passively: passively, expectedGeneration: generation)
+                return
+            } catch {
+                continue
+            }
+        }
+    }
+
+    func restoreCandidateModelIds(
+        preferredModelId: String? = nil,
+        allowDownloads: Bool = false
+    ) -> [String] {
+        var candidateIds: [String] = []
+
+        func appendCandidate(_ modelId: String?) {
+            guard let modelId, !modelId.isEmpty else { return }
+            guard allModelDefinitions.contains(where: { $0.id == modelId }) else { return }
+            guard !candidateIds.contains(modelId) else { return }
+            candidateIds.append(modelId)
+        }
+
+        appendCandidate(preferredModelId)
+        appendCandidate(host?.userDefault(forKey: "loadedModel") as? String)
+        appendCandidate(_selectedModelId)
+
+        let downloadedIds = downloadedModels.map(\.id)
+        if downloadedIds.count == 1 {
+            appendCandidate(downloadedIds[0])
+        }
+
+        guard !allowDownloads else { return candidateIds }
+
+        return candidateIds.filter { modelId in
+            guard let modelDef = allModelDefinitions.first(where: { $0.id == modelId }) else {
+                return false
+            }
+            return hasDownloadedModel(modelDef)
+        }
+    }
+
+    func shouldRestoreDownloadedSelection(
+        _ modelId: String,
+        previousLoadedModelId: String?
+    ) -> Bool {
+        guard previousLoadedModelId != modelId else { return false }
+        guard let modelDef = allModelDefinitions.first(where: { $0.id == modelId }) else {
+            return false
+        }
+        return hasDownloadedModel(modelDef)
+    }
+
+    private func hasDownloadedModel(_ modelDef: Qwen3ModelDef) -> Bool {
+        guard let modelsDir = host?.pluginDataDirectory.appendingPathComponent("models") else { return false }
+        return usableModelDirectory(for: modelDef, modelsDirectory: modelsDir) != nil
+    }
+
+    private func usableModelDirectory(for modelDef: Qwen3ModelDef, modelsDirectory: URL) -> URL? {
+        if modelDef.id.hasPrefix("custom-") {
+            guard let directory = customModelStore?.modelDirectory(for: modelDef.id),
+                  PluginHuggingFaceModelStore(modelsDirectory: directory).isUsableModelDirectory(
+                    directory, requirements: Self.modelRequirements) else { return nil }
+            return directory
+        }
+        return PluginHuggingFaceModelStore(modelsDirectory: modelsDirectory).usableModelDirectory(
+            for: modelDef.repoId,
+            legacyDirectories: [legacyModelDirectory(for: modelDef, modelsDirectory: modelsDirectory)],
+            requirements: Self.modelRequirements
+        )
+    }
+
+    private func legacyModelDirectory(for modelDef: Qwen3ModelDef, modelsDirectory: URL) -> URL {
+        modelsDirectory
+            .appendingPathComponent("mlx-audio")
+            .appendingPathComponent(modelDef.repoId.replacingOccurrences(of: "/", with: "_"))
+    }
+
+    private func removeIncompleteModelIfNeeded(_ modelDef: Qwen3ModelDef, modelsDirectory: URL) {
+        let store = PluginHuggingFaceModelStore(modelsDirectory: modelsDirectory)
+        let legacyDirectories = [legacyModelDirectory(for: modelDef, modelsDirectory: modelsDirectory)]
+        guard usableModelDirectory(for: modelDef, modelsDirectory: modelsDirectory) == nil,
+              store.hasCachedModelFiles(for: modelDef.repoId, legacyDirectories: legacyDirectories) else {
+            return
+        }
+        try? store.deleteModelFiles(for: modelDef.repoId, legacyDirectories: legacyDirectories)
+    }
+
+    private func cleanupRedundantModelCopies() {
+        guard let modelsDirectory = host?.pluginDataDirectory.appendingPathComponent("models") else { return }
+        let store = PluginHuggingFaceModelStore(modelsDirectory: modelsDirectory)
+        for modelDef in Self.availableModels {
+            _ = try? store.removeRedundantLegacyDirectories(
+                for: modelDef.repoId,
+                legacyDirectories: [legacyModelDirectory(for: modelDef, modelsDirectory: modelsDirectory)],
+                requirements: Self.modelRequirements,
+                reproducibleRelativePaths: ["tokenizer.json"]
+            )
+        }
+    }
+
+    // MARK: - Settings View
+
+    var currentSettingsActivity: PluginSettingsActivity? {
+        switch modelState {
+        case .notLoaded, .ready:
+            return nil
+        case .loading:
+            return PluginSettingsActivity(message: "Preparing model")
+        case .error(let message):
+            return PluginSettingsActivity(message: message, isError: true)
+        }
+    }
+
+    var runtimeMemorySnapshot: PluginRuntimeMemorySnapshot? {
+        let snapshot = Memory.snapshot()
+        return PluginRuntimeMemorySnapshot(
+            activeMemoryBytes: snapshot.activeMemory,
+            cacheMemoryBytes: snapshot.cacheMemory,
+            peakMemoryBytes: snapshot.peakMemory
+        )
+    }
+
+    private static func clearRuntimeCache() {
+        Memory.clearCache()
+    }
+
+    private static func clearRuntimeCacheWhenInferenceIsIdle() async {
+        try? await PluginLocalInferenceGate.shared.withLock {
+            Memory.clearCache()
+        }
+    }
+
+    private static func scheduleRuntimeCacheClearWhenInferenceIsIdle() {
+        Task {
+            await clearRuntimeCacheWhenInferenceIsIdle()
+        }
+    }
+
+    var settingsView: AnyView? {
+        AnyView(Qwen3SettingsView(plugin: self))
+    }
+
+    func setHuggingFaceToken(_ token: String) {
+        _hfToken = PluginHuggingFaceTokenHelper.saveToken(token, to: host)
+    }
+
+    func clearHuggingFaceToken() {
+        _hfToken = nil
+        PluginHuggingFaceTokenHelper.clearToken(from: host)
+    }
+
+    func validateHuggingFaceToken(
+        _ token: String,
+        dataFetcher: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = PluginHTTPClient.data
+    ) async -> Bool {
+        await PluginHuggingFaceTokenHelper.validateToken(token, dataFetcher: dataFetcher)
+    }
+
+    // MARK: - Model Definitions
+
+    static let availableModels: [Qwen3ModelDef] = [
+        Qwen3ModelDef(
+            id: "qwen3-asr-0.6b-4bit",
+            displayName: "Qwen3 0.6B (4-bit)",
+            repoId: "mlx-community/Qwen3-ASR-0.6B-4bit",
+            sizeDescription: "~0.7 GB",
+            ramRequirement: "8 GB+",
+            usageHint: "Smallest download; use when memory matters more than quality."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-0.6b-5bit",
+            displayName: "Qwen3 0.6B (5-bit)",
+            repoId: "mlx-community/Qwen3-ASR-0.6B-5bit",
+            sizeDescription: "~0.8 GB",
+            ramRequirement: "8 GB+",
+            usageHint: "Slightly more precision than 4-bit with a similar footprint."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-0.6b-6bit",
+            displayName: "Qwen3 0.6B (6-bit)",
+            repoId: "mlx-community/Qwen3-ASR-0.6B-6bit",
+            sizeDescription: "~0.9 GB",
+            ramRequirement: "8 GB+",
+            usageHint: "Fast pick for 8 GB Macs and casual dictation.",
+            recommendation: .lowMemory
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-0.6b-8bit",
+            displayName: "Qwen3 0.6B (8-bit)",
+            repoId: "mlx-community/Qwen3-ASR-0.6B-8bit",
+            sizeDescription: "~1.0 GB",
+            ramRequirement: "16 GB+",
+            usageHint: "Higher-precision small model when 0.6B quality matters."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-0.6b-bf16",
+            displayName: "Qwen3 0.6B (BF16)",
+            repoId: "mlx-community/Qwen3-ASR-0.6B-bf16",
+            sizeDescription: "~1.6 GB",
+            ramRequirement: "16 GB+",
+            usageHint: "Unquantized small model; useful for comparison or validation."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-1.7b-4bit",
+            displayName: "Qwen3 1.7B (4-bit)",
+            repoId: "mlx-community/Qwen3-ASR-1.7B-4bit",
+            sizeDescription: "~1.6 GB",
+            ramRequirement: "16 GB+",
+            usageHint: "Smallest 1.7B option; use when 6-bit is too heavy."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-1.7b-5bit",
+            displayName: "Qwen3 1.7B (5-bit)",
+            repoId: "mlx-community/Qwen3-ASR-1.7B-5bit",
+            sizeDescription: "~1.8 GB",
+            ramRequirement: "16 GB+",
+            usageHint: "Middle ground if the default 6-bit model is tight on memory."
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-1.7b-6bit",
+            displayName: "Qwen3 1.7B (6-bit)",
+            repoId: "mlx-community/Qwen3-ASR-1.7B-6bit",
+            sizeDescription: "~2.0 GB",
+            ramRequirement: "16 GB+",
+            usageHint: "Best default for most 16 GB+ Macs.",
+            recommendation: .balanced
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-1.7b-8bit",
+            displayName: "Qwen3 1.7B (8-bit)",
+            repoId: "mlx-community/Qwen3-ASR-1.7B-8bit",
+            sizeDescription: "~2.5 GB",
+            ramRequirement: "32 GB+",
+            usageHint: "Higher-quality pick for 32 GB+ Macs.",
+            recommendation: .highQuality
+        ),
+        Qwen3ModelDef(
+            id: "qwen3-asr-1.7b-bf16",
+            displayName: "Qwen3 1.7B (BF16)",
+            repoId: "mlx-community/Qwen3-ASR-1.7B-bf16",
+            sizeDescription: "~4.1 GB",
+            ramRequirement: "32 GB+",
+            usageHint: "Largest unquantized model; use for max-fidelity validation."
+        ),
+    ]
+
+    // MARK: - Helpers
+
+    static let qwenSupportedLanguageCodes: [String] = [
+        "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it",
+        "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv",
+        "da", "fi", "pl", "cs", "fil", "tl", "fa", "el", "ro", "hu",
+        "mk",
+    ]
+
+    // Language code to English language name used by the Qwen3 ASR API.
+    private static let languageNamesByCode: [String: String] = [
+        "zh": "Chinese", "en": "English", "yue": "Cantonese",
+        "ar": "Arabic", "de": "German", "fr": "French",
+        "es": "Spanish", "pt": "Portuguese", "id": "Indonesian",
+        "it": "Italian", "ko": "Korean", "ru": "Russian",
+        "th": "Thai", "vi": "Vietnamese", "ja": "Japanese",
+        "tr": "Turkish", "hi": "Hindi", "ms": "Malay",
+        "nl": "Dutch", "sv": "Swedish", "da": "Danish",
+        "fi": "Finnish", "pl": "Polish", "cs": "Czech",
+        "fil": "Filipino", "tl": "Filipino", "fa": "Persian", "el": "Greek",
+        "hu": "Hungarian", "mk": "Macedonian", "ro": "Romanian",
+    ]
+
+    private static let languageCodesByName: [String: String] = {
+        var result: [String: String] = [:]
+        for (code, name) in languageNamesByCode {
+            if result[name.lowercased()] == nil || code != "tl" {
+                result[name.lowercased()] = code
+            }
+        }
+        return result
+    }()
+
+    static func resolveLanguageName(_ isoCode: String?) -> String? {
+        guard let code = isoCode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !code.isEmpty else {
+            return nil
+        }
+        return languageNamesByCode[code]
+    }
+
+    static func languageCode(forQwenLanguageName languageName: String?) -> String? {
+        guard let languageName = languageName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !languageName.isEmpty else {
+            return nil
+        }
+
+        let names = languageName
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard names.count == 1 else { return nil }
+        return languageCodesByName[names[0]]
+    }
+
+    static func contextBiasString(from prompt: String?) -> String {
+        Qwen3ContextBiasFormatter.format(prompt: prompt)
+    }
+
+    private static let sampleRate = 16_000
+
+    private static func generateSingleChunk(
+        model: Qwen3ASRModel,
+        audio: MLXArray,
+        params: STTGenerateParameters,
+        context: String,
+        language: String?
+    ) -> QwenChunkGeneration {
+        let output = model.generate(
+            audio: audio,
+            maxTokens: params.maxTokens,
+            temperature: params.temperature,
+            context: context,
+            language: language,
+            // The plugin already split the source. Keep the upstream model from
+            // creating another set of chunks with a shared token budget.
+            chunkDuration: 1_200,
+            minChunkDuration: params.minChunkDuration
+        )
+        return QwenChunkGeneration(
+            text: normalizeTranscript(output.text),
+            language: output.language,
+            generatedTokenCount: output.generationTokens
+        )
+    }
+
+    fileprivate static func normalizeTranscript(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct QwenChunkGeneration: Equatable {
+    let text: String
+    let language: String?
+    let generatedTokenCount: Int
+}
+
+struct QwenChunkTranscript: Equatable {
+    let text: String
+    let language: String?
+}
+
+enum QwenChunkTranscriptionError: LocalizedError, Equatable {
+    case incomplete
+
+    var errorDescription: String? {
+        "Qwen3 ASR could not complete the entire audio because a chunk reached the model output limit."
+    }
+}
+
+enum QwenChunkTranscriber {
+    static func transcribe<Chunk>(
+        primaryChunks: [Chunk],
+        primaryTokenLimit: Int,
+        fallbackTokenLimit: Int,
+        makeFallbackChunks: (Chunk) -> [Chunk],
+        generatePrimary: (Chunk) -> QwenChunkGeneration,
+        generateFallback: (Chunk) -> QwenChunkGeneration
+    ) throws -> QwenChunkTranscript {
+        var chunkTexts: [String] = []
+        var chunkLanguages: [String?] = []
+
+        for chunk in primaryChunks {
+            try Task.checkCancellation()
+            let primary = generatePrimary(chunk)
+            let primaryReachedLimit = primary.generatedTokenCount >= primaryTokenLimit
+
+            guard primaryReachedLimit || QwenTranscriptGuard.isLikelyLooped(primary.text) else {
+                chunkTexts.append(primary.text)
+                chunkLanguages.append(primary.language)
+                continue
+            }
+
+            let fallback = try transcribeFallbackChunks(
+                makeFallbackChunks(chunk),
+                tokenLimit: fallbackTokenLimit,
+                generate: generateFallback
+            )
+
+            if primaryReachedLimit {
+                guard !fallback.reachedTokenLimit, !fallback.transcript.text.isEmpty else {
+                    throw QwenChunkTranscriptionError.incomplete
+                }
+                chunkTexts.append(fallback.transcript.text)
+                chunkLanguages.append(fallback.transcript.language)
+            } else if fallback.reachedTokenLimit || fallback.transcript.text.isEmpty {
+                throw QwenChunkTranscriptionError.incomplete
+            } else if QwenTranscriptGuard.isLikelyLooped(fallback.transcript.text) {
+                chunkTexts.append(
+                    QwenTranscriptGuard.preferredTranscript(
+                        primary: primary.text,
+                        fallback: fallback.transcript.text
+                    )
+                )
+                chunkLanguages.append(primary.language ?? fallback.transcript.language)
+            } else {
+                chunkTexts.append(fallback.transcript.text)
+                chunkLanguages.append(fallback.transcript.language)
+            }
+        }
+
+        return QwenChunkTranscript(
+            text: joinedTranscript(chunkTexts),
+            language: mergedLanguage(chunkLanguages)
+        )
+    }
+
+    private static func transcribeFallbackChunks<Chunk>(
+        _ chunks: [Chunk],
+        tokenLimit: Int,
+        generate: (Chunk) -> QwenChunkGeneration
+    ) throws -> (transcript: QwenChunkTranscript, reachedTokenLimit: Bool) {
+        var texts: [String] = []
+        var languages: [String?] = []
+        var reachedTokenLimit = false
+
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let output = generate(chunk)
+            texts.append(output.text)
+            languages.append(output.language)
+            reachedTokenLimit = reachedTokenLimit || output.generatedTokenCount >= tokenLimit
+        }
+
+        return (
+            QwenChunkTranscript(
+                text: joinedTranscript(texts),
+                language: mergedLanguage(languages)
+            ),
+            reachedTokenLimit
+        )
+    }
+
+    private static func joinedTranscript(_ texts: [String]) -> String {
+        texts
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func mergedLanguage(_ languages: [String?]) -> String? {
+        var seen: Set<String> = []
+        var merged: [String] = []
+
+        for language in languages {
+            guard let language = language?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !language.isEmpty,
+                  seen.insert(language).inserted else {
+                continue
+            }
+            merged.append(language)
+        }
+
+        return merged.isEmpty ? nil : merged.joined(separator: ",")
+    }
+}
+
+// MARK: - Model Types
+
+struct Qwen3ModelDef: Identifiable {
+    let id: String
+    let displayName: String
+    let repoId: String
+    let sizeDescription: String
+    let ramRequirement: String
+    let usageHint: String
+    let recommendation: Qwen3ModelRecommendation?
+
+    init(
+        id: String,
+        displayName: String,
+        repoId: String,
+        sizeDescription: String,
+        ramRequirement: String,
+        usageHint: String,
+        recommendation: Qwen3ModelRecommendation? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.repoId = repoId
+        self.sizeDescription = sizeDescription
+        self.ramRequirement = ramRequirement
+        self.usageHint = usageHint
+        self.recommendation = recommendation
+    }
+}
+
+enum Qwen3ModelRecommendation: Equatable {
+    case lowMemory
+    case balanced
+    case highQuality
+}
+
+enum Qwen3ModelState: Equatable {
+    case notLoaded
+    case loading
+    case ready(String) // loaded model ID
+    case error(String)
+
+    static func == (lhs: Qwen3ModelState, rhs: Qwen3ModelState) -> Bool {
+        switch (lhs, rhs) {
+        case (.notLoaded, .notLoaded): true
+        case (.loading, .loading): true
+        case let (.ready(a), .ready(b)): a == b
+        case let (.error(a), .error(b)): a == b
+        default: false
+        }
+    }
+}
+
+// MARK: - QwenTranscriptGuard (Loop Detection)
+
+enum QwenTranscriptGuard {
+    static func removingLikelyTrailingArtifact(from text: String, languageName: String?) -> String {
+        guard isFrench(languageName) else { return text }
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return text }
+
+        let artifactPattern = #"(?i)[.!?;:]\s+oui[.!?]*$"#
+        guard let artifactRange = trimmed.range(of: artifactPattern, options: .regularExpression) else {
+            return removingBareTrailingOuiArtifact(from: trimmed) ?? text
+        }
+
+        let artifact = String(trimmed[artifactRange])
+        guard let punctuation = artifact.first else { return text }
+
+        let prefix = trimmed[..<artifactRange.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return text }
+
+        return "\(prefix)\(punctuation)"
+    }
+
+    private static func removingBareTrailingOuiArtifact(from text: String) -> String? {
+        let artifactPattern = #"(?i)(?:,\s+|\s+)oui[.!?]*$"#
+        guard let artifactRange = text.range(of: artifactPattern, options: .regularExpression) else {
+            return nil
+        }
+
+        let prefix = text[..<artifactRange.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixWords = words(in: String(prefix))
+        guard prefixWords.count >= 4, prefixWords.last != "que" else {
+            return nil
+        }
+
+        return String(prefix)
+    }
+
+    static func isLikelyLooped(_ text: String) -> Bool {
+        let words = words(in: text)
+        guard words.count >= 16 else { return false }
+
+        let metrics = LoopMetrics(words: words)
+        let dominantShare = Double(metrics.maxFrequency) / Double(words.count)
+
+        if metrics.longestRun >= 7 { return true }
+        if dominantShare >= 0.5, metrics.uniqueRatio <= 0.3 { return true }
+        if metrics.hasRepeatedNGram(n: 3, minRepeats: 5), metrics.uniqueRatio <= 0.45 { return true }
+        return false
+    }
+
+    static func preferredTranscript(primary: String, fallback: String) -> String {
+        let primaryMetrics = LoopMetrics(words: words(in: primary))
+        let fallbackMetrics = LoopMetrics(words: words(in: fallback))
+        let primaryScore = primaryMetrics.qualityScore
+        let fallbackScore = fallbackMetrics.qualityScore
+
+        if primaryScore == fallbackScore {
+            return primary.count <= fallback.count ? primary : fallback
+        }
+        return primaryScore >= fallbackScore ? primary : fallback
+    }
+
+    private static func words(in text: String) -> [String] {
+        text
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" })
+            .map(String.init)
+    }
+
+    private static func isFrench(_ languageName: String?) -> Bool {
+        guard let languageName = languageName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !languageName.isEmpty else {
+            return false
+        }
+
+        return languageName
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .contains("french")
+    }
+
+    private struct LoopMetrics {
+        let words: [String]
+        let uniqueRatio: Double
+        let maxFrequency: Int
+        let longestRun: Int
+
+        init(words: [String]) {
+            self.words = words
+            if words.isEmpty {
+                uniqueRatio = 0
+                maxFrequency = 0
+                longestRun = 0
+                return
+            }
+
+            var counts: [String: Int] = [:]
+            counts.reserveCapacity(words.count)
+            var currentRun = 0
+            var lastWord: String?
+            var bestRun = 0
+
+            for word in words {
+                counts[word, default: 0] += 1
+                if word == lastWord {
+                    currentRun += 1
+                } else {
+                    currentRun = 1
+                    lastWord = word
+                }
+                if currentRun > bestRun {
+                    bestRun = currentRun
+                }
+            }
+
+            uniqueRatio = Double(counts.count) / Double(words.count)
+            maxFrequency = counts.values.max() ?? 0
+            longestRun = bestRun
+        }
+
+        var qualityScore: Double {
+            guard !words.isEmpty else { return -Double.greatestFiniteMagnitude }
+            let runPenalty = Double(longestRun) / Double(words.count)
+            let dominancePenalty = Double(maxFrequency) / Double(words.count)
+            return uniqueRatio - runPenalty - dominancePenalty
+        }
+
+        func hasRepeatedNGram(n: Int, minRepeats: Int) -> Bool {
+            guard n > 0, words.count >= n * minRepeats else { return false }
+            var counts: [String: Int] = [:]
+            counts.reserveCapacity(words.count / n)
+            let limit = words.count - n
+            for index in 0...limit {
+                let key = words[index..<(index + n)].joined(separator: " ")
+                counts[key, default: 0] += 1
+                if counts[key, default: 0] >= minRepeats {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+}
+
+// MARK: - Settings View
+
+private struct Qwen3SettingsView: View {
+    let plugin: Qwen3Plugin
+    private let bundle = Bundle(for: Qwen3Plugin.self)
+    @State private var modelState: Qwen3ModelState = .notLoaded
+    @State private var selectedModelId: String = ""
+    @State private var isPolling = false
+    @State private var hfTokenInput = ""
+    @State private var showHfToken = false
+    @State private var isValidatingToken = false
+    @State private var tokenValidationResult: Bool?
+
+    private let pollTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    nonisolated init(plugin: Qwen3Plugin) {
+        self.plugin = plugin
+    }
+
+    private var trimmedHfTokenInput: String {
+        hfTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var storedHfToken: String {
+        plugin._hfToken?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var hasStoredHfToken: Bool {
+        !storedHfToken.isEmpty
+    }
+
+    private var quickPickModels: [Qwen3ModelDef] {
+        Qwen3Plugin.availableModels.filter { $0.recommendation != nil }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Qwen3 ASR (MLX)")
+                .font(.headline)
+
+            Text("Local Qwen3-ASR speech-to-text powered by MLX on Apple Silicon. 30 languages plus Chinese dialect coverage, no API key required.", bundle: bundle)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            // HuggingFace Token
+            VStack(alignment: .leading, spacing: 8) {
+                Text("HuggingFace Token", bundle: bundle)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                Text("Optional. Increases download rate limits. Free at huggingface.co/settings/tokens", bundle: bundle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    if showHfToken {
+                        TextField("hf_...", text: $hfTokenInput)
+                            .textFieldStyle(.roundedBorder)
+                    } else {
+                        SecureField("hf_...", text: $hfTokenInput)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    Button {
+                        showHfToken.toggle()
+                    } label: {
+                        Image(systemName: showHfToken ? "eye.slash" : "eye")
+                    }
+                    .buttonStyle(.borderless)
+
+                    if hasStoredHfToken {
+                        Button(String(localized: "Remove", bundle: bundle)) {
+                            hfTokenInput = ""
+                            tokenValidationResult = nil
+                            isValidatingToken = false
+                            plugin.clearHuggingFaceToken()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
+                    Button(String(localized: "Save", bundle: bundle)) {
+                        validateAndSaveHuggingFaceToken()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(trimmedHfTokenInput.isEmpty || isValidatingToken)
+                }
+
+                if isValidatingToken {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.small)
+                        Text("Validating token...", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let tokenValidationResult {
+                    HStack(spacing: 4) {
+                        Image(systemName: tokenValidationResult ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(tokenValidationResult ? .green : .red)
+                        Text(
+                            tokenValidationResult
+                                ? String(localized: "Valid HuggingFace Token", bundle: bundle)
+                                : String(localized: "Invalid HuggingFace Token", bundle: bundle)
+                        )
+                        .font(.caption)
+                        .foregroundStyle(tokenValidationResult ? .green : .red)
+                    }
+                }
+            }
+
+            Divider()
+
+            // Model Selection
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Model", bundle: bundle)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Spacer()
+                    PluginModelImportButton(importer: plugin, bundle: bundle)
+                        .disabled(modelState == .loading)
+                }
+
+                quickPickGuide
+
+                ForEach(plugin.allModelDefinitions) { modelDef in
+                    modelRow(modelDef)
+                }
+            }
+
+            if case .error(let message) = modelState {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding()
+        .onAppear {
+            modelState = plugin.modelState
+            selectedModelId = plugin.selectedModelId ?? plugin.allModelDefinitions.first?.id ?? ""
+            if let token = plugin._hfToken, !token.isEmpty {
+                hfTokenInput = token
+            }
+        }
+        .task {
+            // Auto-restore previously loaded model
+            if case .notLoaded = plugin.modelState, plugin.shouldRestoreLoadedModelsPassively {
+                isPolling = true
+                await plugin.restoreLoadedModel(allowDownloads: false, passively: true)
+                isPolling = false
+                modelState = plugin.modelState
+            }
+        }
+        .onReceive(pollTimer) { _ in
+            guard isPolling else {
+                modelState = plugin.modelState
+                selectedModelId = plugin.selectedModelId ?? selectedModelId
+                return
+            }
+            let pluginState = plugin.modelState
+            if pluginState != .notLoaded {
+                modelState = pluginState
+            }
+            if case .ready = pluginState { isPolling = false }
+            else if case .error = pluginState { isPolling = false }
+        }
+        .onChange(of: hfTokenInput) { _, newValue in
+            let trimmedValue = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedValue != storedHfToken {
+                tokenValidationResult = nil
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var quickPickGuide: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Quick picks", bundle: bundle)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+
+            ForEach(quickPickModels) { modelDef in
+                if let recommendation = modelDef.recommendation {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: recommendationSystemImage(for: recommendation))
+                            .font(.caption)
+                            .foregroundStyle(recommendationColor(for: recommendation))
+                            .frame(width: 14)
+
+                        Text(recommendationTitle(for: recommendation))
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.primary)
+
+                        Text(modelDef.displayName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func modelRow(_ modelDef: Qwen3ModelDef) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(modelDef.displayName)
+                        .font(.body)
+
+                    if let recommendation = modelDef.recommendation {
+                        recommendationBadge(recommendation)
+                    }
+                }
+
+                Text("\(modelDef.sizeDescription) - RAM: \(modelDef.ramRequirement)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text(localizedUsageHint(for: modelDef))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if case .loading = modelState, selectedModelId == modelDef.id {
+                ProgressView()
+                    .controlSize(.small)
+            } else if case .ready(let loadedId) = modelState, loadedId == modelDef.id {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Button(String(localized: "Unload", bundle: bundle)) {
+                        plugin.unloadModel()
+                        if !modelDef.id.hasPrefix("custom-") {
+                            try? plugin.deleteModelFiles(modelDef)
+                        }
+                        modelState = plugin.modelState
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            } else {
+                Button(modelDef.id.hasPrefix("custom-") ? String(localized: "Load", bundle: bundle) : String(localized: "Download & Load", bundle: bundle)) {
+                    selectedModelId = modelDef.id
+                    modelState = .loading
+                    isPolling = true
+                    Task {
+                        try? await plugin.loadModel(modelDef)
+                        isPolling = false
+                        modelState = plugin.modelState
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(modelState == .loading)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func recommendationBadge(_ recommendation: Qwen3ModelRecommendation) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: recommendationSystemImage(for: recommendation))
+                .imageScale(.small)
+            Text(recommendationShortLabel(for: recommendation))
+        }
+        .font(.caption2)
+        .fontWeight(.semibold)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .foregroundStyle(recommendationColor(for: recommendation))
+        .background(recommendationColor(for: recommendation).opacity(0.12), in: Capsule())
+    }
+
+    private func recommendationSystemImage(for recommendation: Qwen3ModelRecommendation) -> String {
+        switch recommendation {
+        case .lowMemory:
+            "bolt.fill"
+        case .balanced:
+            "checkmark.seal.fill"
+        case .highQuality:
+            "star.fill"
+        }
+    }
+
+    private func recommendationColor(for recommendation: Qwen3ModelRecommendation) -> Color {
+        switch recommendation {
+        case .lowMemory:
+            .blue
+        case .balanced:
+            .green
+        case .highQuality:
+            .purple
+        }
+    }
+
+    private func recommendationShortLabel(for recommendation: Qwen3ModelRecommendation) -> String {
+        switch recommendation {
+        case .lowMemory:
+            String(localized: "8 GB pick", bundle: bundle)
+        case .balanced:
+            String(localized: "Recommended", bundle: bundle)
+        case .highQuality:
+            String(localized: "32 GB quality", bundle: bundle)
+        }
+    }
+
+    private func recommendationTitle(for recommendation: Qwen3ModelRecommendation) -> String {
+        switch recommendation {
+        case .lowMemory:
+            String(localized: "Fast / 8 GB", bundle: bundle)
+        case .balanced:
+            String(localized: "Best default", bundle: bundle)
+        case .highQuality:
+            String(localized: "Quality / 32 GB", bundle: bundle)
+        }
+    }
+
+    private func localizedUsageHint(for modelDef: Qwen3ModelDef) -> String {
+        switch modelDef.id {
+        case "qwen3-asr-0.6b-4bit":
+            String(localized: "Smallest download; use when memory matters more than quality.", bundle: bundle)
+        case "qwen3-asr-0.6b-5bit":
+            String(localized: "Slightly more precision than 4-bit with a similar footprint.", bundle: bundle)
+        case "qwen3-asr-0.6b-6bit":
+            String(localized: "Fast pick for 8 GB Macs and casual dictation.", bundle: bundle)
+        case "qwen3-asr-0.6b-8bit":
+            String(localized: "Higher-precision small model when 0.6B quality matters.", bundle: bundle)
+        case "qwen3-asr-0.6b-bf16":
+            String(localized: "Unquantized small model; useful for comparison or validation.", bundle: bundle)
+        case "qwen3-asr-1.7b-4bit":
+            String(localized: "Smallest 1.7B option; use when 6-bit is too heavy.", bundle: bundle)
+        case "qwen3-asr-1.7b-5bit":
+            String(localized: "Middle ground if the default 6-bit model is tight on memory.", bundle: bundle)
+        case "qwen3-asr-1.7b-6bit":
+            String(localized: "Best default for most 16 GB+ Macs.", bundle: bundle)
+        case "qwen3-asr-1.7b-8bit":
+            String(localized: "Higher-quality pick for 32 GB+ Macs.", bundle: bundle)
+        case "qwen3-asr-1.7b-bf16":
+            String(localized: "Largest unquantized model; use for max-fidelity validation.", bundle: bundle)
+        default:
+            modelDef.id.hasPrefix("custom-") ? String(localized: "Imported model", bundle: bundle) : modelDef.usageHint
+        }
+    }
+
+    private func validateAndSaveHuggingFaceToken() {
+        let trimmedToken = trimmedHfTokenInput
+        guard !trimmedToken.isEmpty else { return }
+
+        isValidatingToken = true
+        tokenValidationResult = nil
+
+        Task {
+            let isValid = await plugin.validateHuggingFaceToken(trimmedToken)
+            await MainActor.run {
+                isValidatingToken = false
+                tokenValidationResult = isValid
+                if isValid {
+                    plugin.setHuggingFaceToken(trimmedToken)
+                    hfTokenInput = trimmedToken
+                }
+            }
+        }
+    }
+}

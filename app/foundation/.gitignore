@@ -1,0 +1,50 @@
+# Xcode
+build/
+build-*/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+*.swp
+*~.nib
+xcuserdata/
+
+# Xcode Schemes (keep shared, ignore user-specific)
+*.xcodeproj/xcuserdata/**/*.xcscheme
+!*.xcodeproj/xcshareddata/xcschemes/*.xcscheme
+
+# CocoaPods (if used)
+Pods/
+
+# Fastlane
+vendor/bundle/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Claude Code
+.claude/
+.agents/
+.skills/
+
+# Code signing config (developer-specific)
+CodeSigning.local.xcconfig
+
+# Git worktrees
+.worktrees/
+
+# Python bytecode from the helper scripts
+__pycache__/

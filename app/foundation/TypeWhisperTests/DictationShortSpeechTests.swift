@@ -1,0 +1,855 @@
+import Foundation
+import XCTest
+@testable import TypeWhisper
+
+final class DictationShortSpeechTests: XCTestCase {
+    private final class ReleaseProbe {
+        private let onDeinit: () -> Void
+
+        init(onDeinit: @escaping () -> Void = {}) {
+            self.onDeinit = onDeinit
+        }
+
+        deinit {
+            onDeinit()
+        }
+    }
+
+    func testEmptyBuffer_isDiscardedAsTooShort() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0, peakLevel: 0, hasConfirmedText: false), .discardTooShort)
+    }
+
+    func testThirtyMsHighPeak_isStillTooShort() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.03, peakLevel: 0.2, hasConfirmedText: false), .discardTooShort)
+    }
+
+    func testThirtyMsPreviewText_isStillTooShort() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.03, peakLevel: 0.2, hasConfirmedText: true), .discardTooShort)
+    }
+
+    func testEightyMsSpeechAtPointZeroZeroEight_transcribesAndPadsToZeroPointSevenFive() {
+        let samples = makeSamples(duration: 0.08)
+
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.08, peakLevel: 0.008, hasConfirmedText: false), .transcribe)
+
+        let paddedSamples = paddedSamplesForFinalTranscription(samples, rawDuration: 0.08)
+        XCTAssertEqual(paddedSamples.count, 12_000)
+        XCTAssertEqual(Double(paddedSamples.count) / AudioRecordingService.targetSampleRate, 0.75, accuracy: 0.0001)
+    }
+
+    func testOneHundredTwentyMsVeryQuietClip_transcribesByDefault() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.12, peakLevel: 0.0029, hasConfirmedText: false), .transcribe)
+    }
+
+    func testOneHundredTwentyMsVeryQuietClip_discardsWhenAggressivePolicyDisabled() {
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 0.12,
+                peakLevel: 0.0029,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: false
+            ),
+            .discardNoSpeech
+        )
+    }
+
+    func testOneHundredTwentyMsBorderlineQuietClip_nowTranscribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.12, peakLevel: 0.0034, hasConfirmedText: false), .transcribe)
+    }
+
+    func testOneHundredTwentyMsQuietClip_transcribesWhenAggressivePolicyEnabled() {
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 0.12,
+                peakLevel: 0.0034,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .transcribe
+        )
+    }
+
+    func testOneHundredTwentyMsQuietClip_withConfirmedText_transcribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.12, peakLevel: 0.0029, hasConfirmedText: true), .transcribe)
+    }
+
+    func testFourHundredMsVeryQuietClip_transcribesByDefaultAndPads() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.4, peakLevel: 0.0029, hasConfirmedText: false), .transcribe)
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.4, peakLevel: 0.0034, hasConfirmedText: false), .transcribe)
+
+        let paddedSamples = paddedSamplesForFinalTranscription(makeSamples(duration: 0.4), rawDuration: 0.4)
+        XCTAssertEqual(paddedSamples.count, 12_000)
+        XCTAssertEqual(Double(paddedSamples.count) / AudioRecordingService.targetSampleRate, 0.75, accuracy: 0.0001)
+    }
+
+    func testFourHundredMsQuietClip_withConfirmedText_transcribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.4, peakLevel: 0.0029, hasConfirmedText: true), .transcribe)
+    }
+
+    func testThirtyMsQuietClip_staysTooShortEvenWhenAggressivePolicyEnabled() {
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 0.03,
+                peakLevel: 0.2,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .discardTooShort
+        )
+    }
+
+    func testEightHundredEightyFiveMsClip_withLowSpeechPeakStillTranscribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 0.885, peakLevel: 0.0069, hasConfirmedText: false), .transcribe)
+    }
+
+    func testOnePointTwoSecondsVeryQuietClip_transcribesWhenAggressivePolicyEnabled() {
+        // Issue #732: with aggressive transcription enabled, a short quiet
+        // dictation must be transcribed rather than discarded as "no speech".
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 1.2, peakLevel: 0.0059, hasConfirmedText: false), .transcribe)
+    }
+
+    func testOnePointTwoSecondsVeryQuietClip_isNoSpeechWhenAggressivePolicyDisabled() {
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 1.2,
+                peakLevel: 0.0059,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: false
+            ),
+            .discardNoSpeech
+        )
+    }
+
+    func testOnePointTwoSecondsBorderlineQuietClip_nowTranscribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 1.2, peakLevel: 0.0061, hasConfirmedText: false), .transcribe)
+    }
+
+    func testOnePointTwoSecondsVeryQuietClip_withConfirmedText_transcribes() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 1.2, peakLevel: 0.0059, hasConfirmedText: true), .transcribe)
+    }
+
+    // MARK: - Issue #732: aggressive mode must cover short (1-8s) quiet dictations
+
+    func testThreeSecondQuietClip_transcribesWhenAggressivePolicyEnabled() {
+        // The issue's scenario: a few seconds of quiet speech discarded as
+        // "No speech detected" despite aggressive transcription being enabled.
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 3.0,
+                peakLevel: 0.004,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .transcribe
+        )
+    }
+
+    func testThreeSecondQuietClip_discardsWhenAggressivePolicyDisabled() {
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 3.0,
+                peakLevel: 0.004,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: false
+            ),
+            .discardNoSpeech
+        )
+    }
+
+    func testSixAndAHalfSecondQuietClip_transcribesWhenAggressivePolicyEnabled() {
+        // Upper end of the duration range reported in the issue.
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 6.5,
+                peakLevel: 0.005,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .transcribe
+        )
+    }
+
+    func testThreeSecondNearSilentClip_stillDiscardsWhenAggressivePolicyEnabled() {
+        // Genuinely silent recordings must keep reporting "No speech detected".
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 3.0,
+                peakLevel: 0.002,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .discardNoSpeech
+        )
+    }
+
+    func testTenSecondQuietClip_staysStrictWhenAggressivePolicyEnabled() {
+        // Long recordings of near-silence are not short dictations: keep the
+        // strict threshold so extended silence isn't needlessly transcribed.
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 10.0,
+                peakLevel: 0.004,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: true
+            ),
+            .discardNoSpeech
+        )
+    }
+
+    func testThreeSecondNormalClip_transcribesRegardlessOfPolicy() {
+        XCTAssertEqual(classifyShortSpeech(rawDuration: 3.0, peakLevel: 0.02, hasConfirmedText: false), .transcribe)
+        XCTAssertEqual(
+            classifyShortSpeech(
+                rawDuration: 3.0,
+                peakLevel: 0.02,
+                hasConfirmedText: false,
+                transcribeShortQuietClipsAggressively: false
+            ),
+            .transcribe
+        )
+    }
+
+    func testConfirmedTranscriptionResultText_requiresNonEmptyResult() {
+        XCTAssertFalse(hasConfirmedTranscriptionResultText(nil))
+        XCTAssertFalse(hasConfirmedTranscriptionResultText(TranscriptionResult(
+            text: "",
+            detectedLanguage: nil,
+            duration: 1.2,
+            processingTime: 0.1,
+            engineUsed: "whisper",
+            segments: []
+        )))
+        XCTAssertFalse(hasConfirmedTranscriptionResultText(TranscriptionResult(
+            text: "   ",
+            detectedLanguage: nil,
+            duration: 1.2,
+            processingTime: 0.1,
+            engineUsed: "whisper",
+            segments: []
+        )))
+        XCTAssertTrue(hasConfirmedTranscriptionResultText(TranscriptionResult(
+            text: "hello",
+            detectedLanguage: "en",
+            duration: 1.2,
+            processingTime: 0.1,
+            engineUsed: "whisper",
+            segments: []
+        )))
+    }
+
+    func testFinalizeShortSpeechPolicy_waitsOnlyWhenBufferedDurationIsBelowFiveHundredths() {
+        let policy = AudioRecordingService.StopPolicy.finalizeShortSpeech()
+
+        XCTAssertTrue(policy.shouldApplyGracePeriod(bufferedDuration: 0))
+        XCTAssertTrue(policy.shouldApplyGracePeriod(bufferedDuration: 0.049))
+        XCTAssertFalse(policy.shouldApplyGracePeriod(bufferedDuration: 0.05))
+        XCTAssertFalse(policy.shouldApplyGracePeriod(bufferedDuration: 0.08))
+        XCTAssertFalse(AudioRecordingService.StopPolicy.immediate.shouldApplyGracePeriod(bufferedDuration: 0.01))
+    }
+
+    func testDelayedReleaseRetainer_keepsObjectAliveUntilDelayExpires() throws {
+        let retainer = DelayedReleaseRetainer<ReleaseProbe>(label: "com.typewhisper.tests.delayed-release")
+        let released = expectation(description: "release after delay")
+        let releaseLock = NSLock()
+        var didRelease = false
+        var probe: ReleaseProbe? = ReleaseProbe {
+            releaseLock.withLock {
+                didRelease = true
+            }
+            released.fulfill()
+        }
+
+        retainer.retain(try XCTUnwrap(probe), for: 0.1)
+        probe = nil
+
+        Thread.sleep(forTimeInterval: 0.03)
+        XCTAssertFalse(releaseLock.withLock { didRelease })
+        wait(for: [released], timeout: 0.5)
+    }
+
+    private func makeSamples(duration: TimeInterval) -> [Float] {
+        let count = Int(duration * AudioRecordingService.targetSampleRate)
+        return [Float](repeating: 0.1, count: count)
+    }
+}
+
+final class MicrophoneBoostProcessorTests: XCTestCase {
+    func testDisabledBoostLeavesSamplesUnchanged() {
+        let samples: [Float] = [0.01, -0.02, 0.03]
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        let result = processor.process(samples, enabled: false)
+
+        XCTAssertEqual(result.samples, samples)
+        XCTAssertEqual(result.gain, 1)
+    }
+
+    func testQuietSpeechIsBoostedTowardTargetRMS() {
+        let samples = [Float](repeating: 0.01, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        var result = processor.process(samples, enabled: true)
+        for _ in 0..<12 {
+            result = processor.process(samples, enabled: true)
+        }
+
+        XCTAssertEqual(result.gain, 10, accuracy: 0.01)
+        XCTAssertEqual(result.outputRMS, TypeWhisper.MicrophoneBoostProcessor.targetRMS, accuracy: 0.001)
+        XCTAssertTrue(result.samples.allSatisfy { abs($0 - 0.1) < 0.001 })
+    }
+
+    func testQuietSpeechReceivesUsefulBoostInFirstBuffer() {
+        let samples = [Float](repeating: 0.01, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        let result = processor.process(samples, enabled: true)
+
+        XCTAssertGreaterThanOrEqual(result.gain, 5)
+        XCTAssertGreaterThanOrEqual(result.outputRMS, 0.05)
+    }
+
+    func testGainDoesNotExceedMaximum() {
+        let samples = [Float](repeating: 0.002, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        var result = processor.process(samples, enabled: true)
+        for _ in 0..<12 {
+            result = processor.process(samples, enabled: true)
+        }
+
+        XCTAssertEqual(result.gain, TypeWhisper.MicrophoneBoostProcessor.maximumGain, accuracy: 0.01)
+        XCTAssertLessThanOrEqual(result.gain, TypeWhisper.MicrophoneBoostProcessor.maximumGain)
+    }
+
+    func testRoomNoiseDoesNotTriggerGainIncrease() {
+        let samples = [Float](repeating: 0.001, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        let result = processor.process(samples, enabled: true)
+
+        XCTAssertEqual(result.samples, samples)
+        XCTAssertEqual(result.gain, 1)
+    }
+
+    func testNearSilenceIsNotBoosted() {
+        let samples = [Float](repeating: 0.00005, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        let result = processor.process(samples, enabled: true)
+
+        XCTAssertEqual(result.samples, samples)
+        XCTAssertEqual(result.gain, 1)
+    }
+
+    func testPeakGuardAndSoftLimiterAvoidHardClipping() throws {
+        let samples = [Float(0.2)] + [Float](repeating: 0.01, count: 99)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        var result = processor.process(samples, enabled: true)
+        for _ in 0..<12 {
+            result = processor.process(samples, enabled: true)
+        }
+
+        let unLimitedPeak = try XCTUnwrap(samples.first) * result.gain
+        let outputPeak = try XCTUnwrap(result.samples.first)
+        XCTAssertGreaterThan(unLimitedPeak, 0.8)
+        XCTAssertLessThan(outputPeak, unLimitedPeak)
+        XCTAssertTrue(result.samples.allSatisfy { $0 > -1 && $0 < 1 })
+    }
+
+    func testGainIsHeldThroughBriefLowEnergyGap() {
+        let speech = [Float](repeating: 0.02, count: 100)
+        let quietGap = [Float](repeating: 0.001, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        var speechResult = processor.process(speech, enabled: true)
+        for _ in 0..<12 {
+            speechResult = processor.process(speech, enabled: true)
+        }
+        let gapResult = processor.process(quietGap, enabled: true)
+
+        XCTAssertGreaterThan(speechResult.gain, 1)
+        XCTAssertEqual(gapResult.gain, speechResult.gain, accuracy: 0.0001)
+        XCTAssertEqual(gapResult.outputRMS, quietGap[0] * speechResult.gain, accuracy: 0.0001)
+    }
+
+    func testResetClearsGainBetweenRecordings() {
+        let speech = [Float](repeating: 0.02, count: 100)
+        let roomNoise = [Float](repeating: 0.001, count: 100)
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+
+        for _ in 0..<12 {
+            _ = processor.process(speech, enabled: true)
+        }
+        processor.reset()
+        let result = processor.process(roomNoise, enabled: true)
+
+        XCTAssertEqual(result.samples, roomNoise)
+        XCTAssertEqual(result.gain, 1)
+    }
+
+    func testInPlaceMicrophoneBoostMatchesScalarReference() {
+        let processor = TypeWhisper.MicrophoneBoostProcessor()
+        var limiterEngaged = false
+
+        for bufferIndex in 0..<24 {
+            // Quiet speech with one transient per buffer, so the gain climbs until the
+            // boosted transient crosses the soft limiter knee.
+            let samples = (0..<256).map { index -> Float in
+                index == 17 ? (bufferIndex.isMultiple(of: 2) ? 0.09 : -0.09) : 0.01 * sin(Float(bufferIndex * 256 + index) * 0.07)
+            }
+            var processed = samples
+            let levels = processor.processInPlace(&processed, enabled: true)
+
+            let expected = levels.gain > 1
+                ? samples.map { referenceSoftLimited($0 * levels.gain) }
+                : samples
+            XCTAssertEqual(processed, expected, "buffer \(bufferIndex)")
+            XCTAssertEqual(levels.outputRMS, sqrt(expected.reduce(0) { $0 + $1 * $1 } / Float(expected.count)))
+            limiterEngaged = limiterEngaged || expected.contains { abs($0) > 0.8 }
+        }
+
+        XCTAssertTrue(limiterEngaged)
+    }
+
+    private func referenceSoftLimited(_ sample: Float) -> Float {
+        let knee: Float = 0.8
+        let ceiling: Float = 0.98
+        let magnitude = abs(sample)
+        guard magnitude > knee else { return sample }
+        let normalizedExcess = (magnitude - knee) / (ceiling - knee)
+        let limitedMagnitude = knee + (ceiling - knee) * tanh(normalizedExcess)
+        return sample < 0 ? -limitedMagnitude : limitedMagnitude
+    }
+}
+
+final class DictationInsertionTextFormatterTests: XCTestCase {
+    func testDoesNotAddTrailingSpaceToNonEmptyText() {
+        XCTAssertEqual(DictationInsertionTextFormatter.textForInsertion("Hello"), "Hello")
+    }
+
+    func testLeavesExistingTrailingSpaceUntouched() {
+        XCTAssertEqual(DictationInsertionTextFormatter.textForInsertion("Hello "), "Hello ")
+    }
+
+    func testLeavesExistingTrailingNewlineUntouched() {
+        XCTAssertEqual(DictationInsertionTextFormatter.textForInsertion("Hello\n"), "Hello\n")
+    }
+
+    func testLeavesEmptyTextUntouched() {
+        XCTAssertEqual(DictationInsertionTextFormatter.textForInsertion(""), "")
+    }
+
+    func testDisabledContextualInsertionDoesNotAddTrailingSpace() {
+        let context = TextInsertionService.InsertionContext(
+            value: "coffeemachine",
+            selectedRange: NSRange(location: 6, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(
+                "Strong.",
+                insertionContext: context,
+                contextualInsertionEnabled: false
+            ),
+            "Strong."
+        )
+    }
+
+    func testMissingContextDoesNotAddTrailingSpace() {
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Strong."),
+            "Strong."
+        )
+    }
+
+    func testSmartInsertionAddsMissingLeadingAndTrailingSpacesBetweenWords() {
+        let context = TextInsertionService.InsertionContext(
+            value: "coffeemachine",
+            selectedRange: NSRange(location: 6, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("strong", insertionContext: context),
+            " strong "
+        )
+    }
+
+    func testSmartInsertionDoesNotAddSpacesBetweenCJKCharacters() {
+        let cases: [(script: String, value: String, insertion: String)] = [
+            ("Han", "你好", "世"),
+            ("Kana", "あい", "カ"),
+            ("Hangul", "가나", "다")
+        ]
+
+        for testCase in cases {
+            let context = TextInsertionService.InsertionContext(
+                value: testCase.value,
+                selectedRange: NSRange(location: 1, length: 0),
+                selectedText: nil,
+                previousCharacter: nil,
+                nextCharacter: nil
+            )
+
+            XCTAssertEqual(
+                DictationInsertionTextFormatter.textForInsertion(
+                    testCase.insertion,
+                    insertionContext: context
+                ),
+                testCase.insertion,
+                testCase.script
+            )
+        }
+    }
+
+    func testSmartInsertionPreservesSpacesAtMixedLatinCJKBoundaries() {
+        let context = TextInsertionService.InsertionContext(
+            value: "AB",
+            selectedRange: NSRange(location: 1, length: 0),
+            selectedText: nil,
+            previousCharacter: "A",
+            nextCharacter: "B"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("中", insertionContext: context),
+            " 中 "
+        )
+    }
+
+    func testSmartInsertionAvoidsDuplicateLeadingSpace() {
+        let context = TextInsertionService.InsertionContext(
+            value: "coffee machine",
+            selectedRange: NSRange(location: 7, length: 0),
+            selectedText: nil,
+            previousCharacter: " ",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("strong", insertionContext: context),
+            "strong "
+        )
+    }
+
+    func testSmartInsertionDoesNotAddSpaceBeforePunctuation() {
+        let context = TextInsertionService.InsertionContext(
+            value: "Hello,",
+            selectedRange: NSRange(location: 5, length: 0),
+            selectedText: nil,
+            previousCharacter: "o",
+            nextCharacter: ","
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("friend", insertionContext: context),
+            " friend"
+        )
+    }
+
+    func testSmartInsertionStripsFinalPeriodBeforeExistingComma() {
+        let context = TextInsertionService.InsertionContext(
+            value: "start, I will begin",
+            selectedRange: NSRange(location: 5, length: 0),
+            selectedText: nil,
+            previousCharacter: "t",
+            nextCharacter: ","
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(
+                "Dictation in the middle of a sentence before the comma.",
+                insertionContext: context
+            ),
+            " dictation in the middle of a sentence before the comma"
+        )
+    }
+
+    func testSmartInsertionStripsFinalPeriodBeforeExistingPeriod() {
+        let context = TextInsertionService.InsertionContext(
+            value: "dictating.",
+            selectedRange: NSRange(location: 9, length: 0),
+            selectedText: nil,
+            previousCharacter: "g",
+            nextCharacter: "."
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("my first sentence.", insertionContext: context),
+            " my first sentence"
+        )
+    }
+
+    func testSmartInsertionDoesNotLowercaseAfterSentenceEndingPunctuation() {
+        let context = TextInsertionService.InsertionContext(
+            value: "Done.Next",
+            selectedRange: NSRange(location: 5, length: 0),
+            selectedText: nil,
+            previousCharacter: ".",
+            nextCharacter: "N"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Another item", insertionContext: context),
+            " Another item "
+        )
+    }
+
+    func testSmartInsertionLowercasesTitlecaseFirstWordInMidSentence() {
+        let context = TextInsertionService.InsertionContext(
+            value: "The presentation will bemachine",
+            selectedRange: NSRange(location: 24, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Presented tomorrow", insertionContext: context),
+            " presented tomorrow "
+        )
+    }
+
+    func testSmartInsertionLowercasesAndStripsPeriodAfterExistingWordSeparatedBySpace() {
+        let context = TextInsertionService.InsertionContext(
+            value: "will begin",
+            selectedRange: NSRange(location: 5, length: 0),
+            selectedText: nil,
+            previousCharacter: " ",
+            nextCharacter: "b"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Immediately.", insertionContext: context),
+            "immediately "
+        )
+    }
+
+    func testSmartInsertionTrimsDictatedBoundaryWhitespaceBeforePunctuation() {
+        let context = TextInsertionService.InsertionContext(
+            value: "dictating.",
+            selectedRange: NSRange(location: 9, length: 0),
+            selectedText: nil,
+            previousCharacter: "g",
+            nextCharacter: "."
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(" my first sentence ", insertionContext: context),
+            " my first sentence"
+        )
+    }
+
+    func testSmartInsertionPreservesAllCapsFirstWord() {
+        let context = TextInsertionService.InsertionContext(
+            value: "we use",
+            selectedRange: NSRange(location: 6, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: nil
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("NASA tools.", insertionContext: context),
+            " NASA tools."
+        )
+    }
+
+    func testSmartInsertionPreservesCamelCaseFirstWord() {
+        let context = TextInsertionService.InsertionContext(
+            value: "about",
+            selectedRange: NSRange(location: 5, length: 0),
+            selectedText: nil,
+            previousCharacter: "t",
+            nextCharacter: nil
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("TypeWhisper", insertionContext: context),
+            " TypeWhisper"
+        )
+    }
+
+    func testSmartInsertionStripsSingleFinalPeriodBeforeExistingWord() {
+        let context = TextInsertionService.InsertionContext(
+            value: "coffeemachine",
+            selectedRange: NSRange(location: 6, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Strong.", insertionContext: context),
+            " strong "
+        )
+    }
+
+    func testSmartInsertionPreservesQuestionPunctuation() {
+        let context = TextInsertionService.InsertionContext(
+            value: "coffeemachine",
+            selectedRange: NSRange(location: 6, length: 0),
+            selectedText: nil,
+            previousCharacter: "e",
+            nextCharacter: "m"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion("Really?", insertionContext: context),
+            " really? "
+        )
+    }
+
+    // MARK: - Standalone value final-period cleanup (#1333)
+
+    private func emptyFieldInsertionContext() -> TextInsertionService.InsertionContext {
+        TextInsertionService.InsertionContext(
+            value: "",
+            selectedRange: NSRange(location: 0, length: 0),
+            selectedText: nil,
+            previousCharacter: nil,
+            nextCharacter: nil
+        )
+    }
+
+    private func assertStandaloneCleanup(
+        _ input: String,
+        becomes expected: String,
+        enabled: Bool = true,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(
+                input,
+                insertionContext: emptyFieldInsertionContext(),
+                standaloneValueFinalPeriodCleanupEnabled: enabled
+            ),
+            expected,
+            file: file,
+            line: line
+        )
+    }
+
+    func testStandaloneCleanupStripsFinalPeriodFromEmail() {
+        assertStandaloneCleanup("name@example.com.", becomes: "name@example.com")
+    }
+
+    func testStandaloneCleanupStripsFinalPeriodFromURLs() {
+        assertStandaloneCleanup("https://example.com.", becomes: "https://example.com")
+        assertStandaloneCleanup("www.example.com.", becomes: "www.example.com")
+        assertStandaloneCleanup("example.com.", becomes: "example.com")
+    }
+
+    func testStandaloneCleanupPreservesTerminalPeriodInURLPathsAndQueries() {
+        // A period is a legal part of URL paths and queries (RFC 3986
+        // section 2.3), so the dot may belong to the requested resource.
+        assertStandaloneCleanup("https://example.com/docs.", becomes: "https://example.com/docs.")
+        assertStandaloneCleanup(
+            "https://example.com/files/report.",
+            becomes: "https://example.com/files/report."
+        )
+        assertStandaloneCleanup(
+            "https://example.com/search?q=Dr.",
+            becomes: "https://example.com/search?q=Dr."
+        )
+    }
+
+    func testStandaloneCleanupPreservesSpacedDates() {
+        // Dictation often inserts whitespace around date separators; those
+        // dates must not fall through to the phone-number check.
+        assertStandaloneCleanup("27. 09. 2026.", becomes: "27. 09. 2026.")
+        assertStandaloneCleanup("27 / 09 / 2026.", becomes: "27 / 09 / 2026.")
+        assertStandaloneCleanup("2026 - 09 - 27.", becomes: "2026 - 09 - 27.")
+    }
+
+    func testStandaloneCleanupStripsFinalPeriodFromDecimalNumbers() {
+        assertStandaloneCleanup("3.14.", becomes: "3.14")
+        assertStandaloneCleanup("1,5.", becomes: "1,5")
+        assertStandaloneCleanup("1,000.50.", becomes: "1,000.50")
+        assertStandaloneCleanup("1.000,50.", becomes: "1.000,50")
+    }
+
+    func testStandaloneCleanupStripsFinalPeriodFromPhoneNumbers() {
+        assertStandaloneCleanup("+49 171 2345678.", becomes: "+49 171 2345678")
+        assertStandaloneCleanup("(030) 123456.", becomes: "(030) 123456")
+    }
+
+    func testStandaloneCleanupStripsFinalPeriodFromVersionStrings() {
+        assertStandaloneCleanup("1.2.3.", becomes: "1.2.3")
+        assertStandaloneCleanup("v2.10.4.", becomes: "v2.10.4")
+    }
+
+    func testStandaloneCleanupPreservesAbbreviations() {
+        assertStandaloneCleanup("Dr.", becomes: "Dr.")
+        assertStandaloneCleanup("U.S.", becomes: "U.S.")
+        assertStandaloneCleanup("e.g.", becomes: "e.g.")
+        assertStandaloneCleanup("Dr.med.", becomes: "Dr.med.")
+        assertStandaloneCleanup("Ph.D.", becomes: "Ph.D.")
+    }
+
+    func testStandaloneCleanupPreservesProseAndSentencesEndingInValues() {
+        assertStandaloneCleanup("Hello world.", becomes: "Hello world.")
+        assertStandaloneCleanup(
+            "Contact me at name@example.com.",
+            becomes: "Contact me at name@example.com."
+        )
+    }
+
+    func testStandaloneCleanupPreservesAmbiguousNumericForms() {
+        assertStandaloneCleanup("19.04.2026.", becomes: "19.04.2026.")
+        assertStandaloneCleanup("2026-09-27.", becomes: "2026-09-27.")
+        assertStandaloneCleanup("123.", becomes: "123.")
+    }
+
+    func testStandaloneCleanupPreservesEllipsesAndOtherPunctuation() {
+        assertStandaloneCleanup("Wait...", becomes: "Wait...")
+        assertStandaloneCleanup("Really?", becomes: "Really?")
+    }
+
+    func testStandaloneCleanupRespectsOptOut() {
+        assertStandaloneCleanup("name@example.com.", becomes: "name@example.com.", enabled: false)
+    }
+
+    func testStandaloneCleanupDoesNotApplyAtEndOfExistingSentence() {
+        let context = TextInsertionService.InsertionContext(
+            value: "Email: ",
+            selectedRange: NSRange(location: 7, length: 0),
+            selectedText: nil,
+            previousCharacter: " ",
+            nextCharacter: nil
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(
+                "name@example.com.",
+                insertionContext: context
+            ),
+            "name@example.com."
+        )
+    }
+
+    func testStandaloneCleanupDoesNotDoubleStripMidSentence() {
+        let context = TextInsertionService.InsertionContext(
+            value: "ab",
+            selectedRange: NSRange(location: 1, length: 0),
+            selectedText: nil,
+            previousCharacter: "a",
+            nextCharacter: "b"
+        )
+
+        XCTAssertEqual(
+            DictationInsertionTextFormatter.textForInsertion(
+                "name@example.com.",
+                insertionContext: context
+            ),
+            " name@example.com "
+        )
+    }
+}

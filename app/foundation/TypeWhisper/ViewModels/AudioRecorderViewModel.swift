@@ -1,0 +1,1709 @@
+import Foundation
+import Combine
+import AppKit
+import AVFoundation
+import os
+import TypeWhisperPluginSDK
+
+private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "typewhisper-mac", category: "AudioRecorderViewModel")
+
+private final class RecorderTranscriptionSourceProgressCapture: @unchecked Sendable {
+    private let maximumProcessedDuration = OSAllocatedUnfairLock(initialState: TimeInterval.zero)
+
+    func record(_ progress: PluginTranscriptionSourceProgress) -> Bool {
+        guard progress.processedDuration.isFinite else { return true }
+        maximumProcessedDuration.withLock { current in
+            current = max(current, progress.processedDuration)
+        }
+        return true
+    }
+
+    var processedDuration: TimeInterval {
+        maximumProcessedDuration.withLock { $0 }
+    }
+}
+
+private func recorderAudioHasAudibleTail(
+    samples: [Float],
+    startingAt startTime: TimeInterval,
+    sampleRate: Double = AudioRecorderService.transcriptionSampleRate
+) -> Bool {
+    let frameSampleCount = max(1, Int(sampleRate * 0.1))
+    let analysisStride = 8
+    let requiredActiveFrames = 10
+    let speechRMSFloor = 0.004
+    let analysisStartOffset = startTime > 0 ? 0.5 : 0
+    let startIndex = min(
+        samples.count,
+        max(0, Int((startTime + analysisStartOffset) * sampleRate))
+    )
+    guard startIndex < samples.count else { return false }
+
+    var activeFrames = 0
+    var frameStart = startIndex
+    while frameStart < samples.count {
+        guard !Task.isCancelled else { return false }
+        let frameEnd = min(samples.count, frameStart + frameSampleCount)
+        var squaredSum = 0.0
+        var analyzedSamples = 0
+        var index = frameStart
+        while index < frameEnd {
+            let sample = Double(samples[index])
+            if sample.isFinite {
+                squaredSum += sample * sample
+                analyzedSamples += 1
+            }
+            index += analysisStride
+        }
+
+        if analyzedSamples > 0 {
+            let rms = sqrt(squaredSum / Double(analyzedSamples))
+            if rms >= speechRMSFloor {
+                activeFrames += 1
+                if activeFrames >= requiredActiveFrames {
+                    return true
+                }
+            }
+        }
+        frameStart = frameEnd
+    }
+
+    return false
+}
+
+@MainActor
+final class AudioRecorderViewModel: ObservableObject {
+    typealias AudioSamplesLoader = @MainActor (URL) async throws -> [Float]
+    typealias RecordingsLoader = @Sendable (
+        URL,
+        [String: RecordingTranscriptionFailure]
+    ) -> [RecordingItem]
+
+    nonisolated(unsafe) static var _shared: AudioRecorderViewModel?
+    static var shared: AudioRecorderViewModel {
+        guard let instance = _shared else {
+            fatalError("AudioRecorderViewModel not initialized")
+        }
+        return instance
+    }
+
+    enum RecorderState: Equatable {
+        case idle, recording, finalizing
+    }
+
+    enum RecorderAPISessionStatus: String {
+        case recording, finalizing, completed, failed
+    }
+
+    struct RecorderAPISessionSnapshot {
+        let id: UUID
+        let status: RecorderAPISessionStatus
+        let text: String?
+        let outputFile: String?
+        let error: String?
+    }
+
+    enum RecorderAPIError: LocalizedError {
+        case noSourceEnabled
+        case alreadyRecording
+        case finalizing
+        case retranscribing
+        case notRecording
+        case calendarRecordingHandleMismatch
+
+        var errorDescription: String? {
+            switch self {
+            case .noSourceEnabled:
+                "At least one audio source must be enabled."
+            case .alreadyRecording:
+                "Already recording"
+            case .finalizing:
+                "Recorder is finalizing"
+            case .retranscribing:
+                "Recorder is transcribing an existing recording"
+            case .notRecording:
+                "Not recording"
+            case .calendarRecordingHandleMismatch:
+                "The calendar-started recording is no longer active."
+            }
+        }
+    }
+
+    private struct FinalTranscriptionRequest {
+        let outputURL: URL
+        let buffer: [Float]
+        let languageSelection: LanguageSelection
+        let task: TranscriptionTask
+        let providerId: String?
+        let modelOverrideId: String?
+        let prompt: String?
+        let dictionaryTermHints: [PluginDictionaryTermHint]
+        let liveSessionResult: TranscriptionResult?
+        let calendarEvent: CalendarMeetingTranscriptMetadata?
+    }
+
+    struct RecordingTranscriptionFailure: Codable, Equatable, Sendable {
+        enum Phase: String, Codable, Equatable, Sendable {
+            case preparingFinalAudio
+            case finalTranscription
+            case emptyResult
+            case savingTranscript
+
+            var displayName: String {
+                switch self {
+                case .preparingFinalAudio:
+                    String(localized: "recorder.failurePhase.preparingFinalAudio")
+                case .finalTranscription:
+                    String(localized: "recorder.failurePhase.finalTranscription")
+                case .emptyResult:
+                    String(localized: "recorder.failurePhase.emptyResult")
+                case .savingTranscript:
+                    String(localized: "recorder.failurePhase.savingTranscript")
+                }
+            }
+        }
+
+        let phase: Phase
+        let providerError: String
+        let engineName: String?
+        let modelName: String?
+        let failedAt: Date
+    }
+
+    private enum FinalTranscriptionOutcome {
+        case skipped
+        case transcriptSaved
+        case failed(RecordingTranscriptionFailure)
+
+        var failure: RecordingTranscriptionFailure? {
+            if case .failed(let failure) = self {
+                return failure
+            }
+            return nil
+        }
+    }
+
+    struct RecordingItem: Identifiable, Sendable {
+        let id = UUID()
+        let url: URL
+        let date: Date
+        let duration: TimeInterval
+        let fileSize: Int64
+        let transcript: String?
+        let transcriptionFailure: RecordingTranscriptionFailure?
+        let calendarEvent: CalendarMeetingTranscriptMetadata?
+        var fileName: String { url.lastPathComponent }
+
+        init(
+            url: URL,
+            date: Date,
+            duration: TimeInterval,
+            fileSize: Int64,
+            transcript: String?,
+            transcriptionFailure: RecordingTranscriptionFailure?,
+            calendarEvent: CalendarMeetingTranscriptMetadata? = nil
+        ) {
+            self.url = url
+            self.date = date
+            self.duration = duration
+            self.fileSize = fileSize
+            self.transcript = transcript
+            self.transcriptionFailure = transcriptionFailure
+            self.calendarEvent = calendarEvent
+        }
+    }
+
+    @Published var state: RecorderState = .idle
+    @Published var duration: TimeInterval = 0
+    @Published var micLevel: Float = 0
+    @Published var systemLevel: Float = 0
+    @Published var micEnabled: Bool {
+        didSet { defaults.set(micEnabled, forKey: UserDefaultsKeys.recorderMicEnabled) }
+    }
+    @Published var systemAudioEnabled: Bool {
+        didSet { defaults.set(systemAudioEnabled, forKey: UserDefaultsKeys.recorderSystemAudioEnabled) }
+    }
+    @Published var outputFormat: AudioRecorderService.OutputFormat {
+        didSet { defaults.set(outputFormat.rawValue, forKey: UserDefaultsKeys.recorderOutputFormat) }
+    }
+    @Published var micDuckingMode: AudioRecorderService.MicDuckingMode {
+        didSet {
+            defaults.set(micDuckingMode.rawValue, forKey: UserDefaultsKeys.recorderMicDuckingMode)
+            recorderService.micDuckingMode = micDuckingMode
+        }
+    }
+    @Published var trackMode: AudioRecorderService.TrackMode {
+        didSet {
+            defaults.set(trackMode.rawValue, forKey: UserDefaultsKeys.recorderTrackMode)
+            recorderService.trackMode = trackMode
+        }
+    }
+    @Published var transcriptionEnabled: Bool {
+        didSet { defaults.set(transcriptionEnabled, forKey: UserDefaultsKeys.recorderTranscriptionEnabled) }
+    }
+    @Published var livePreviewEnabled: Bool {
+        didSet { defaults.set(livePreviewEnabled, forKey: UserDefaultsKeys.recorderLivePreviewEnabled) }
+    }
+    @Published var selectedEngine: String? {
+        didSet {
+            defaults.set(selectedEngine, forKey: UserDefaultsKeys.recorderTranscriptionEngine)
+            guard isInitialized, oldValue != selectedEngine else { return }
+            selectedModel = nil
+            normalizeLanguageSelectionForResolvedEngine()
+        }
+    }
+    @Published var selectedModel: String? {
+        didSet {
+            defaults.set(selectedModel, forKey: UserDefaultsKeys.recorderTranscriptionModel)
+            guard isInitialized, oldValue != selectedModel else { return }
+            normalizeLanguageSelectionForResolvedEngine()
+        }
+    }
+    @Published var languageSelection: LanguageSelection = .auto {
+        didSet {
+            defaults.set(
+                languageSelection.storedValue(nilBehavior: .auto),
+                forKey: UserDefaultsKeys.recorderTranscriptionLanguage
+            )
+        }
+    }
+    @Published var selectedTask: TranscriptionTask = .transcribe
+    @Published var recordings: [RecordingItem] = []
+    @Published var errorMessage: String?
+    @Published var systemAudioWarningMessage: String?
+    @Published var partialText: String = ""
+    @Published var isTranscribing: Bool = false
+    @Published private(set) var retranscribingRecordingURL: URL?
+
+    var activeEngineName: String? { resolvedEngine?.providerDisplayName }
+    var activeModelName: String? {
+        modelManager.resolvedModelDisplayName(
+            engineOverrideId: selectedEngine,
+            cloudModelOverride: effectiveModelId
+        )
+    }
+    var isModelReady: Bool {
+        guard let engine = resolvedEngine else { return false }
+        guard modelManager.canUseForTranscription(engine) else { return false }
+        return engine.isConfigured
+    }
+    var supportsTranslation: Bool { resolvedEngine?.supportsTranslation ?? false }
+    var effectiveProviderId: String? {
+        selectedEngine ?? modelManager.selectedProviderId
+    }
+    var effectiveModelId: String? {
+        modelManager.resolvedModelId(
+            engineOverrideId: selectedEngine,
+            cloudModelOverride: selectedModel
+        )
+    }
+    var resolvedEngine: TranscriptionEnginePlugin? {
+        guard let providerId = effectiveProviderId else { return nil }
+        guard let pluginManager = PluginManager.shared else { return nil }
+        return pluginManager.transcriptionEngine(for: providerId)
+    }
+    var selectedEngineSupportedLanguages: [String] {
+        resolvedEngine?.supportedLanguages(forModel: selectedModel).sorted() ?? []
+    }
+    var selectedLanguage: String? { languageSelection.requestedLanguage }
+    var canToggleRecording: Bool {
+        retranscribingRecordingURL == nil && Self.canToggleRecording(
+            state: state,
+            micEnabled: micEnabled,
+            systemAudioEnabled: systemAudioEnabled
+        )
+    }
+
+    private let recorderService: AudioRecorderService
+    private let audioDeviceService: AudioDeviceService
+    private let modelManager: ModelManagerService
+    private let dictionaryService: DictionaryService
+    private let audioSamplesLoader: AudioSamplesLoader
+    private let recordingsLoader: RecordingsLoader
+    private let defaults: UserDefaults
+    private let streamingHandler: StreamingHandler
+    private let livePreviewStartObserver: (() -> Void)?
+    private var cancellables = Set<AnyCancellable>()
+    private var currentOutputURL: URL?
+    private var activeCalendarMeetingHandle: CalendarMeetingRecordingHandle?
+    private var activeCalendarMeetingTranscriptMetadata: CalendarMeetingTranscriptMetadata?
+    private var activeRecorderAPISessionID: UUID?
+    private var recorderAPISessions: [UUID: RecorderAPISessionSnapshot] = [:]
+    private var transientTranscriptionFailures: [String: RecordingTranscriptionFailure] = [:]
+    private var recordingsLoadTask: Task<Void, Never>?
+    private var recordingsLoadGeneration = 0
+    private var hasRequestedInitialRecordingsLoad = false
+    private var isInitialized = false
+
+    init(
+        recorderService: AudioRecorderService,
+        modelManager: ModelManagerService,
+        dictionaryService: DictionaryService,
+        audioFileService: AudioFileService = AudioFileService(),
+        audioDeviceService: AudioDeviceService = AudioDeviceService(initialInputDevices: [], monitorDeviceChanges: false),
+        defaults: UserDefaults = .standard,
+        audioSamplesLoader: AudioSamplesLoader? = nil,
+        recordingsLoader: RecordingsLoader? = nil,
+        livePreviewStartObserver: (() -> Void)? = nil
+    ) {
+        self.recorderService = recorderService
+        self.audioDeviceService = audioDeviceService
+        self.modelManager = modelManager
+        self.dictionaryService = dictionaryService
+        self.audioSamplesLoader = audioSamplesLoader ?? { [audioFileService] url in
+            try await audioFileService.loadAudioSamples(from: url)
+        }
+        self.recordingsLoader = recordingsLoader ?? { directory, transientFailures in
+            Self.readRecordings(from: directory, transientFailures: transientFailures)
+        }
+        self.defaults = defaults
+        self.livePreviewStartObserver = livePreviewStartObserver
+        self.streamingHandler = StreamingHandler(
+            modelManager: modelManager,
+            bufferProvider: { [weak recorderService] in
+                recorderService?.getCurrentBuffer() ?? []
+            },
+            recentBufferProvider: { [weak recorderService] maxDuration in
+                recorderService?.getRecentBuffer(maxDuration: maxDuration) ?? []
+            },
+            bufferDeltaProvider: { [weak recorderService] offset in
+                recorderService?.getBufferDelta(since: offset) ?? ([], offset)
+            },
+            bufferedDurationProvider: { [weak recorderService] in
+                recorderService?.totalBufferDuration ?? 0
+            }
+        )
+
+        // Load saved preferences with defaults
+        if defaults.object(forKey: UserDefaultsKeys.recorderMicEnabled) == nil {
+            self.micEnabled = true
+        } else {
+            self.micEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderMicEnabled)
+        }
+        self.systemAudioEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderSystemAudioEnabled)
+
+        if let formatString = defaults.string(forKey: UserDefaultsKeys.recorderOutputFormat),
+           let format = AudioRecorderService.OutputFormat(rawValue: formatString) {
+            self.outputFormat = format
+        } else {
+            self.outputFormat = .wav
+        }
+
+        if let modeString = defaults.string(forKey: UserDefaultsKeys.recorderMicDuckingMode),
+           let mode = AudioRecorderService.MicDuckingMode(rawValue: modeString) {
+            self.micDuckingMode = mode
+        } else {
+            self.micDuckingMode = .aggressive
+        }
+
+        if let modeString = defaults.string(forKey: UserDefaultsKeys.recorderTrackMode),
+           let mode = AudioRecorderService.TrackMode(rawValue: modeString) {
+            self.trackMode = mode
+        } else {
+            self.trackMode = .mixed
+        }
+
+        if defaults.object(forKey: UserDefaultsKeys.recorderTranscriptionEnabled) == nil {
+            self.transcriptionEnabled = true
+        } else {
+            self.transcriptionEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderTranscriptionEnabled)
+        }
+        if defaults.object(forKey: UserDefaultsKeys.recorderLivePreviewEnabled) == nil {
+            self.livePreviewEnabled = false
+        } else {
+            self.livePreviewEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderLivePreviewEnabled)
+        }
+        self.selectedEngine = defaults.string(forKey: UserDefaultsKeys.recorderTranscriptionEngine)
+        self.selectedModel = defaults.string(forKey: UserDefaultsKeys.recorderTranscriptionModel)
+        self.languageSelection = LanguageSelection(
+            storedValue: defaults.string(forKey: UserDefaultsKeys.recorderTranscriptionLanguage),
+            nilBehavior: .auto
+        )
+
+        recorderService.micDuckingMode = micDuckingMode
+        recorderService.trackMode = trackMode
+
+        setupBindings()
+        if !defaults.bool(forKey: UserDefaultsKeys.devPrivacyQuietMode) {
+            loadRecordingsIfNeeded()
+        }
+
+        streamingHandler.onPartialTextUpdate = { [weak self] text in
+            guard let self else { return }
+            self.partialText = text
+            EventBus.shared.emit(.partialTranscriptionUpdate(PartialTranscriptionPayload(
+                text: text,
+                elapsedSeconds: self.duration
+            )))
+        }
+        streamingHandler.onStreamingStateChange = { [weak self] streaming in
+            self?.isTranscribing = streaming
+        }
+
+        isInitialized = true
+        reconcileSelectionWithAvailablePlugins()
+    }
+
+    private func setupBindings() {
+        recorderService.$duration
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.duration = value }
+            .store(in: &cancellables)
+
+        recorderService.$micLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.micLevel = value }
+            .store(in: &cancellables)
+
+        recorderService.$systemLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.systemLevel = value }
+            .store(in: &cancellables)
+
+        recorderService.$systemAudioWarningMessage
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in self?.systemAudioWarningMessage = value }
+            .store(in: &cancellables)
+
+        modelManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    self?.reconcileSelectionWithAvailablePlugins()
+                    self?.objectWillChange.send()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    func observePluginManager() {
+        guard let pluginManager = PluginManager.shared else { return }
+        pluginManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.reconcileSelectionWithAvailablePlugins()
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+    }
+
+    func canUseForTranscription(_ engine: TranscriptionEnginePlugin) -> Bool {
+        modelManager.canUseForTranscription(engine)
+    }
+
+    func reconcileSelectionWithAvailablePlugins() {
+        guard let pluginManager = PluginManager.shared else { return }
+        if let selectedEngine,
+           pluginManager.transcriptionEngine(for: selectedEngine) == nil {
+            self.selectedEngine = nil
+            selectedModel = nil
+        }
+        clearUnavailableSelectedModelForResolvedEngine()
+        normalizeLanguageSelectionForResolvedEngine()
+    }
+
+    private func clearUnavailableSelectedModelForResolvedEngine() {
+        guard let selectedModel else { return }
+        guard let engine = resolvedEngine else {
+            self.selectedModel = nil
+            return
+        }
+
+        let modelIds = Set((engine.modelCatalog + engine.transcriptionModels).map(\.id))
+        if !modelIds.contains(selectedModel) {
+            self.selectedModel = nil
+        }
+    }
+
+    private func normalizeLanguageSelectionForResolvedEngine() {
+        guard let engine = resolvedEngine else { return }
+        let normalized = languageSelection.normalizedForSupportedLanguages(
+            engine.supportedLanguages(forModel: selectedModel)
+        )
+        if normalized != languageSelection {
+            languageSelection = normalized
+        }
+    }
+
+    nonisolated static func canToggleRecording(
+        state: RecorderState,
+        micEnabled: Bool,
+        systemAudioEnabled: Bool
+    ) -> Bool {
+        switch state {
+        case .idle:
+            micEnabled || systemAudioEnabled
+        case .recording:
+            true
+        case .finalizing:
+            false
+        }
+    }
+
+    func toggleRecording() {
+        guard canToggleRecording else { return }
+
+        switch state {
+        case .idle:
+            startRecording()
+        case .recording:
+            stopRecording()
+        case .finalizing:
+            break
+        }
+    }
+
+    func startRecording() {
+        Task {
+            do {
+                _ = try await beginRecording(
+                    micEnabled: micEnabled,
+                    systemAudioEnabled: systemAudioEnabled,
+                    apiSessionID: nil,
+                    preferredBaseName: nil,
+                    transcriptMetadata: nil
+                )
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func stopRecording() {
+        stopRecording(apiSessionID: activeRecorderAPISessionID)
+    }
+
+    @discardableResult
+    private func beginRecording(
+        micEnabled requestedMicEnabled: Bool,
+        systemAudioEnabled requestedSystemAudioEnabled: Bool,
+        apiSessionID: UUID?,
+        preferredBaseName: String?,
+        transcriptMetadata: CalendarMeetingTranscriptMetadata?
+    ) async throws -> URL {
+        guard retranscribingRecordingURL == nil else {
+            throw RecorderAPIError.retranscribing
+        }
+
+        switch state {
+        case .idle:
+            break
+        case .recording:
+            throw RecorderAPIError.alreadyRecording
+        case .finalizing:
+            throw RecorderAPIError.finalizing
+        }
+
+        guard requestedMicEnabled || requestedSystemAudioEnabled else {
+            throw RecorderAPIError.noSourceEnabled
+        }
+
+        errorMessage = nil
+        systemAudioWarningMessage = nil
+        partialText = ""
+        activeCalendarMeetingTranscriptMetadata = transcriptMetadata
+        reconcileSelectionWithAvailablePlugins()
+        state = .recording
+        let microphoneSelection = requestedMicEnabled
+            ? audioDeviceService.resolvedRecordingInputSelection()
+            : .systemDefault
+
+        let url: URL
+        do {
+            url = try await recorderService.startRecording(
+                micEnabled: requestedMicEnabled,
+                systemAudioEnabled: requestedSystemAudioEnabled,
+                format: outputFormat,
+                microphoneSelection: microphoneSelection,
+                preferredBaseName: preferredBaseName
+            )
+        } catch {
+            if let selectionError = error as? SelectedInputDeviceError,
+               case .incompatible(let issue) = selectionError {
+                audioDeviceService.markRecordingInputSelectionCompatibility(
+                    .incompatible(issue),
+                    selection: microphoneSelection
+                )
+            }
+            state = .idle
+            currentOutputURL = nil
+            activeCalendarMeetingTranscriptMetadata = nil
+            if let apiSessionID {
+                activeRecorderAPISessionID = nil
+                recorderAPISessions.removeValue(forKey: apiSessionID)
+            }
+            throw error
+        }
+        currentOutputURL = url
+
+        if let apiSessionID {
+            activeRecorderAPISessionID = apiSessionID
+            storeRecorderAPISession(RecorderAPISessionSnapshot(
+                id: apiSessionID,
+                status: .recording,
+                text: nil,
+                outputFile: url.path,
+                error: nil
+            ))
+        }
+
+        EventBus.shared.emit(.recordingStarted(RecordingStartedPayload()))
+
+        if transcriptionEnabled && livePreviewEnabled {
+            startStreamingTranscription()
+        } else {
+            isTranscribing = false
+        }
+
+        return url
+    }
+
+    private func stopRecording(apiSessionID: UUID?) {
+        activeCalendarMeetingHandle = nil
+        let calendarEvent = activeCalendarMeetingTranscriptMetadata
+        activeCalendarMeetingTranscriptMetadata = nil
+        let recordingDuration = duration
+        let shouldTranscribe = transcriptionEnabled
+
+        // Flip out of `.recording` immediately so the recording timer/widget disappears
+        // the instant Stop is pressed, instead of staying up while audio finalization
+        // and transcription run (which can take a while for long recordings).
+        state = .finalizing
+
+        Task {
+            let stoppedRecording = await recorderService.stopCapture(
+                includeTranscriptionSamples: shouldTranscribe
+            )
+            async let liveSessionResultTask = streamingHandler.finish(
+                finalSamples: stoppedRecording.transcriptionSamples
+            )
+            async let finalizedURLTask = recorderService.finalizeRecording(stoppedRecording)
+            let (liveSessionResult, url) = await (liveSessionResultTask, finalizedURLTask)
+
+            if let url, let calendarEvent {
+                do {
+                    try saveTranscriptDocument(
+                        text: nil,
+                        calendarEvent: calendarEvent,
+                        for: url
+                    )
+                } catch {
+                    logger.error(
+                        "Failed to save calendar transcript metadata: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+
+            let finalTranscriptionRequest: FinalTranscriptionRequest?
+            if shouldTranscribe, let url {
+                reconcileSelectionWithAvailablePlugins()
+                let providerId = effectiveProviderId
+                let dictionaryPrompt = dictionaryService.getTermsForPrompt(providerId: providerId)
+                let dictionaryTermHints = dictionaryService.getTermHints(providerId: providerId)
+                let finalSamples = if liveSessionResult == nil {
+                    await finalizedRecordingSamples(
+                        from: url,
+                        fallback: stoppedRecording.transcriptionSamples
+                    )
+                } else {
+                    stoppedRecording.transcriptionSamples
+                }
+                finalTranscriptionRequest = FinalTranscriptionRequest(
+                    outputURL: url,
+                    buffer: finalSamples,
+                    languageSelection: languageSelection,
+                    task: selectedTask,
+                    providerId: providerId,
+                    modelOverrideId: selectedModel,
+                    prompt: dictionaryPrompt,
+                    dictionaryTermHints: dictionaryTermHints,
+                    liveSessionResult: liveSessionResult,
+                    calendarEvent: calendarEvent
+                )
+                if let apiSessionID {
+                    markRecorderAPISessionFinalizing(id: apiSessionID, outputURL: url)
+                }
+            } else {
+                finalTranscriptionRequest = nil
+                state = .idle
+                isTranscribing = false
+            }
+
+            EventBus.shared.emit(.recordingStopped(RecordingStoppedPayload(durationSeconds: recordingDuration)))
+
+            let finalTranscriptionOutcome: FinalTranscriptionOutcome
+            if let request = finalTranscriptionRequest {
+                finalTranscriptionOutcome = await runFinalTranscription(request)
+                state = .idle
+            } else {
+                finalTranscriptionOutcome = .skipped
+            }
+
+            // Emit final transcript to LiveTranscriptPlugin
+            if livePreviewEnabled && !partialText.isEmpty {
+                EventBus.shared.emit(.partialTranscriptionUpdate(PartialTranscriptionPayload(
+                    text: partialText, isFinal: true, elapsedSeconds: recordingDuration
+                )))
+            }
+
+            if url != nil {
+                loadRecordings()
+            }
+
+            if let apiSessionID {
+                if let url {
+                    if let failure = finalTranscriptionOutcome.failure {
+                        failRecorderAPISession(
+                            id: apiSessionID,
+                            outputURL: url,
+                            error: recorderTranscriptionFailureAPISummary(failure)
+                        )
+                    } else {
+                        completeRecorderAPISession(id: apiSessionID, outputURL: url)
+                    }
+                } else {
+                    failRecorderAPISession(id: apiSessionID, error: "Failed to finalize recording")
+                }
+            }
+        }
+    }
+
+    private func finalizedRecordingSamples(
+        from outputURL: URL,
+        fallback captureSamples: [Float]
+    ) async -> [Float] {
+        do {
+            let samples = try await audioSamplesLoader(outputURL)
+            guard !samples.isEmpty else {
+                logger.warning(
+                    "Finalized recording contained no transcription samples; using capture buffer"
+                )
+                return captureSamples
+            }
+            return samples
+        } catch {
+            logger.warning(
+                "Could not load finalized recording for transcription; using capture buffer: \(error.localizedDescription, privacy: .public)"
+            )
+            return captureSamples
+        }
+    }
+
+    // MARK: - HTTP API
+
+    var apiRecorderIsRecording: Bool {
+        state == .recording
+    }
+
+    func apiStartRecording(micEnabled micOverride: Bool?, systemAudioEnabled systemAudioOverride: Bool?) async throws -> UUID {
+        let resolvedMicEnabled = micOverride ?? micEnabled
+        let resolvedSystemAudioEnabled = systemAudioOverride ?? systemAudioEnabled
+        let sessionID = UUID()
+        _ = try await beginRecording(
+            micEnabled: resolvedMicEnabled,
+            systemAudioEnabled: resolvedSystemAudioEnabled,
+            apiSessionID: sessionID,
+            preferredBaseName: nil,
+            transcriptMetadata: nil
+        )
+        return sessionID
+    }
+
+    func apiStopRecording() throws -> UUID {
+        guard state == .recording else {
+            throw RecorderAPIError.notRecording
+        }
+        guard let sessionID = activeRecorderAPISessionID else {
+            throw RecorderAPIError.notRecording
+        }
+        if let currentOutputURL {
+            markRecorderAPISessionFinalizing(id: sessionID, outputURL: currentOutputURL)
+        }
+        state = .finalizing
+        stopRecording(apiSessionID: sessionID)
+        return sessionID
+    }
+
+    func apiRecorderSession(id: UUID) -> RecorderAPISessionSnapshot? {
+        recorderAPISessions[id]
+    }
+
+    // MARK: - Calendar Meeting Automation
+
+    func startCalendarMeetingRecording(
+        preferredBaseName: String,
+        transcriptMetadata: CalendarMeetingTranscriptMetadata? = nil
+    ) async throws -> CalendarMeetingRecordingHandle {
+        let outputURL = try await beginRecording(
+            micEnabled: micEnabled,
+            systemAudioEnabled: systemAudioEnabled,
+            apiSessionID: nil,
+            preferredBaseName: preferredBaseName,
+            transcriptMetadata: transcriptMetadata
+        )
+        guard state == .recording else {
+            activeCalendarMeetingHandle = nil
+            throw RecorderAPIError.notRecording
+        }
+        let handle = CalendarMeetingRecordingHandle(id: UUID(), outputURL: outputURL)
+        activeCalendarMeetingHandle = handle
+        return handle
+    }
+
+    func stopCalendarMeetingRecording(
+        handle: CalendarMeetingRecordingHandle
+    ) throws {
+        guard state == .recording else {
+            activeCalendarMeetingHandle = nil
+            throw RecorderAPIError.notRecording
+        }
+        guard activeCalendarMeetingHandle == handle else {
+            throw RecorderAPIError.calendarRecordingHandleMismatch
+        }
+        stopRecording(apiSessionID: nil)
+    }
+
+    private func storeRecorderAPISession(_ session: RecorderAPISessionSnapshot) {
+        recorderAPISessions[session.id] = session
+    }
+
+    private func markRecorderAPISessionFinalizing(id: UUID, outputURL: URL) {
+        storeRecorderAPISession(RecorderAPISessionSnapshot(
+            id: id,
+            status: .finalizing,
+            text: nil,
+            outputFile: outputURL.path,
+            error: nil
+        ))
+    }
+
+    private func completeRecorderAPISession(id: UUID, outputURL: URL) {
+        let text = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        storeRecorderAPISession(RecorderAPISessionSnapshot(
+            id: id,
+            status: .completed,
+            text: text.isEmpty ? nil : text,
+            outputFile: outputURL.path,
+            error: nil
+        ))
+        if activeRecorderAPISessionID == id {
+            activeRecorderAPISessionID = nil
+        }
+    }
+
+    private func failRecorderAPISession(id: UUID, outputURL: URL? = nil, error: String) {
+        let outputFile = outputURL?.path ?? recorderAPISessions[id]?.outputFile
+        storeRecorderAPISession(RecorderAPISessionSnapshot(
+            id: id,
+            status: .failed,
+            text: nil,
+            outputFile: outputFile,
+            error: error
+        ))
+        if activeRecorderAPISessionID == id {
+            activeRecorderAPISessionID = nil
+        }
+    }
+
+    func deleteRecording(_ item: RecordingItem) {
+        guard !isRetranscribing(item) else { return }
+
+        let sidecarURLs = [
+            transcriptURL(for: item.url),
+            transcriptMarkdownURL(for: item.url),
+            transcriptDocumentURL(for: item.url),
+            transcriptionFailureURL(for: item.url)
+        ]
+
+        do {
+            let sidecarSnapshots = try sidecarURLs.map(makeRecordingFileSnapshot(at:))
+            do {
+                for url in sidecarURLs {
+                    try removeRecordingFileIfPresent(at: url)
+                }
+                try removeRecordingFileIfPresent(at: item.url)
+            } catch {
+                do {
+                    try restoreRecordingFileSnapshots(sidecarSnapshots)
+                } catch {
+                    logger.error(
+                        "Failed to restore recording sidecars after deletion failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+                throw error
+            }
+            transientTranscriptionFailures.removeValue(
+                forKey: transcriptionFailureKey(for: item.url)
+            )
+            recordings.removeAll { $0.id == item.id }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func removeRecordingFileIfPresent(at url: URL) throws {
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        }
+    }
+
+    private struct RecordingFileSnapshot {
+        let url: URL
+        let data: Data?
+    }
+
+    private func makeRecordingFileSnapshot(at url: URL) throws -> RecordingFileSnapshot {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return RecordingFileSnapshot(url: url, data: nil)
+        }
+        return RecordingFileSnapshot(url: url, data: try Data(contentsOf: url))
+    }
+
+    private func restoreRecordingFileSnapshots(_ snapshots: [RecordingFileSnapshot]) throws {
+        for snapshot in snapshots {
+            guard let data = snapshot.data,
+                  !FileManager.default.fileExists(atPath: snapshot.url.path) else {
+                continue
+            }
+            try data.write(to: snapshot.url, options: .atomic)
+        }
+    }
+
+    func revealInFinder(_ item: RecordingItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+    }
+
+    func transcribeRecording(_ item: RecordingItem) {
+        guard canTranscribeRecording(item) else { return }
+
+        let url = item.url
+        retranscribingRecordingURL = url
+        errorMessage = nil
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.retranscribingRecordingURL = nil
+                self.loadRecordings()
+            }
+
+            let samples: [Float]
+            do {
+                samples = try await self.audioSamplesLoader(url)
+            } catch {
+                self.recordRetranscriptionFailure(
+                    phase: .preparingFinalAudio,
+                    error: error,
+                    for: url
+                )
+                return
+            }
+
+            self.reconcileSelectionWithAvailablePlugins()
+            let providerId = self.effectiveProviderId
+            let request = FinalTranscriptionRequest(
+                outputURL: url,
+                buffer: samples,
+                languageSelection: self.languageSelection,
+                task: self.selectedTask,
+                providerId: providerId,
+                modelOverrideId: self.selectedModel,
+                prompt: self.dictionaryService.getTermsForPrompt(providerId: providerId),
+                dictionaryTermHints: self.dictionaryService.getTermHints(providerId: providerId),
+                liveSessionResult: nil,
+                calendarEvent: item.calendarEvent
+            )
+
+            _ = await self.runRetranscription(request)
+        }
+    }
+
+    func isRetranscribing(_ item: RecordingItem) -> Bool {
+        retranscribingRecordingURL?.standardizedFileURL == item.url.standardizedFileURL
+    }
+
+    func canTranscribeRecording(_ item: RecordingItem) -> Bool {
+        guard state == .idle, retranscribingRecordingURL == nil else { return false }
+        guard FileManager.default.fileExists(atPath: item.url.path) else { return false }
+        guard let engine = resolvedEngine else { return false }
+        return modelManager.canPrepareForTranscription(engine)
+    }
+
+    func openRecordingsFolder() {
+        let dir = recorderService.recordingsDirectory
+        if FileManager.default.fileExists(atPath: dir.path) {
+            NSWorkspace.shared.open(dir)
+        }
+    }
+
+    func copyTranscript(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func loadRecordingsIfNeeded() {
+        guard !hasRequestedInitialRecordingsLoad else { return }
+        hasRequestedInitialRecordingsLoad = true
+        loadRecordings()
+    }
+
+    func loadRecordings() {
+        guard hasRequestedInitialRecordingsLoad else { return }
+        let dir = recorderService.recordingsDirectory
+        let transientFailures = transientTranscriptionFailures
+        let loader = recordingsLoader
+        recordingsLoadGeneration += 1
+        let generation = recordingsLoadGeneration
+
+        recordingsLoadTask?.cancel()
+        let worker = Task.detached(priority: .userInitiated) {
+            loader(dir, transientFailures)
+        }
+        recordingsLoadTask = Task { [weak self] in
+            let items = await worker.value
+            guard !Task.isCancelled, let self, generation == self.recordingsLoadGeneration else { return }
+            self.recordings = items
+        }
+    }
+
+    nonisolated private static func readRecordings(
+        from directory: URL,
+        transientFailures: [String: RecordingTranscriptionFailure]
+    ) -> [RecordingItem] {
+        guard FileManager.default.fileExists(atPath: directory.path),
+              let files = try? FileManager.default.contentsOfDirectory(
+                  at: directory,
+                  includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .contentModificationDateKey],
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+
+        let audioExtensions: Set<String> = ["wav", "m4a", "mp3", "aac", "caf"]
+        return files
+            .filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+            .compactMap { url in
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
+                let date = (attrs[.creationDate] as? Date) ?? Date.distantPast
+                let size = (attrs[.size] as? Int64) ?? 0
+                let duration = audioDuration(for: url)
+                let transcriptURL = url.deletingPathExtension().appendingPathExtension("txt")
+                let transcriptDocumentURL = url
+                    .deletingPathExtension()
+                    .appendingPathExtension("transcript.json")
+                let transcriptDocument = (try? Data(contentsOf: transcriptDocumentURL))
+                    .flatMap { data -> RecordingTranscriptDocument? in
+                        let decoder = JSONDecoder()
+                        decoder.dateDecodingStrategy = .iso8601
+                        return try? decoder.decode(RecordingTranscriptDocument.self, from: data)
+                    }
+                let transcript = (try? String(contentsOf: transcriptURL, encoding: .utf8))
+                    ?? transcriptDocument?.text
+                let failureURL = url.appendingPathExtension("transcription-failure.json")
+                let persistedFailure = (try? Data(contentsOf: failureURL))
+                    .flatMap { try? JSONDecoder().decode(RecordingTranscriptionFailure.self, from: $0) }
+                let failureKey = url.resolvingSymlinksInPath().path
+                return RecordingItem(
+                    url: url,
+                    date: date,
+                    duration: duration,
+                    fileSize: size,
+                    transcript: transcript,
+                    transcriptionFailure: persistedFailure ?? transientFailures[failureKey],
+                    calendarEvent: transcriptDocument?.calendarEvent
+                )
+            }
+            .sorted { $0.date > $1.date }
+    }
+
+    nonisolated private static func audioDuration(for url: URL) -> TimeInterval {
+        guard let player = try? AVAudioPlayer(contentsOf: url) else { return 0 }
+        return player.duration.isFinite ? player.duration : 0
+    }
+
+    func formattedDuration(_ duration: TimeInterval) -> String {
+        let hours = Int(duration) / 3600
+        let minutes = (Int(duration) % 3600) / 60
+        let seconds = Int(duration) % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    func formattedFileSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    func transcriptionFailureSummary(for item: RecordingItem) -> String? {
+        guard let failure = item.transcriptionFailure else { return nil }
+        return String(
+            format: String(localized: "recorder.transcriptionFailureSummary"),
+            formattedDuration(item.duration),
+            formattedFileSize(item.fileSize),
+            failure.phase.displayName,
+            failure.providerError
+        )
+    }
+
+    // MARK: - Streaming Transcription
+
+    private func startStreamingTranscription() {
+        guard let pluginManager = PluginManager.shared else {
+            logger.info("Plugin manager unavailable, skipping live transcription")
+            return
+        }
+        reconcileSelectionWithAvailablePlugins()
+        guard let providerId = effectiveProviderId,
+              let plugin = pluginManager.transcriptionEngine(for: providerId) else {
+            logger.info("No transcription engine available, skipping live transcription")
+            return
+        }
+
+        livePreviewStartObserver?()
+        let task = (selectedTask == .translate && !plugin.supportsTranslation) ? .transcribe : selectedTask
+        streamingHandler.start(
+            streamPrompt: dictionaryService.getTermsForPrompt(providerId: providerId) ?? "",
+            dictionaryTermHints: dictionaryService.getTermHints(providerId: providerId),
+            engineOverrideId: providerId,
+            selectedProviderId: modelManager.selectedProviderId,
+            languageSelection: languageSelection,
+            task: task,
+            cloudModelOverride: selectedModel,
+            allowLiveTranscription: true,
+            stateCheck: { [weak self] in self?.state == .recording }
+        )
+    }
+
+    private func runFinalTranscription(_ request: FinalTranscriptionRequest) async -> FinalTranscriptionOutcome {
+        isTranscribing = true
+        defer { isTranscribing = false }
+
+        let buffer = request.buffer
+        guard buffer.count > 8000 else { // At least 0.5s of audio
+            // Use streaming result as final if buffer too short
+            if !partialText.isEmpty {
+                return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
+            } else if let liveSessionResult = request.liveSessionResult {
+                let text = liveSessionResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    partialText = text
+                    return saveTranscriptOutcome(text, for: request.outputURL, request: request)
+                }
+            }
+            return .skipped
+        }
+
+        // Fall back to transcribe if engine doesn't support translation
+        let effectiveTask = resolvedTask(for: request)
+
+        do {
+            let result = if let liveSessionResult = request.liveSessionResult {
+                liveSessionResult
+            } else {
+                try await transcribeFinalRecording(request, task: effectiveTask)
+            }
+            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                partialText = text
+                return saveTranscriptOutcome(text, for: request.outputURL, request: request)
+            } else if !partialText.isEmpty {
+                return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
+            } else {
+                let failure = makeTranscriptionFailure(
+                    phase: .emptyResult,
+                    providerError: String(localized: "recorder.emptyFinalTranscriptionError"),
+                    request: request
+                )
+                let recordedFailure = saveTranscriptionFailure(failure, for: request.outputURL)
+                errorMessage = recorderTranscriptionFailureAPISummary(recordedFailure)
+                return .failed(recordedFailure)
+            }
+        } catch is CancellationError {
+            return .skipped
+        } catch {
+            logger.error("Final transcription failed: \(error.localizedDescription)")
+            // Fall back to streaming result
+            if !partialText.isEmpty {
+                return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
+            }
+            let failure = makeTranscriptionFailure(
+                phase: .finalTranscription,
+                providerError: error.localizedDescription,
+                request: request
+            )
+            let recordedFailure = saveTranscriptionFailure(failure, for: request.outputURL)
+            errorMessage = recorderTranscriptionFailureAPISummary(recordedFailure)
+            return .failed(recordedFailure)
+        }
+    }
+
+    private func runRetranscription(_ request: FinalTranscriptionRequest) async -> FinalTranscriptionOutcome {
+        let effectiveTask = resolvedTask(for: request)
+
+        do {
+            let result = try await transcribeFinalRecording(request, task: effectiveTask)
+            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                let failure = makeTranscriptionFailure(
+                    phase: .emptyResult,
+                    providerError: String(localized: "recorder.emptyFinalTranscriptionError"),
+                    request: request
+                )
+                let recordedFailure = saveTranscriptionFailure(failure, for: request.outputURL)
+                errorMessage = recorderTranscriptionFailureAPISummary(recordedFailure)
+                return .failed(recordedFailure)
+            }
+
+            return saveTranscriptOutcome(text, for: request.outputURL, request: request)
+        } catch is CancellationError {
+            return .skipped
+        } catch {
+            recordRetranscriptionFailure(
+                phase: .finalTranscription,
+                error: error,
+                for: request.outputURL,
+                request: request
+            )
+            let failure = loadTranscriptionFailure(for: request.outputURL)
+                ?? transientTranscriptionFailures[transcriptionFailureKey(for: request.outputURL)]
+            if let failure {
+                return .failed(failure)
+            }
+            return .skipped
+        }
+    }
+
+    private func transcribeFinalRecording(
+        _ request: FinalTranscriptionRequest,
+        task: TranscriptionTask
+    ) async throws -> TranscriptionResult {
+        let initialPass = try await transcribeFinalRecordingPass(
+            request,
+            task: task,
+            prompt: request.prompt,
+            dictionaryTermHints: request.dictionaryTermHints
+        )
+        try Task.checkCancellation()
+
+        guard try await shouldRetryWhisperKitWithoutConditioning(
+            request: request,
+            pass: initialPass
+        ) else {
+            return initialPass.result
+        }
+
+        logger.warning(
+            "WhisperKit final transcription stopped with audible audio remaining; retrying without dictionary conditioning [processedDuration=\(initialPass.processedDuration, privacy: .public), audioDuration=\(initialPass.result.duration, privacy: .public)]"
+        )
+
+        do {
+            try Task.checkCancellation()
+            let retryPass = try await transcribeFinalRecordingPass(
+                request,
+                task: task,
+                prompt: nil,
+                dictionaryTermHints: []
+            )
+            return preferredFinalTranscriptionResult(
+                initial: initialPass,
+                retry: retryPass
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.warning(
+                "WhisperKit final transcription retry without dictionary conditioning failed; keeping the initial result: \(error.localizedDescription, privacy: .public)"
+            )
+            return initialPass.result
+        }
+    }
+
+    private struct FinalTranscriptionPass {
+        let result: TranscriptionResult
+        let processedDuration: TimeInterval
+    }
+
+    private func transcribeFinalRecordingPass(
+        _ request: FinalTranscriptionRequest,
+        task: TranscriptionTask,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) async throws -> FinalTranscriptionPass {
+        let progressCapture = RecorderTranscriptionSourceProgressCapture()
+        let result = try await modelManager.transcribe(
+            audioSamples: request.buffer,
+            languageSelection: request.languageSelection,
+            task: task,
+            engineOverrideId: request.providerId,
+            cloudModelOverride: request.modelOverrideId,
+            prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
+            onProgress: { _ in true },
+            onSourceProgress: progressCapture.record
+        )
+        let segmentDuration = result.segments
+            .map(\.end)
+            .filter(\.isFinite)
+            .max() ?? 0
+        return FinalTranscriptionPass(
+            result: result,
+            processedDuration: max(progressCapture.processedDuration, segmentDuration)
+        )
+    }
+
+    private func shouldRetryWhisperKitWithoutConditioning(
+        request: FinalTranscriptionRequest,
+        pass: FinalTranscriptionPass
+    ) async throws -> Bool {
+        guard request.providerId == "whisper",
+              let prompt = request.prompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !prompt.isEmpty else {
+            return false
+        }
+
+        let text = pass.result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let audioDuration = Double(request.buffer.count) / AudioRecorderService.transcriptionSampleRate
+        let analysisStartTime: TimeInterval
+        if text.isEmpty {
+            analysisStartTime = 0
+        } else {
+            guard audioDuration >= 60,
+                  pass.processedDuration > 0,
+                  audioDuration - pass.processedDuration >= 30 else {
+                return false
+            }
+            analysisStartTime = pass.processedDuration
+        }
+
+        let samples = request.buffer
+        let analysisTask = Task.detached(priority: .utility) {
+            recorderAudioHasAudibleTail(
+                samples: samples,
+                startingAt: analysisStartTime
+            )
+        }
+        let hasAudibleAudio = await withTaskCancellationHandler {
+            await analysisTask.value
+        } onCancel: {
+            analysisTask.cancel()
+        }
+        try Task.checkCancellation()
+        return hasAudibleAudio
+    }
+
+    private func preferredFinalTranscriptionResult(
+        initial: FinalTranscriptionPass,
+        retry: FinalTranscriptionPass
+    ) -> TranscriptionResult {
+        let initialText = initial.result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let retryText = retry.result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !retryText.isEmpty else { return initial.result }
+        guard !initialText.isEmpty else { return retry.result }
+
+        if retry.processedDuration > initial.processedDuration + 5 {
+            return retry.result
+        }
+        if retryText.count > Int(Double(initialText.count) * 1.2) {
+            return retry.result
+        }
+        return initial.result
+    }
+
+    private func resolvedTask(for request: FinalTranscriptionRequest) -> TranscriptionTask {
+        guard request.task == .translate,
+              let providerId = request.providerId,
+              let plugin = PluginManager.shared?.transcriptionEngine(for: providerId),
+              !plugin.supportsTranslation else {
+            return request.task
+        }
+        return .transcribe
+    }
+
+    private func recordRetranscriptionFailure(
+        phase: RecordingTranscriptionFailure.Phase,
+        error: Error,
+        for audioURL: URL,
+        request: FinalTranscriptionRequest? = nil
+    ) {
+        let request = request ?? FinalTranscriptionRequest(
+            outputURL: audioURL,
+            buffer: [],
+            languageSelection: languageSelection,
+            task: selectedTask,
+            providerId: effectiveProviderId,
+            modelOverrideId: selectedModel,
+            prompt: nil,
+            dictionaryTermHints: [],
+            liveSessionResult: nil,
+            calendarEvent: nil
+        )
+        let failure = makeTranscriptionFailure(
+            phase: phase,
+            providerError: error.localizedDescription,
+            request: request
+        )
+        let recordedFailure = saveTranscriptionFailure(failure, for: audioURL)
+        errorMessage = recorderTranscriptionFailureAPISummary(recordedFailure)
+    }
+
+    // MARK: - Transcript Sidecar
+
+    private func transcriptURL(for audioURL: URL) -> URL {
+        audioURL.deletingPathExtension().appendingPathExtension("txt")
+    }
+
+    private func saveTranscript(
+        _ text: String,
+        for audioURL: URL,
+        calendarEvent: CalendarMeetingTranscriptMetadata?
+    ) throws {
+        let txtURL = transcriptURL(for: audioURL)
+        if let calendarEvent {
+            let documentWrites = try transcriptDocumentWrites(
+                text: text,
+                calendarEvent: calendarEvent,
+                for: audioURL
+            )
+            try writeRecordingFilesTransactionally([
+                RecordingFileWrite(url: txtURL, data: Data(text.utf8))
+            ] + documentWrites)
+        } else {
+            try text.write(to: txtURL, atomically: true, encoding: .utf8)
+        }
+        clearTranscriptionFailure(for: audioURL)
+    }
+
+    private func transcriptDocumentURL(for audioURL: URL) -> URL {
+        audioURL.deletingPathExtension().appendingPathExtension("transcript.json")
+    }
+
+    private func transcriptMarkdownURL(for audioURL: URL) -> URL {
+        audioURL.deletingPathExtension().appendingPathExtension("transcript.md")
+    }
+
+    private func saveTranscriptDocument(
+        text: String?,
+        calendarEvent: CalendarMeetingTranscriptMetadata,
+        for audioURL: URL
+    ) throws {
+        try writeRecordingFilesTransactionally(
+            try transcriptDocumentWrites(
+                text: text,
+                calendarEvent: calendarEvent,
+                for: audioURL
+            )
+        )
+    }
+
+    private struct RecordingFileWrite {
+        let url: URL
+        let data: Data
+    }
+
+    private struct RecordingFileCommit {
+        let write: RecordingFileWrite
+        let stagedURL: URL
+        let backupURL: URL?
+        var installedNewFile: Bool
+    }
+
+    private func transcriptDocumentWrites(
+        text: String?,
+        calendarEvent: CalendarMeetingTranscriptMetadata,
+        for audioURL: URL
+    ) throws -> [RecordingFileWrite] {
+        let document = RecordingTranscriptDocument(
+            text: text,
+            calendarEvent: calendarEvent
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(document)
+        let markdown = RecordingTranscriptMarkdownRenderer.render(document)
+        return [
+            RecordingFileWrite(url: transcriptDocumentURL(for: audioURL), data: data),
+            RecordingFileWrite(url: transcriptMarkdownURL(for: audioURL), data: Data(markdown.utf8))
+        ]
+    }
+
+    private func writeRecordingFilesTransactionally(_ writes: [RecordingFileWrite]) throws {
+        let fileManager = FileManager.default
+        var stagedWrites: [(write: RecordingFileWrite, stagedURL: URL)] = []
+        var commits: [RecordingFileCommit] = []
+
+        do {
+            for write in writes {
+                let stagedURL = temporarySiblingURL(for: write.url, suffix: "staged")
+                try write.data.write(to: stagedURL, options: .atomic)
+                stagedWrites.append((write, stagedURL))
+            }
+
+            for stagedWrite in stagedWrites {
+                let backupURL: URL?
+                if fileManager.fileExists(atPath: stagedWrite.write.url.path) {
+                    let url = temporarySiblingURL(for: stagedWrite.write.url, suffix: "backup")
+                    try fileManager.moveItem(at: stagedWrite.write.url, to: url)
+                    backupURL = url
+                } else {
+                    backupURL = nil
+                }
+
+                commits.append(RecordingFileCommit(
+                    write: stagedWrite.write,
+                    stagedURL: stagedWrite.stagedURL,
+                    backupURL: backupURL,
+                    installedNewFile: false
+                ))
+                try fileManager.moveItem(at: stagedWrite.stagedURL, to: stagedWrite.write.url)
+                commits[commits.count - 1].installedNewFile = true
+            }
+        } catch {
+            for commit in commits.reversed() {
+                if commit.installedNewFile,
+                   fileManager.fileExists(atPath: commit.write.url.path) {
+                    try? fileManager.removeItem(at: commit.write.url)
+                }
+                if let backupURL = commit.backupURL,
+                   fileManager.fileExists(atPath: backupURL.path) {
+                    try? fileManager.moveItem(at: backupURL, to: commit.write.url)
+                }
+            }
+            for stagedWrite in stagedWrites where fileManager.fileExists(atPath: stagedWrite.stagedURL.path) {
+                try? fileManager.removeItem(at: stagedWrite.stagedURL)
+            }
+            throw error
+        }
+
+        for commit in commits {
+            if let backupURL = commit.backupURL,
+               fileManager.fileExists(atPath: backupURL.path) {
+                do {
+                    try fileManager.removeItem(at: backupURL)
+                } catch {
+                    logger.error(
+                        "Failed to remove transcript backup: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func temporarySiblingURL(for url: URL, suffix: String) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString).\(suffix)"
+        )
+    }
+
+    private func loadTranscript(for audioURL: URL) -> String? {
+        let txtURL = transcriptURL(for: audioURL)
+        return try? String(contentsOf: txtURL, encoding: .utf8)
+    }
+
+    private func saveTranscriptOutcome(
+        _ text: String,
+        for audioURL: URL,
+        request: FinalTranscriptionRequest
+    ) -> FinalTranscriptionOutcome {
+        do {
+            try saveTranscript(
+                text,
+                for: audioURL,
+                calendarEvent: request.calendarEvent
+            )
+            return .transcriptSaved
+        } catch {
+            logger.error("Failed to save transcript: \(error.localizedDescription)")
+            let failure = makeTranscriptionFailure(
+                phase: .savingTranscript,
+                providerError: error.localizedDescription,
+                request: request
+            )
+            let recordedFailure = saveTranscriptionFailure(failure, for: audioURL)
+            errorMessage = recorderTranscriptionFailureAPISummary(recordedFailure)
+            return .failed(recordedFailure)
+        }
+    }
+
+    private func transcriptionFailureURL(for audioURL: URL) -> URL {
+        audioURL.appendingPathExtension("transcription-failure.json")
+    }
+
+    private func transcriptionFailureKey(for audioURL: URL) -> String {
+        audioURL.resolvingSymlinksInPath().path
+    }
+
+    private func makeTranscriptionFailure(
+        phase: RecordingTranscriptionFailure.Phase,
+        providerError: String,
+        request: FinalTranscriptionRequest
+    ) -> RecordingTranscriptionFailure {
+        RecordingTranscriptionFailure(
+            phase: phase,
+            providerError: providerError,
+            engineName: request.providerId.flatMap { providerId in
+                PluginManager.shared?.transcriptionEngine(for: providerId)?.providerDisplayName
+            },
+            modelName: modelManager.resolvedModelDisplayName(
+                engineOverrideId: request.providerId,
+                cloudModelOverride: request.modelOverrideId
+            ),
+            failedAt: Date()
+        )
+    }
+
+    @discardableResult
+    private func saveTranscriptionFailure(
+        _ failure: RecordingTranscriptionFailure,
+        for audioURL: URL
+    ) -> RecordingTranscriptionFailure {
+        let url = transcriptionFailureURL(for: audioURL)
+        let key = transcriptionFailureKey(for: audioURL)
+        do {
+            let data = try JSONEncoder().encode(failure)
+            try data.write(to: url, options: .atomic)
+            transientTranscriptionFailures.removeValue(forKey: key)
+            return failure
+        } catch {
+            logger.error("Failed to save recorder transcription failure: \(error.localizedDescription)")
+            let surfacedFailure = RecordingTranscriptionFailure(
+                phase: failure.phase,
+                providerError: String(
+                    format: String(localized: "recorder.failureMetadataSaveError"),
+                    failure.providerError,
+                    error.localizedDescription
+                ),
+                engineName: failure.engineName,
+                modelName: failure.modelName,
+                failedAt: failure.failedAt
+            )
+            transientTranscriptionFailures[key] = surfacedFailure
+            return surfacedFailure
+        }
+    }
+
+    private func loadTranscriptionFailure(for audioURL: URL) -> RecordingTranscriptionFailure? {
+        let url = transcriptionFailureURL(for: audioURL)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(RecordingTranscriptionFailure.self, from: data)
+    }
+
+    private func clearTranscriptionFailure(for audioURL: URL) {
+        transientTranscriptionFailures.removeValue(forKey: transcriptionFailureKey(for: audioURL))
+        try? FileManager.default.removeItem(at: transcriptionFailureURL(for: audioURL))
+    }
+
+    private func recorderTranscriptionFailureAPISummary(_ failure: RecordingTranscriptionFailure) -> String {
+        String(
+            format: String(localized: "recorder.transcriptionFailureAPISummary"),
+            failure.phase.displayName,
+            failure.providerError
+        )
+    }
+}

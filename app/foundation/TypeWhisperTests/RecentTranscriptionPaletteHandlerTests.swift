@@ -1,0 +1,1331 @@
+import AppKit
+import SwiftUI
+import TypeWhisperPluginSDK
+import XCTest
+@testable import TypeWhisper
+
+@MainActor
+final class RecentTranscriptionPaletteHandlerTests: XCTestCase {
+    func testTriggerSelectionOpensOnlyWhenIdle() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let historyService = HistoryService(appSupportDirectory: appSupportDirectory)
+        let textInsertionService = TextInsertionService()
+        let store = RecentTranscriptionStore()
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: historyService,
+            recentTranscriptionStore: store,
+            paletteController: controller
+        )
+
+        store.recordTranscription(
+            id: UUID(),
+            finalText: "Recent session entry",
+            timestamp: Date(),
+            appName: "Notes",
+            appBundleIdentifier: "com.apple.Notes"
+        )
+
+        handler.triggerSelection(currentState: .processing)
+        XCTAssertFalse(controller.isVisible)
+
+        handler.triggerSelection(currentState: .idle)
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastItems?.count, 1)
+    }
+
+    func testTriggerSelectionShowsFeedbackWhenNoEntriesExist() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: TextInsertionService(),
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            paletteController: SelectionPaletteControllerSpy()
+        )
+
+        var feedbackMessage: String?
+        handler.onShowNotchFeedback = { message, _, _, _, _ in
+            feedbackMessage = message
+        }
+
+        handler.triggerSelection(currentState: .idle)
+
+        XCTAssertEqual(
+            feedbackMessage,
+            try TestSupport.localizedCatalogValueForCurrentLocale(for: "No recent transcriptions")
+        )
+    }
+
+    func testTriggerSelectionSortsNewestEntriesFirst() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let historyService = HistoryService(appSupportDirectory: appSupportDirectory)
+        let store = RecentTranscriptionStore()
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: TextInsertionService(),
+            historyService: historyService,
+            recentTranscriptionStore: store,
+            paletteController: controller
+        )
+
+        historyService.addRecord(
+            id: UUID(),
+            rawText: "History newest",
+            finalText: "History newest",
+            appName: "Safari",
+            appBundleIdentifier: "com.apple.Safari",
+            durationSeconds: 1,
+            language: "en",
+            engineUsed: "mock"
+        )
+        let historyRecord = try XCTUnwrap(historyService.recentRecords.first)
+        historyRecord.timestamp = Date().addingTimeInterval(-10)
+        historyService.updateRecord(historyRecord, finalText: historyRecord.finalText)
+
+        store.recordTranscription(
+            id: UUID(),
+            finalText: "Session older",
+            timestamp: Date().addingTimeInterval(-120),
+            appName: "Mail",
+            appBundleIdentifier: "com.apple.mail"
+        )
+
+        handler.triggerSelection(currentState: .idle)
+
+        XCTAssertEqual(controller.lastItems?.map(\.title), ["History newest", "Session older"])
+    }
+
+    func testSelectingItemInsertsWithoutAutoEnter() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.pasteboardProvider = { pasteboard }
+
+        var pasteCount = 0
+        var returnCount = 0
+        textInsertionService.pasteSimulatorOverride = { pasteCount += 1 }
+        textInsertionService.returnSimulatorOverride = { returnCount += 1 }
+
+        let store = RecentTranscriptionStore()
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: store,
+            paletteController: controller
+        )
+
+        let id = UUID()
+        store.recordTranscription(
+            id: id,
+            finalText: "Insert me",
+            timestamp: Date(),
+            appName: "Messages",
+            appBundleIdentifier: "com.apple.MobileSMS"
+        )
+
+        handler.triggerSelection(currentState: .idle)
+        controller.select(id: id)
+
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(returnCount, 0)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Insert me")
+    }
+
+    func testInsertLatestPastesNewestTranscriptionWithoutOpeningPalette() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.pasteboardProvider = { pasteboard }
+
+        var pasteCount = 0
+        var returnCount = 0
+        textInsertionService.pasteSimulatorOverride = { pasteCount += 1 }
+        textInsertionService.returnSimulatorOverride = { returnCount += 1 }
+
+        let store = RecentTranscriptionStore()
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: store,
+            paletteController: controller
+        )
+
+        store.recordTranscription(
+            id: UUID(),
+            finalText: "Older transcription",
+            timestamp: Date().addingTimeInterval(-60),
+            appName: "Notes",
+            appBundleIdentifier: "com.apple.Notes"
+        )
+        store.recordTranscription(
+            id: UUID(),
+            finalText: "Newest transcription",
+            timestamp: Date(),
+            appName: "Messages",
+            appBundleIdentifier: "com.apple.MobileSMS"
+        )
+
+        handler.insertLatest(currentState: .idle)
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(controller.isVisible)
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(returnCount, 0)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Newest transcription")
+    }
+
+    func testInsertLatestIgnoresRapidRepeatUntilClipboardIsRestored() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("Original clipboard", forType: .string)
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.pasteboardProvider = { pasteboard }
+        textInsertionService.focusedTextElementOverride = { nil }
+        textInsertionService.defaultPasteFallbackRestoreDelay = .milliseconds(80)
+
+        let pasteStarted = expectation(description: "synthetic paste started")
+        var pasteCount = 0
+        textInsertionService.pasteSimulatorOverride = {
+            pasteCount += 1
+            pasteStarted.fulfill()
+        }
+
+        let store = RecentTranscriptionStore()
+        store.recordTranscription(
+            id: UUID(),
+            finalText: "Newest transcription",
+            timestamp: Date(),
+            appName: "Messages",
+            appBundleIdentifier: "com.apple.MobileSMS"
+        )
+
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: store,
+            paletteController: SelectionPaletteControllerSpy()
+        )
+        handler.getPreserveClipboard = { true }
+
+        handler.insertLatest(currentState: .idle)
+        handler.insertLatest(currentState: .idle)
+
+        await fulfillment(of: [pasteStarted], timeout: 1.0)
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Newest transcription")
+
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Original clipboard")
+    }
+
+    func testPaletteSelectionCannotOverlapLatestInsertionClipboardRestore() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("Original clipboard", forType: .string)
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.pasteboardProvider = { pasteboard }
+        textInsertionService.focusedTextElementOverride = { nil }
+        textInsertionService.defaultPasteFallbackRestoreDelay = .milliseconds(80)
+
+        let pasteStarted = expectation(description: "synthetic paste started")
+        var pasteCount = 0
+        textInsertionService.pasteSimulatorOverride = {
+            pasteCount += 1
+            pasteStarted.fulfill()
+        }
+
+        let store = RecentTranscriptionStore()
+        let id = UUID()
+        store.recordTranscription(
+            id: id,
+            finalText: "Newest transcription",
+            timestamp: Date(),
+            appName: "Messages",
+            appBundleIdentifier: "com.apple.MobileSMS"
+        )
+
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(
+            textInsertionService: textInsertionService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: store,
+            paletteController: controller
+        )
+        handler.getPreserveClipboard = { true }
+
+        handler.triggerSelection(currentState: .idle)
+        handler.insertLatest(currentState: .idle)
+        controller.select(id: id)
+
+        await fulfillment(of: [pasteStarted], timeout: 1.0)
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Newest transcription")
+
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Original clipboard")
+    }
+
+    func testWorkflowPaletteIncludesManualWorkflows() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", nil, nil) }
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(
+                text: "Selected text",
+                element: AXUIElementCreateSystemWide()
+            )
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        _ = workflowService.addWorkflow(
+            name: "Manual Summary",
+            template: .summary,
+            trigger: .manual()
+        )
+        let recentTranscriptionStore = RecentTranscriptionStore()
+        recentTranscriptionStore.recordTranscription(
+            id: UUID(),
+            finalText: "Recovered field text",
+            timestamp: Date(),
+            appName: "Notes",
+            appBundleIdentifier: "com.apple.Notes"
+        )
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: recentTranscriptionStore,
+            promptProcessingService: PromptProcessingService(),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastEntryDescriptions, ["workflow:Manual Summary", "recent:Recovered field text"])
+        XCTAssertEqual(controller.lastSourceText, "Selected text")
+    }
+
+    func testWorkflowPaletteIncludesInlineCommandDictationWorkflow() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", nil, nil) }
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(
+                text: "The meeting is Friday.",
+                element: AXUIElementCreateSystemWide()
+            )
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        _ = workflowService.addWorkflow(
+            name: "Inline Commands",
+            template: .dictation,
+            trigger: .manual(),
+            behavior: WorkflowBehavior(inlineCommandsEnabled: true)
+        )
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastEntryDescriptions, ["workflow:Inline Commands"])
+    }
+}
+
+@MainActor
+final class PromptPaletteHandlerTests: XCTestCase {
+    func testDirectWorkflowHotkeyProcessesAccessibilitySelectionWithoutShowingPalette() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        let selectedElement = AXUIElementCreateSystemWide()
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(text: "Selected source", element: selectedElement)
+        }
+
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            return true
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        let workflow = Workflow(
+            name: "Direct Summary",
+            template: .summary,
+            trigger: .hotkeys([
+                UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)
+            ], behavior: .processSelectedText)
+        )
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, _, _, _, _ in "Processed: Selected source" },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(controller.isVisible)
+        XCTAssertEqual(insertedText, "Processed: Selected source")
+    }
+
+    func testDirectInlineCommandDictationWorkflowProcessesAccessibilitySelection() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(
+                text: "The meeting is Friday. Write this as a friendly email.",
+                element: AXUIElementCreateSystemWide()
+            )
+        }
+
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            return true
+        }
+
+        let workflow = Workflow(
+            name: "Inline Commands Dictation",
+            template: .dictation,
+            trigger: .manual(),
+            behavior: WorkflowBehavior(inlineCommandsEnabled: true)
+        )
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: WorkflowService(appSupportDirectory: appSupportDirectory),
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, _, _, _, _ in "Friendly email" },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: PromptPaletteControllerSpy()
+        )
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(insertedText, "Friendly email")
+    }
+
+    func testDirectWorkflowHotkeyAutoRichTextUsesResolvedPasteboardPayload() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Pages", "com.apple.iWork.Pages", nil) }
+        let selectedElement = AXUIElementCreateSystemWide()
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(text: "Selected source", element: selectedElement)
+        }
+
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            return true
+        }
+
+        let pasteboard = NSPasteboard.general
+        let savedClipboard = textInsertionService.saveClipboard(from: pasteboard)
+        defer { textInsertionService.restoreClipboard(savedClipboard, to: pasteboard) }
+        pasteboard.clearContents()
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        let workflow = Workflow(
+            name: "Direct Rich Summary",
+            template: .summary,
+            trigger: .hotkeys([
+                UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)
+            ], behavior: .processSelectedText),
+            output: WorkflowOutput(format: "auto")
+        )
+
+        var capturedPrompt: String?
+        var pasteCount = 0
+        let pasteExpectation = expectation(description: "Rich-text workflow pastes its result")
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { prompt, _, _, _, _ in
+                    capturedPrompt = prompt
+                    return "**Launch**\n- Budget"
+                },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller,
+            activateAppForInsertionOverride: { _ in
+                return true
+            }
+        )
+        textInsertionService.pasteSimulatorOverride = {
+            pasteCount += 1
+            pasteExpectation.fulfill()
+        }
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        await fulfillment(of: [pasteExpectation], timeout: 2.0)
+
+        XCTAssertFalse(controller.isVisible)
+        XCTAssertNil(insertedText)
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertTrue(capturedPrompt?.contains("Return Markdown-compatible text for rich-text conversion.") == true)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Launch\n- Budget")
+        XCTAssertNotNil(pasteboard.data(forType: .rtf))
+    }
+
+    func testDirectWorkflowHotkeyRoutesProcessedTextToActionPluginInsteadOfInsertion() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let previousPluginManager = PluginManager.shared
+        let actionPlugin = PromptPaletteActionPluginSpy()
+        PluginManager.shared = PluginManager(appSupportDirectory: appSupportDirectory)
+        PluginManager.shared.loadedPlugins = [
+            LoadedPlugin(
+                manifest: PluginManifest(
+                    id: PromptPaletteActionPluginSpy.pluginId,
+                    name: PromptPaletteActionPluginSpy.pluginName,
+                    version: "1.0.0",
+                    principalClass: "PromptPaletteActionPluginSpy",
+                    requiresAPIKey: false
+                ),
+                instance: actionPlugin,
+                bundle: Bundle.main,
+                sourceURL: appSupportDirectory,
+                isEnabled: true
+            )
+        ]
+        defer { PluginManager.shared = previousPluginManager }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        let selectedElement = AXUIElementCreateSystemWide()
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(text: "Selected source", element: selectedElement)
+        }
+
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            return true
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        let workflow = Workflow(
+            name: "Send to Action",
+            template: .summary,
+            trigger: .hotkeys([
+                UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)
+            ], behavior: .processSelectedText),
+            output: WorkflowOutput(targetActionPluginId: actionPlugin.actionId)
+        )
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, _, _, _, _ in "Processed: Selected source" },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: PromptPaletteControllerSpy()
+        )
+
+        var routedInput: String?
+        var routedOriginalText: String?
+        handler.executeActionPlugin = { plugin, pluginId, text, _, originalText, _ in
+            routedInput = text
+            routedOriginalText = originalText
+            XCTAssertEqual(pluginId, actionPlugin.actionId)
+            XCTAssertTrue(plugin === actionPlugin)
+        }
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(routedInput, "Processed: Selected source")
+        XCTAssertEqual(routedOriginalText, "Selected source")
+        XCTAssertNil(insertedText)
+    }
+
+    func testDirectWorkflowHotkeyUsesClipboardFallbackWhenSelectionIsUnavailable() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        textInsertionService.textSelectionOverride = { nil }
+        textInsertionService.textSelectionViaCopyOverride = { nil }
+        textInsertionService.focusedTextElementOverride = { AXUIElementCreateSystemWide() }
+
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            return true
+        }
+
+        let pasteboard = NSPasteboard.general
+        let savedClipboard = textInsertionService.saveClipboard(from: pasteboard)
+        defer { textInsertionService.restoreClipboard(savedClipboard, to: pasteboard) }
+        pasteboard.clearContents()
+        pasteboard.setString("Clipboard source", forType: .string)
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        let workflow = Workflow(
+            name: "Direct Cleanup",
+            template: .cleanedText,
+            trigger: .hotkeys([
+                UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)
+            ], behavior: .processSelectedText)
+        )
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, _, _, _, _ in "Processed: Clipboard source" },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: PromptPaletteControllerSpy()
+        )
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(insertedText, "Processed: Clipboard source")
+    }
+
+    func testDirectWorkflowHotkeyShowsErrorWhenNoSelectionOrClipboardIsAvailable() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        textInsertionService.textSelectionOverride = { nil }
+        textInsertionService.textSelectionViaCopyOverride = { nil }
+
+        let pasteboard = NSPasteboard.general
+        let savedClipboard = textInsertionService.saveClipboard(from: pasteboard)
+        defer { textInsertionService.restoreClipboard(savedClipboard, to: pasteboard) }
+        pasteboard.clearContents()
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        let workflow = Workflow(
+            name: "Direct Empty",
+            template: .cleanedText,
+            trigger: .hotkeys([
+                UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)
+            ], behavior: .processSelectedText)
+        )
+
+        var processedText: String?
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, text, _, _, _ in
+                    processedText = text
+                    return "Processed: \(text)"
+                },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: PromptPaletteControllerSpy()
+        )
+
+        var feedbackMessage: String?
+        var errorMessage: String?
+        handler.onShowNotchFeedback = { message, _, _, _, _ in
+            feedbackMessage = message
+        }
+        handler.onShowError = { message in
+            errorMessage = message
+        }
+
+        handler.processWorkflowDirectly(
+            workflow: workflow,
+            currentState: .idle,
+            soundFeedbackEnabled: false
+        )
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(processedText)
+        XCTAssertEqual(feedbackMessage, "Please select or copy some text first.")
+        XCTAssertEqual(errorMessage, "Please select or copy some text first.")
+    }
+
+    func testWorkflowPaletteShowsRecentTranscriptionsWhenNoTextContextExists() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        var didCaptureActiveApp = false
+        textInsertionService.captureActiveAppOverride = {
+            didCaptureActiveApp = true
+            return ("Notes", "com.apple.Notes", nil)
+        }
+        textInsertionService.textSelectionOverride = { nil }
+        textInsertionService.textSelectionViaCopyOverride = { nil }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+
+        let recentTranscriptionStore = RecentTranscriptionStore()
+        recentTranscriptionStore.recordTranscription(
+            id: UUID(),
+            finalText: "Recovered field text",
+            timestamp: Date(),
+            appName: "Notes",
+            appBundleIdentifier: "com.apple.Notes"
+        )
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: recentTranscriptionStore,
+            promptProcessingService: PromptProcessingService(),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        var shownError: String?
+        handler.onShowError = { shownError = $0 }
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastEntryDescriptions, ["recent:Recovered field text"])
+        XCTAssertNil(controller.lastSourceText)
+        XCTAssertNil(shownError)
+        XCTAssertFalse(didCaptureActiveApp)
+    }
+
+    func testWorkflowPaletteRecentSelectionInsertsWithoutAutoEnter() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Messages", "com.apple.MobileSMS", nil) }
+        textInsertionService.textSelectionOverride = { nil }
+        textInsertionService.textSelectionViaCopyOverride = { nil }
+
+        let generalPasteboard = NSPasteboard.general
+        let savedClipboard = textInsertionService.saveClipboard(from: generalPasteboard)
+        defer { textInsertionService.restoreClipboard(savedClipboard, to: generalPasteboard) }
+        generalPasteboard.clearContents()
+
+        let insertionPasteboard = NSPasteboard.withUniqueName()
+        textInsertionService.pasteboardProvider = { insertionPasteboard }
+
+        var pasteCount = 0
+        var returnCount = 0
+        textInsertionService.pasteSimulatorOverride = { pasteCount += 1 }
+        textInsertionService.returnSimulatorOverride = { returnCount += 1 }
+
+        let recentTranscriptionStore = RecentTranscriptionStore()
+        let recentID = UUID()
+        recentTranscriptionStore.recordTranscription(
+            id: recentID,
+            finalText: "Insert recovered text",
+            timestamp: Date(),
+            appName: "Messages",
+            appBundleIdentifier: "com.apple.MobileSMS"
+        )
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: WorkflowService(appSupportDirectory: appSupportDirectory),
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: recentTranscriptionStore,
+            promptProcessingService: PromptProcessingService(),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+        try await Task.sleep(for: .milliseconds(50))
+        controller.selectRecent(id: recentID)
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(returnCount, 0)
+        XCTAssertEqual(insertionPasteboard.string(forType: .string), "Insert recovered text")
+    }
+
+    func testWorkflowPaletteWorkflowSelectionProcessesOriginalTextContext() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        let selectedElement = AXUIElementCreateSystemWide()
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(text: "Selected source", element: selectedElement)
+        }
+
+        let insertionCompleted = expectation(description: "Workflow result inserted")
+        var insertedText: String?
+        textInsertionService.insertTextAtOverride = { _, text in
+            insertedText = text
+            insertionCompleted.fulfill()
+            return true
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        _ = workflowService.addWorkflow(
+            name: "Palette Cleanup",
+            template: .cleanedText,
+            trigger: .manual()
+        )
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: PromptProcessingService(),
+            workflowTextProcessingService: WorkflowTextProcessingService(
+                promptProcessor: { _, text, _, _, _ in "Processed: \(text)" },
+                appleTranslator: nil
+            ),
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastEntryDescriptions, ["workflow:Palette Cleanup"])
+        controller.selectWorkflow(named: "Palette Cleanup")
+
+        await fulfillment(of: [insertionCompleted], timeout: 5.0)
+
+        XCTAssertEqual(insertedText, "Processed: Selected source")
+    }
+
+    func testTriggerSelectionStillOpensPaletteWhenCurrentProviderIsNotReady() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let previousPluginManager = PluginManager.shared
+        PluginManager.shared = PluginManager()
+        defer { PluginManager.shared = previousPluginManager }
+
+        let textInsertionService = TextInsertionService()
+        textInsertionService.accessibilityGrantedOverride = true
+        textInsertionService.captureActiveAppOverride = { ("Notes", nil, nil) }
+        textInsertionService.textSelectionOverride = {
+            TextInsertionService.TextSelection(
+                text: "Selected text",
+                element: AXUIElementCreateSystemWide()
+            )
+        }
+
+        let workflowService = WorkflowService(appSupportDirectory: appSupportDirectory)
+        _ = workflowService.addWorkflow(
+            name: "Translate",
+            template: .translation,
+            trigger: .hotkey(UnifiedHotkey(keyCode: 17, modifierFlags: 0, isFn: false)),
+            behavior: WorkflowBehavior(settings: ["targetLanguage": "German"])
+        )
+
+        let suiteName = "RecentTranscriptionPaletteHandlerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let promptProcessingService = PromptProcessingService(userDefaults: defaults)
+        promptProcessingService.selectedProviderId = "missing-provider"
+
+        let controller = PromptPaletteControllerSpy()
+        let handler = PromptPaletteHandler(
+            textInsertionService: textInsertionService,
+            workflowService: workflowService,
+            historyService: HistoryService(appSupportDirectory: appSupportDirectory),
+            recentTranscriptionStore: RecentTranscriptionStore(),
+            promptProcessingService: promptProcessingService,
+            soundService: SoundService(),
+            accessibilityAnnouncementService: AccessibilityAnnouncementService(),
+            promptPaletteController: controller
+        )
+
+        var shownError: String?
+        handler.onShowError = { shownError = $0 }
+
+        handler.triggerSelection(currentState: .idle, soundFeedbackEnabled: false)
+
+        XCTAssertTrue(controller.isVisible)
+        XCTAssertEqual(controller.lastEntryDescriptions, ["workflow:Translate"])
+        XCTAssertEqual(controller.lastSourceText, "Selected text")
+        XCTAssertNil(shownError)
+    }
+}
+
+private final class PromptPaletteActionPluginSpy: NSObject, ActionPlugin, @unchecked Sendable {
+    static let pluginId = "plugin.action"
+    static let pluginName = "Action Plugin"
+
+    let actionName = "Send to Action"
+    let actionId = "plugin.action"
+    let actionIcon = "paperplane"
+
+    required override init() {
+        super.init()
+    }
+
+    func activate(host: HostServices) {}
+
+    func deactivate() {}
+
+    func execute(input: String, context: ActionContext) async throws -> ActionResult {
+        ActionResult(success: true, message: "Done")
+    }
+}
+
+@MainActor
+final class SelectionPaletteControllerTests: XCTestCase {
+    func testHostedPaletteDoesNotPropagateSwiftUISizingIntoPanelConstraints() throws {
+        let controller = SelectionPaletteController()
+        controller.show(
+            configuration: SelectionPaletteConfiguration(
+                panelWidth: 420,
+                panelHeight: 360,
+                searchPrompt: "Search prompts",
+                emptyStateTitle: "No prompts"
+            ),
+            items: [
+                SelectionPaletteItem(id: UUID(), title: "Translate to English"),
+                SelectionPaletteItem(id: UUID(), title: "Summarize"),
+            ],
+            onSelect: { _ in }
+        )
+        defer { controller.hide() }
+
+        let panel = try XCTUnwrap(activePanel(in: controller))
+        let hostingView = try XCTUnwrap(panel.contentView as? any HostingSizingOptionsProviding)
+
+        XCTAssertEqual(hostingView.sizingOptions, [])
+    }
+
+    private func activePanel(in controller: SelectionPaletteController) -> NSPanel? {
+        Mirror(reflecting: controller)
+            .descendant("panel", "some") as? NSPanel
+    }
+}
+
+@MainActor
+private protocol HostingSizingOptionsProviding {
+    var sizingOptions: NSHostingSizingOptions { get }
+}
+
+extension NSHostingView: HostingSizingOptionsProviding {}
+
+#if canImport(Translation)
+@available(macOS 15, *)
+@MainActor
+final class TranslationHostWindowTests: XCTestCase {
+    func testHostedTranslationViewDoesNotPropagateSwiftUISizingIntoWindowConstraints() throws {
+        let window = TranslationHostWindow(translationService: TranslationService())
+        defer { window.orderOut(nil) }
+
+        let hostingView = try XCTUnwrap(window.contentView as? any HostingSizingOptionsProviding)
+
+        XCTAssertEqual(hostingView.sizingOptions, [])
+    }
+
+    func testOffscreenHostWindowStaysAtOrAboveMinimumWindowLevel() {
+        let window = TranslationHostWindow(translationService: TranslationService())
+        defer { window.orderOut(nil) }
+
+        XCTAssertGreaterThanOrEqual(
+            window.level.rawValue,
+            Int(CGWindowLevelForKey(.minimumWindow))
+        )
+        XCTAssertTrue(window.isVisible)
+    }
+}
+#endif
+
+@MainActor
+final class SelectionPaletteInteractionModelTests: XCTestCase {
+    func testArrowKeysMoveSelectionAndReturnSelectsCurrentItem() throws {
+        let items = [
+            SelectionPaletteItem(id: UUID(), title: "First"),
+            SelectionPaletteItem(id: UUID(), title: "Second"),
+            SelectionPaletteItem(id: UUID(), title: "Third"),
+        ]
+        var selectedID: UUID?
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(emptyStateTitle: "Empty"),
+            items: items,
+            onSelect: { selectedID = $0.id },
+            onDismiss: {}
+        )
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 125, characters: "")))
+        XCTAssertEqual(model.selectedIndex, 1)
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 36, characters: "\r")))
+        XCTAssertEqual(selectedID, items[1].id)
+    }
+
+    func testArrowKeysWrapSelectionAtListEdges() throws {
+        let items = [
+            SelectionPaletteItem(id: UUID(), title: "First"),
+            SelectionPaletteItem(id: UUID(), title: "Second"),
+            SelectionPaletteItem(id: UUID(), title: "Third"),
+        ]
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(emptyStateTitle: "Empty"),
+            items: items,
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 126, characters: "")))
+        XCTAssertEqual(model.selectedIndex, 2)
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 125, characters: "")))
+        XCTAssertEqual(model.selectedIndex, 0)
+    }
+
+    func testTypingAndDeleteUpdateSearchTextAndFilteredItems() throws {
+        let items = [
+            SelectionPaletteItem(id: UUID(), title: "Translate"),
+            SelectionPaletteItem(id: UUID(), title: "Summarize"),
+        ]
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(
+                searchPrompt: "Search",
+                emptyStateTitle: "Empty"
+            ),
+            items: items,
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 1, characters: "s")))
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 17, characters: "u")))
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 46, characters: "m")))
+        XCTAssertEqual(model.searchText, "sum")
+        XCTAssertEqual(model.filteredItems.map(\.title), ["Summarize"])
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 51, characters: "")))
+        XCTAssertEqual(model.searchText, "su")
+        XCTAssertEqual(model.filteredItems.map(\.title), ["Summarize"])
+    }
+
+    func testEscapeDismissesPalette() throws {
+        var dismissCount = 0
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(emptyStateTitle: "Empty"),
+            items: [SelectionPaletteItem(id: UUID(), title: "Only")],
+            onSelect: { _ in },
+            onDismiss: { dismissCount += 1 }
+        )
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 53, characters: "")))
+        XCTAssertEqual(dismissCount, 1)
+    }
+
+    func testUpdateSwapsLevelInPlace() throws {
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(emptyStateTitle: "Empty"),
+            items: [SelectionPaletteItem(id: UUID(), title: "First")],
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        var selectedID: UUID?
+        let secondLevelItems = [
+            SelectionPaletteItem(id: UUID(), title: "Alpha"),
+            SelectionPaletteItem(id: UUID(), title: "Beta"),
+        ]
+        model.update(
+            configuration: SelectionPaletteConfiguration(
+                emptyStateTitle: "Empty",
+                initialSelectedIndex: 1
+            ),
+            items: secondLevelItems,
+            onSelect: { selectedID = $0.id },
+            onDismiss: {}
+        )
+
+        XCTAssertEqual(model.filteredItems.map(\.title), ["Alpha", "Beta"])
+        XCTAssertEqual(model.selectedIndex, 1)
+        XCTAssertEqual(model.searchText, "")
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 36, characters: "\r")))
+        XCTAssertEqual(selectedID, secondLevelItems[1].id)
+    }
+
+    func testUpdateClampsOutOfRangeInitialSelectedIndex() {
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(emptyStateTitle: "Empty"),
+            items: [SelectionPaletteItem(id: UUID(), title: "First")],
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        model.update(
+            configuration: SelectionPaletteConfiguration(
+                emptyStateTitle: "Empty",
+                initialSelectedIndex: 99
+            ),
+            items: [SelectionPaletteItem(id: UUID(), title: "Only")],
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        XCTAssertEqual(model.selectedIndex, 0)
+    }
+
+    func testSecondaryItemsJoinSearchResults() throws {
+        let model = SelectionPaletteInteractionModel(
+            configuration: SelectionPaletteConfiguration(
+                searchPrompt: "Search",
+                emptyStateTitle: "Empty",
+                secondaryItems: [
+                    SelectionPaletteItem(id: UUID(), title: "hello world"),
+                    SelectionPaletteItem(id: UUID(), title: "unrelated"),
+                ]
+            ),
+            items: [SelectionPaletteItem(id: UUID(), title: "Summarize")],
+            onSelect: { _ in },
+            onDismiss: {}
+        )
+
+        // Without typing, secondary items stay hidden.
+        XCTAssertEqual(model.filteredItems.map(\.title), ["Summarize"])
+
+        XCTAssertTrue(model.handleKeyDown(try keyEvent(keyCode: 4, characters: "h")))
+        XCTAssertEqual(model.filteredItems.map(\.title), ["hello world"])
+    }
+
+    private func keyEvent(
+        keyCode: UInt16,
+        characters: String,
+        modifierFlags: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: modifierFlags,
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: characters,
+                charactersIgnoringModifiers: characters,
+                isARepeat: false,
+                keyCode: keyCode
+            )
+        )
+    }
+}
+
+@MainActor
+private final class PromptPaletteControllerSpy: PromptPaletteControlling {
+    private(set) var isVisible = false
+    private(set) var lastEntries: [PromptPaletteEntry]?
+    private(set) var lastSourceText: String?
+    private var onSelect: ((PromptPaletteEntry) -> Void)?
+
+    var lastEntryDescriptions: [String] {
+        lastEntries?.map { entry in
+            switch entry {
+            case .workflow(let workflow):
+                return "workflow:\(workflow.name)"
+            case .recentTranscription(let recentEntry):
+                return "recent:\(recentEntry.finalText)"
+            }
+        } ?? []
+    }
+
+    func show(entries: [PromptPaletteEntry], sourceText: String?, onSelect: @escaping (PromptPaletteEntry) -> Void) {
+        isVisible = true
+        lastEntries = entries
+        lastSourceText = sourceText
+        self.onSelect = onSelect
+    }
+
+    func hide() {
+        isVisible = false
+    }
+
+    func selectWorkflow(named name: String) {
+        guard let entry = lastEntries?.first(where: { entry in
+            if case .workflow(let workflow) = entry {
+                return workflow.name == name
+            }
+            return false
+        }) else { return }
+        onSelect?(entry)
+    }
+
+    func selectRecent(id: UUID) {
+        guard let entry = lastEntries?.first(where: { entry in
+            if case .recentTranscription(let recentEntry) = entry {
+                return recentEntry.id == id
+            }
+            return false
+        }) else { return }
+        onSelect?(entry)
+    }
+}
+
+@MainActor
+private final class SelectionPaletteControllerSpy: SelectionPaletteControlling {
+    private(set) var isVisible = false
+    private(set) var lastConfiguration: SelectionPaletteConfiguration?
+    private(set) var lastItems: [SelectionPaletteItem]?
+    private var onSelect: ((SelectionPaletteItem) -> Void)?
+
+    func show(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void,
+        onEscape: (() -> Void)?
+    ) {
+        isVisible = true
+        lastConfiguration = configuration
+        lastItems = items
+        self.onSelect = onSelect
+    }
+
+    func hide() {
+        isVisible = false
+    }
+
+    func select(id: UUID) {
+        guard let item = lastItems?.first(where: { $0.id == id }) else { return }
+        onSelect?(item)
+    }
+}

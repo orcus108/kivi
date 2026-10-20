@@ -1,0 +1,565 @@
+import AppKit
+import SwiftUI
+
+struct SelectionPaletteItem: Identifiable, Equatable {
+    let id: UUID
+    let title: String
+    let subtitle: String?
+    let iconSystemName: String?
+    let searchTokens: [String]
+
+    init(
+        id: UUID,
+        title: String,
+        subtitle: String? = nil,
+        iconSystemName: String? = nil,
+        searchTokens: [String] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.iconSystemName = iconSystemName
+        self.searchTokens = searchTokens
+    }
+}
+
+struct SelectionPaletteConfiguration: Equatable {
+    let panelWidth: CGFloat
+    let panelHeight: CGFloat
+    let previewText: String?
+    let previewLineLimit: Int
+    let titleLineLimit: Int
+    let searchPrompt: String?
+    let emptyStateTitle: String
+    /// Items that stay hidden until the user types in the search field, then
+    /// join the filtered results. Lets a multi-level palette surface
+    /// deeper-level matches (e.g. recent transcriptions) from the top level.
+    /// Mutable so multi-level flows can derive a configuration from a base
+    /// one and fill in the level-specific items before presenting.
+    var secondaryItems: [SelectionPaletteItem]
+    /// The row selected when the palette is (re)presented — e.g. the group
+    /// item the user drilled in from when backing out with Escape. Nil selects
+    /// the first row.
+    var initialSelectedIndex: Int?
+
+    init(
+        panelWidth: CGFloat = 380,
+        panelHeight: CGFloat = 400,
+        previewText: String? = nil,
+        previewLineLimit: Int = 3,
+        titleLineLimit: Int = 1,
+        searchPrompt: String? = nil,
+        emptyStateTitle: String,
+        secondaryItems: [SelectionPaletteItem] = [],
+        initialSelectedIndex: Int? = nil
+    ) {
+        self.panelWidth = panelWidth
+        self.panelHeight = panelHeight
+        self.previewText = previewText
+        self.previewLineLimit = previewLineLimit
+        self.titleLineLimit = titleLineLimit
+        self.searchPrompt = searchPrompt
+        self.emptyStateTitle = emptyStateTitle
+        self.secondaryItems = secondaryItems
+        self.initialSelectedIndex = initialSelectedIndex
+    }
+
+    var showsSearchField: Bool { searchPrompt != nil }
+}
+
+@MainActor
+protocol SelectionPaletteControlling: AnyObject {
+    var isVisible: Bool { get }
+    /// Presents the palette. `onEscape` replaces the default Escape behavior
+    /// (hiding the palette) for this presentation only — used by multi-level
+    /// palettes to return to the previous level instead of dismissing.
+    /// Pass nil to keep the historical hide-on-Escape behavior.
+    func show(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void,
+        onEscape: (() -> Void)?
+    )
+    func hide()
+}
+
+extension SelectionPaletteControlling {
+    /// Presents the palette with the default hide-on-Escape behavior.
+    /// (A protocol-extension overload, since Swift forbids default arguments
+    /// in protocol methods.)
+    func show(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void
+    ) {
+        show(configuration: configuration, items: items, onSelect: onSelect, onEscape: nil)
+    }
+}
+
+@MainActor
+final class SelectionPaletteInteractionModel: ObservableObject {
+    @Published var configuration: SelectionPaletteConfiguration
+
+    @Published var searchText = "" {
+        didSet {
+            if searchText != oldValue {
+                selectedIndex = 0
+            }
+        }
+    }
+    @Published private(set) var selectedIndex = 0
+
+    @Published private var items: [SelectionPaletteItem]
+    private var onSelect: (SelectionPaletteItem) -> Void
+    private var onDismiss: () -> Void
+
+    init(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        self.configuration = configuration
+        self.items = items
+        self.onSelect = onSelect
+        self.onDismiss = onDismiss
+    }
+
+    /// Swaps the presented level in place: new items, handlers, and size, but
+    /// the same panel on the same screen, so drill-in/drill-out never jumps.
+    func update(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        self.configuration = configuration
+        self.items = items
+        self.onSelect = onSelect
+        self.onDismiss = onDismiss
+        searchText = ""
+        let maxIndex = max(items.count - 1, 0)
+        selectedIndex = min(configuration.initialSelectedIndex ?? 0, maxIndex)
+    }
+
+    var filteredItems: [SelectionPaletteItem] {
+        guard configuration.showsSearchField, !searchText.isEmpty else {
+            return items
+        }
+
+        return items.filter(matchesSearch) + configuration.secondaryItems.filter(matchesSearch)
+    }
+
+    private func matchesSearch(_ item: SelectionPaletteItem) -> Bool {
+        item.title.localizedCaseInsensitiveContains(searchText)
+            || (item.subtitle?.localizedCaseInsensitiveContains(searchText) ?? false)
+            || item.searchTokens.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
+    }
+
+    func handleKeyDown(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 125: // Down arrow
+            moveSelection(by: 1)
+            return true
+        case 126: // Up arrow
+            moveSelection(by: -1)
+            return true
+        case 36, 76: // Return, keypad enter
+            acceptSelection()
+            return true
+        case 53: // Escape
+            onDismiss()
+            return true
+        case 51, 117: // Delete, forward delete
+            guard configuration.showsSearchField else { return false }
+            deleteBackward()
+            return true
+        default:
+            guard configuration.showsSearchField, let typedText = event.selectionPaletteTypedText else {
+                return false
+            }
+            searchText.append(typedText)
+            return true
+        }
+    }
+
+    func selectItem(_ item: SelectionPaletteItem) {
+        onSelect(item)
+    }
+
+    private func moveSelection(by offset: Int) {
+        guard !filteredItems.isEmpty else { return }
+        let itemCount = filteredItems.count
+        selectedIndex = (selectedIndex + offset + itemCount) % itemCount
+    }
+
+    private func acceptSelection() {
+        guard let item = filteredItems[safe: selectedIndex] else { return }
+        onSelect(item)
+    }
+
+    private func deleteBackward() {
+        guard !searchText.isEmpty else { return }
+        searchText.removeLast()
+    }
+}
+
+private struct SelectionPaletteContentView: View {
+    @ObservedObject var model: SelectionPaletteInteractionModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let previewText = model.configuration.previewText {
+                Text(previewText)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(model.configuration.previewLineLimit)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+
+                Divider()
+            }
+
+            if let searchPrompt = model.configuration.searchPrompt {
+                SelectionPaletteSearchField(
+                    prompt: searchPrompt,
+                    text: model.searchText
+                )
+                .padding(.horizontal, 12)
+                .padding(.top, model.configuration.previewText == nil ? 12 : 10)
+                .padding(.bottom, 10)
+            }
+
+            if model.filteredItems.isEmpty {
+                VStack(spacing: 8) {
+                    Text(model.configuration.emptyStateTitle)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.vertical, 20)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(Array(model.filteredItems.enumerated()), id: \.element.id) { index, item in
+                                SelectionPaletteRow(
+                                    item: item,
+                                    isSelected: index == model.selectedIndex,
+                                    titleLineLimit: model.configuration.titleLineLimit
+                                )
+                                .id(index)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    model.selectItem(item)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                    }
+                    .onChange(of: model.selectedIndex) { _, newValue in
+                        proxy.scrollTo(newValue, anchor: .center)
+                    }
+                }
+            }
+        }
+        .frame(width: model.configuration.panelWidth, height: model.configuration.panelHeight)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.28), radius: 24, y: 12)
+    }
+}
+
+private struct SelectionPaletteSearchField: View {
+    let prompt: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .accessibilityHidden(true)
+
+            HStack(spacing: 1) {
+                Text(text.isEmpty ? prompt : text)
+                    .foregroundColor(text.isEmpty ? .secondary : .primary)
+
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.85))
+                    .frame(width: 1, height: 13)
+            }
+            .font(.system(size: 14, weight: .medium))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.045))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(prompt)
+        .accessibilityValue(text)
+    }
+}
+
+private struct SelectionPaletteRow: View {
+    let item: SelectionPaletteItem
+    let isSelected: Bool
+    let titleLineLimit: Int
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            if let iconSystemName = item.iconSystemName {
+                ZStack {
+                    Circle()
+                        .fill(isSelected ? Color.white.opacity(0.14) : Color.accentColor.opacity(0.12))
+                        .frame(width: 28, height: 28)
+
+                    Image(systemName: iconSystemName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(isSelected ? .white : .accentColor)
+                        .accessibilityHidden(true)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: item.subtitle == nil ? 0 : 2) {
+                Text(item.title)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundColor(isSelected ? .white : .primary)
+                    .lineLimit(titleLineLimit)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let subtitle = item.subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(isSelected ? .white.opacity(0.82) : .secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isSelected ? Color.accentColor.opacity(0.22) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(isSelected ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(item.subtitle.map { "\(item.title), \($0)" } ?? item.title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private final class SelectionPalettePanel: NSPanel {
+    var keyDownHandler: ((NSEvent) -> Bool)?
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 300),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        level = .floating
+        collectionBehavior = FloatingPanelSpacePolicy.selectionPaletteCollectionBehavior
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isMovableByWindowBackground = false
+    }
+
+    override var canBecomeKey: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if keyDownHandler?(event) == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func positionOnActiveScreen() {
+        let screen = activeScreen() ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+
+        let screenFrame = screen.visibleFrame
+        let x = screenFrame.midX - frame.width / 2
+        let y = screenFrame.midY + 60
+
+        setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func activeScreen() -> NSScreen? {
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) })
+    }
+}
+
+@MainActor
+final class SelectionPaletteController: SelectionPaletteControlling {
+    private var panel: SelectionPalettePanel?
+    private var hostingView: NSHostingView<SelectionPaletteContentView>?
+    private var interactionModel: SelectionPaletteInteractionModel?
+    private var localClickMonitor: Any?
+    private var globalClickMonitor: Any?
+    /// Bumped on every presentation, so selection/Escape handlers can tell
+    /// whether they navigated to another level instead of dismissing.
+    private var presentationID = UUID()
+
+    var isVisible: Bool { panel != nil }
+
+    func show(
+        configuration: SelectionPaletteConfiguration,
+        items: [SelectionPaletteItem],
+        onSelect: @escaping (SelectionPaletteItem) -> Void,
+        onEscape: (() -> Void)?
+    ) {
+        guard !items.isEmpty else {
+            hide()
+            return
+        }
+
+        let wrappedOnSelect: (SelectionPaletteItem) -> Void = { [weak self] item in
+            guard let self else { return }
+            let presentedID = self.presentationID
+            onSelect(item)
+            // A selection handler that navigates to another level already
+            // presents it — don't dismiss on top of it. Otherwise this
+            // selection dismisses the palette.
+            if self.presentationID == presentedID {
+                self.hide()
+            }
+        }
+        let onDismiss: () -> Void = { [weak self] in
+            guard let self else { return }
+            let presentedID = self.presentationID
+            if let onEscape {
+                onEscape()
+                // If the owner was released, onEscape is a no-op and the
+                // panel would be stranded — hide it instead.
+                if self.presentationID == presentedID {
+                    self.hide()
+                }
+            } else {
+                self.hide()
+            }
+        }
+
+        if let panel, let hostingView, let interactionModel {
+            // Level change: reuse the panel in place so it never jumps to
+            // another screen on drill-in/drill-out.
+            interactionModel.update(
+                configuration: configuration,
+                items: items,
+                onSelect: wrappedOnSelect,
+                onDismiss: onDismiss
+            )
+            let newSize = NSSize(width: configuration.panelWidth, height: configuration.panelHeight)
+            hostingView.frame = NSRect(origin: .zero, size: newSize)
+            panel.setContentSize(newSize)
+            presentationID = UUID()
+            return
+        }
+
+        let interactionModel = SelectionPaletteInteractionModel(
+            configuration: configuration,
+            items: items,
+            onSelect: wrappedOnSelect,
+            onDismiss: onDismiss
+        )
+        self.interactionModel = interactionModel
+
+        let contentView = SelectionPaletteContentView(
+            model: interactionModel
+        )
+
+        let hosting = NSHostingView(rootView: contentView)
+        // The panel owns its fixed content size. Prevent SwiftUI from feeding
+        // intrinsic and min/max sizes back into the window constraint cycle.
+        hosting.sizingOptions = []
+        hosting.translatesAutoresizingMaskIntoConstraints = true
+        hostingView = hosting
+
+        let panelSize = NSSize(width: configuration.panelWidth, height: configuration.panelHeight)
+        let palettePanel = SelectionPalettePanel()
+        palettePanel.contentView = hosting
+        hosting.frame = NSRect(origin: .zero, size: panelSize)
+        palettePanel.setContentSize(panelSize)
+        palettePanel.positionOnActiveScreen()
+        palettePanel.keyDownHandler = { [weak interactionModel] event in
+            interactionModel?.handleKeyDown(event) ?? false
+        }
+
+        panel = palettePanel
+        palettePanel.makeKeyAndOrderFront(nil)
+        presentationID = UUID()
+
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            if let panel = self?.panel, !panel.frame.contains(NSEvent.mouseLocation) {
+                self?.hide()
+            }
+            return event
+        }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            self?.hide()
+        }
+    }
+
+    func hide() {
+        if let monitor = localClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            localClickMonitor = nil
+        }
+        if let monitor = globalClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalClickMonitor = nil
+        }
+        panel?.orderOut(nil)
+        panel = nil
+        hostingView = nil
+        interactionModel = nil
+    }
+}
+
+private extension Collection {
+    subscript(safe index: Index) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
+private extension NSEvent {
+    var selectionPaletteTypedText: String? {
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .function]
+        let modifiers = modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.intersection(disallowedModifiers).isEmpty else {
+            return nil
+        }
+
+        guard let characters, !characters.isEmpty else {
+            return nil
+        }
+
+        let containsControlCharacter = characters.unicodeScalars.contains(where: { scalar in
+            CharacterSet.controlCharacters.contains(scalar)
+        })
+        return containsControlCharacter ? nil : characters
+    }
+}

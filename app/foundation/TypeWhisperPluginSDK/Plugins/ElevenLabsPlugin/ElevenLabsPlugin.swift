@@ -1,0 +1,1082 @@
+import Foundation
+import SwiftUI
+import os
+import TypeWhisperPluginSDK
+
+// Screenshot automation blocks provider requests, so an automatic key check could only fail.
+enum ElevenLabsAutomaticValidationPolicy {
+    static func allowsValidationOnAppear(
+        arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> Bool {
+        !arguments.contains("--store-screenshots")
+    }
+}
+
+private let elevenLabsSupportedLanguages = [
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo",
+    "br", "bs", "ca", "cs", "cy", "da", "de", "el", "en", "es",
+    "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
+    "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja",
+    "jw", "ka", "kk", "km", "kn", "ko", "la", "lb", "ln", "lo",
+    "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt",
+    "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so", "sq",
+    "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+    "tr", "tt", "uk", "ur", "uz", "vi", "vo", "yi", "yo", "yue",
+    "zh",
+]
+
+private actor ElevenLabsTranscriptCollector {
+    private var finals: [String] = []
+    private var interim = ""
+    private var detectedLanguage: String?
+
+    func addFinal(_ text: String, language: String? = nil) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, finals.last != trimmed {
+            finals.append(trimmed)
+        }
+        if let language, !language.isEmpty {
+            detectedLanguage = language
+        }
+        interim = ""
+    }
+
+    func setInterim(_ text: String, language: String? = nil) {
+        interim = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let language, !language.isEmpty {
+            detectedLanguage = language
+        }
+    }
+
+    func currentText() -> String {
+        var parts = finals
+        if !interim.isEmpty {
+            parts.append(interim)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    func finalizedText() -> String {
+        let final = finals.joined(separator: " ")
+        if !final.isEmpty {
+            return final
+        }
+        return currentText()
+    }
+
+    func finalLanguage(fallback: String?) -> String? {
+        detectedLanguage ?? fallback
+    }
+}
+
+private enum ElevenLabsReceivePayload: Sendable {
+    case text(String)
+    case data(Data)
+    case timedOut
+}
+
+enum ElevenLabsTranscriptionMode: String, CaseIterable, Sendable {
+    case automatic
+    case restOnly
+}
+
+enum ElevenLabsTranscriptionTransport: Equatable, Sendable {
+    case rest
+    case realtime
+}
+
+enum ElevenLabsSettingsAccessibility {
+    static let cleanTranscript = "ElevenLabsCleanTranscript"
+    static let audioEvents = "ElevenLabsAudioEvents"
+    static let speakerCount = "ElevenLabsSpeakerCount"
+    static let useDictionaryTerms = "ElevenLabsUseDictionaryTerms"
+}
+
+enum ElevenLabsAPIKeyValidationResult: Equatable, Sendable {
+    case valid
+    case invalid(message: String?)
+
+    var isValid: Bool {
+        if case .valid = self { return true }
+        return false
+    }
+
+    var errorMessage: String? {
+        guard case .invalid(let message) = self else { return nil }
+        return message
+    }
+}
+
+private struct ElevenLabsAPIErrorResponse: Decodable {
+    struct Detail: Decodable {
+        let message: String?
+        let status: String?
+    }
+
+    let detail: Detail?
+}
+
+@objc(ElevenLabsPlugin)
+final class ElevenLabsPlugin: NSObject, DictionaryTermHintTranscriptionEnginePlugin, DictionaryTermsCapabilityProviding, DictionaryTermsBudgetProviding, @unchecked Sendable {
+    static let pluginId = "com.typewhisper.elevenlabs"
+    private static let missingUserReadPermissionMessage =
+        "The API key you used is missing the permission user_read to execute this operation."
+    private static let invalidKeytermCharacters = CharacterSet(charactersIn: "<>{}[]\\")
+    static let pluginName = "ElevenLabs"
+    static let transcriptionModeKey = "transcriptionMode"
+    static let tagAudioEventsKey = "tagAudioEvents"
+    static let noVerbatimKey = "noVerbatim"
+    static let speakerCountKey = "numSpeakers"
+    static let useDictionaryTermsKey = "useDictionaryTerms"
+    static let automaticSpeakerCount = 0
+    static let defaultSpeakerCount = 1
+    static let maximumSpeakerCount = 32
+    static let maximumKeytermCount = 1_000
+    static let maximumKeytermCharacterCount = 49
+    static let maximumKeytermWordCount = 5
+
+    fileprivate var host: HostServices?
+    fileprivate var _apiKey: String?
+    fileprivate var _selectedModelId: String?
+    fileprivate var _transcriptionMode = ElevenLabsTranscriptionMode.automatic
+    fileprivate var _tagAudioEvents = false
+    fileprivate var _noVerbatim = true
+    fileprivate var _speakerCount = ElevenLabsPlugin.defaultSpeakerCount
+    fileprivate var _useDictionaryTerms = true
+
+    private let logger = Logger(subsystem: "com.typewhisper.elevenlabs", category: "Plugin")
+
+    required override init() {
+        super.init()
+    }
+
+    func activate(host: HostServices) {
+        self.host = host
+        _apiKey = host.loadSecret(key: "api-key")
+        _selectedModelId = host.userDefault(forKey: "selectedModel") as? String
+            ?? transcriptionModels.first?.id
+        _transcriptionMode = (host.userDefault(forKey: Self.transcriptionModeKey) as? String)
+            .flatMap(ElevenLabsTranscriptionMode.init(rawValue:))
+            ?? .automatic
+        _tagAudioEvents = host.userDefault(forKey: Self.tagAudioEventsKey) as? Bool ?? false
+        _noVerbatim = host.userDefault(forKey: Self.noVerbatimKey) as? Bool ?? true
+        _speakerCount = Self.normalizedSpeakerCount(
+            host.userDefault(forKey: Self.speakerCountKey) as? Int ?? Self.defaultSpeakerCount
+        )
+        _useDictionaryTerms = host.userDefault(forKey: Self.useDictionaryTermsKey) as? Bool ?? true
+    }
+
+    func deactivate() {
+        host = nil
+    }
+
+    var providerId: String { "elevenlabs" }
+    var providerDisplayName: String { "ElevenLabs" }
+
+    var isConfigured: Bool {
+        guard let key = _apiKey else { return false }
+        return !key.isEmpty
+    }
+
+    var transcriptionModels: [PluginModelInfo] {
+        [
+            PluginModelInfo(id: "scribe_v2", displayName: "Scribe v2"),
+        ]
+    }
+
+    var selectedModelId: String? { _selectedModelId }
+
+    func selectModel(_ modelId: String) {
+        _selectedModelId = modelId
+        host?.setUserDefault(modelId, forKey: "selectedModel")
+    }
+
+    var transcriptionMode: ElevenLabsTranscriptionMode { _transcriptionMode }
+    var tagAudioEvents: Bool { _tagAudioEvents }
+    var noVerbatim: Bool { _noVerbatim }
+    var speakerCount: Int { _speakerCount }
+    var useDictionaryTerms: Bool { _useDictionaryTerms }
+
+    func setTranscriptionMode(_ mode: ElevenLabsTranscriptionMode) {
+        guard _transcriptionMode != mode else { return }
+        _transcriptionMode = mode
+        host?.setUserDefault(mode.rawValue, forKey: Self.transcriptionModeKey)
+        host?.notifyCapabilitiesChanged()
+    }
+
+    func setTagAudioEvents(_ enabled: Bool) {
+        guard _tagAudioEvents != enabled else { return }
+        _tagAudioEvents = enabled
+        host?.setUserDefault(enabled, forKey: Self.tagAudioEventsKey)
+    }
+
+    func setNoVerbatim(_ enabled: Bool) {
+        guard _noVerbatim != enabled else { return }
+        _noVerbatim = enabled
+        host?.setUserDefault(enabled, forKey: Self.noVerbatimKey)
+    }
+
+    func setSpeakerCount(_ speakerCount: Int) {
+        let normalized = Self.normalizedSpeakerCount(speakerCount)
+        guard _speakerCount != normalized else { return }
+        _speakerCount = normalized
+        host?.setUserDefault(normalized, forKey: Self.speakerCountKey)
+    }
+
+    func setUseDictionaryTerms(_ enabled: Bool) {
+        guard _useDictionaryTerms != enabled else { return }
+        _useDictionaryTerms = enabled
+        host?.setUserDefault(enabled, forKey: Self.useDictionaryTermsKey)
+        host?.notifyCapabilitiesChanged()
+    }
+
+    var supportsTranslation: Bool { false }
+    var supportsStreaming: Bool { _transcriptionMode == .automatic }
+    var dictionaryTermsSupport: DictionaryTermsSupport {
+        _useDictionaryTerms ? .supported : .requiresPluginSetting
+    }
+    var dictionaryTermsBudget: DictionaryTermsBudget {
+        DictionaryTermsBudget(
+            maxTerms: Self.maximumKeytermCount,
+            maxCharsPerTerm: Self.maximumKeytermCharacterCount,
+            maxWordsPerTerm: Self.maximumKeytermWordCount
+        )
+    }
+    var supportedLanguages: [String] { elevenLabsSupportedLanguages }
+
+    func transcribe(audio: AudioData, language: String?, translate: Bool, prompt: String?) async throws -> PluginTranscriptionResult {
+        guard let apiKey = _apiKey, !apiKey.isEmpty else {
+            throw PluginTranscriptionError.notConfigured
+        }
+        guard let modelId = _selectedModelId else {
+            throw PluginTranscriptionError.noModelSelected
+        }
+
+        return try await transcribeREST(
+            audio: audio,
+            language: language,
+            modelId: modelId,
+            apiKey: apiKey,
+            keyterms: activeKeyterms(prompt: prompt, dictionaryTermHints: [])
+        )
+    }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) async throws -> PluginTranscriptionResult {
+        guard let apiKey = _apiKey, !apiKey.isEmpty else {
+            throw PluginTranscriptionError.notConfigured
+        }
+        guard let modelId = _selectedModelId else {
+            throw PluginTranscriptionError.noModelSelected
+        }
+
+        return try await transcribeREST(
+            audio: audio,
+            language: language,
+            modelId: modelId,
+            apiKey: apiKey,
+            keyterms: activeKeyterms(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        )
+    }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        onProgress: @Sendable @escaping (String) -> Bool
+    ) async throws -> PluginTranscriptionResult {
+        try await transcribe(
+            audio: audio,
+            language: language,
+            translate: translate,
+            prompt: prompt,
+            dictionaryTermHints: [],
+            onProgress: onProgress
+        )
+    }
+
+    func transcribe(
+        audio: AudioData,
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        onProgress: @Sendable @escaping (String) -> Bool
+    ) async throws -> PluginTranscriptionResult {
+        guard let apiKey = _apiKey, !apiKey.isEmpty else {
+            throw PluginTranscriptionError.notConfigured
+        }
+        guard let modelId = _selectedModelId else {
+            throw PluginTranscriptionError.noModelSelected
+        }
+
+        let keyterms = activeKeyterms(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        if transcriptionTransport(keyterms: keyterms) == .rest {
+            let result = try await transcribeREST(
+                audio: audio,
+                language: language,
+                modelId: modelId,
+                apiKey: apiKey,
+                keyterms: keyterms
+            )
+            _ = onProgress(result.text)
+            return result
+        }
+
+        return try await Self.transcribeWithRESTFallback(
+            realtime: {
+                try await self.transcribeWebSocket(
+                    audio: audio,
+                    language: language,
+                    modelId: modelId,
+                    apiKey: apiKey,
+                    noVerbatim: self._noVerbatim,
+                    onProgress: onProgress
+                )
+            },
+            rest: {
+                try await self.transcribeREST(
+                    audio: audio,
+                    language: language,
+                    modelId: modelId,
+                    apiKey: apiKey,
+                    keyterms: keyterms
+                )
+            },
+            onRealtimeFailure: { error in
+                self.logger.warning("Realtime transcription failed, falling back to REST: \(error.localizedDescription)")
+            }
+        )
+    }
+
+    static func transcribeWithRESTFallback(
+        realtime: () async throws -> PluginTranscriptionResult,
+        rest: () async throws -> PluginTranscriptionResult,
+        onRealtimeFailure: (Error) -> Void = { _ in }
+    ) async throws -> PluginTranscriptionResult {
+        do {
+            return try await realtime()
+        } catch {
+            onRealtimeFailure(error)
+            return try await rest()
+        }
+    }
+
+    private func transcribeREST(
+        audio: AudioData,
+        language: String?,
+        modelId: String,
+        apiKey: String,
+        keyterms: [String]
+    ) async throws -> PluginTranscriptionResult {
+        guard let url = URL(string: "https://api.elevenlabs.io/v1/speech-to-text") else {
+            throw PluginTranscriptionError.apiError("Invalid ElevenLabs REST URL")
+        }
+
+        return try await PluginAudioUploadEncoder.withCompressedM4AUploadWavFallback(from: audio) { uploadFile in
+            let boundary = UUID().uuidString
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 120
+
+            var body = Data()
+            body.appendMultipartFile(
+                boundary: boundary,
+                name: "file",
+                filename: uploadFile.filename,
+                contentType: uploadFile.contentType,
+                data: uploadFile.data
+            )
+            body.appendMultipartField(boundary: boundary, name: "model_id", value: modelId)
+            if let language, !language.isEmpty {
+                body.appendMultipartField(boundary: boundary, name: "language_code", value: language)
+            }
+            body.appendMultipartField(
+                boundary: boundary,
+                name: "tag_audio_events",
+                value: Self.formattedBoolean(_tagAudioEvents)
+            )
+            body.appendMultipartField(
+                boundary: boundary,
+                name: "no_verbatim",
+                value: Self.formattedBoolean(_noVerbatim)
+            )
+            if _speakerCount != Self.automaticSpeakerCount {
+                body.appendMultipartField(
+                    boundary: boundary,
+                    name: "num_speakers",
+                    value: String(_speakerCount)
+                )
+            }
+            if modelId == "scribe_v2" {
+                for term in keyterms {
+                    body.appendMultipartField(boundary: boundary, name: "keyterms", value: term)
+                }
+            }
+            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+            request.httpBody = body
+
+            let (data, response) = try await PluginHTTPClient.data(for: request)
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw PluginTranscriptionError.apiError("No HTTP response")
+            }
+
+            switch httpResponse.statusCode {
+            case 200:
+                if let htmlPageSummary = PluginHTTPErrorBodyFormatter.htmlPageSummary(
+                    from: data,
+                    response: httpResponse
+                ) {
+                    throw PluginTranscriptionError.apiError(
+                        "Invalid ElevenLabs response: \(htmlPageSummary)"
+                    )
+                }
+                return try Self.parseRESTResponse(data, fallbackLanguage: language)
+            case 401:
+                throw PluginTranscriptionError.invalidApiKey
+            case 413:
+                throw PluginTranscriptionError.fileTooLarge
+            case 429:
+                throw PluginTranscriptionError.rateLimited
+            default:
+                let body = PluginHTTPErrorBodyFormatter.summary(from: data, response: httpResponse)
+                throw PluginAudioUploadHTTPFailure(
+                    statusCode: httpResponse.statusCode,
+                    responseData: data,
+                    underlyingError: PluginTranscriptionError.apiError(
+                        "HTTP \(httpResponse.statusCode): \(body)"
+                    )
+                )
+            }
+        }
+    }
+
+    private func transcribeWebSocket(
+        audio: AudioData,
+        language: String?,
+        modelId: String,
+        apiKey: String,
+        noVerbatim: Bool,
+        onProgress: @Sendable @escaping (String) -> Bool
+    ) async throws -> PluginTranscriptionResult {
+        try PluginHTTPClient.ensureNetworkAccessIsAllowed()
+        let url = try Self.realtimeURL(language: language, modelId: modelId, noVerbatim: noVerbatim)
+
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+
+        let wsTask = URLSession.shared.webSocketTask(with: request)
+        wsTask.resume()
+
+        let collector = ElevenLabsTranscriptCollector()
+
+        let receiveTask = Task {
+            var receivedCommittedTranscript = false
+
+            while !Task.isCancelled {
+                let timeout: Duration = receivedCommittedTranscript ? .seconds(1) : .seconds(8)
+                let payload = try await Self.receivePayload(from: wsTask, timeout: timeout)
+
+                let rawText: String
+                switch payload {
+                case .text(let text):
+                    rawText = text
+                case .data(let data):
+                    guard let text = String(data: data, encoding: .utf8) else { continue }
+                    rawText = text
+                case .timedOut:
+                    return
+                }
+
+                guard let data = rawText.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let messageType = json["message_type"] as? String else {
+                    continue
+                }
+
+                switch messageType {
+                case "session_started":
+                    continue
+                case "partial_transcript":
+                    let text = json["text"] as? String ?? ""
+                    await collector.setInterim(text)
+                    let currentText = await collector.currentText()
+                    if !currentText.isEmpty {
+                        _ = onProgress(currentText)
+                    }
+                case "committed_transcript", "committed_transcript_with_timestamps":
+                    receivedCommittedTranscript = true
+                    let text = json["text"] as? String ?? ""
+                    let detectedLanguage = json["language_code"] as? String
+                    await collector.addFinal(text, language: detectedLanguage)
+                    let currentText = await collector.currentText()
+                    if !currentText.isEmpty {
+                        _ = onProgress(currentText)
+                    }
+                default:
+                    if messageType.localizedCaseInsensitiveContains("error") {
+                        throw PluginTranscriptionError.apiError(Self.errorMessage(from: json) ?? rawText)
+                    }
+                }
+            }
+        }
+
+        let pcmData = Self.floatToPCM16(audio.samples)
+        guard !pcmData.isEmpty else {
+            wsTask.cancel(with: .normalClosure, reason: nil)
+            throw PluginTranscriptionError.apiError("No audio available for realtime transcription")
+        }
+
+        let chunkSize = 8192
+        var offset = 0
+
+        while offset < pcmData.count {
+            let end = min(offset + chunkSize, pcmData.count)
+            let chunk = pcmData.subdata(in: offset..<end)
+            let isFinalChunk = end == pcmData.count
+
+            var payload: [String: Any] = [
+                "message_type": "input_audio_chunk",
+                "audio_base_64": chunk.base64EncodedString(),
+                "sample_rate": 16000,
+            ]
+            if isFinalChunk {
+                payload["commit"] = true
+            }
+
+            let jsonData = try JSONSerialization.data(withJSONObject: payload)
+            guard let jsonText = String(data: jsonData, encoding: .utf8) else {
+                throw PluginTranscriptionError.apiError("Failed to encode realtime payload")
+            }
+
+            try await wsTask.send(.string(jsonText))
+            offset = end
+        }
+
+        do {
+            try await receiveTask.value
+        } catch {
+            wsTask.cancel(with: .goingAway, reason: nil)
+            throw error
+        }
+
+        wsTask.cancel(with: .normalClosure, reason: nil)
+
+        let finalText = await collector.finalizedText()
+        guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PluginTranscriptionError.apiError("Realtime API returned no transcript")
+        }
+
+        let detectedLanguage = await collector.finalLanguage(fallback: language)
+        return PluginTranscriptionResult(text: finalText, detectedLanguage: detectedLanguage)
+    }
+
+    static func transcriptionTransport(
+        mode: ElevenLabsTranscriptionMode,
+        keyterms: [String]
+    ) -> ElevenLabsTranscriptionTransport {
+        mode == .restOnly || !keyterms.isEmpty ? .rest : .realtime
+    }
+
+    func transcriptionTransport(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) -> ElevenLabsTranscriptionTransport {
+        transcriptionTransport(
+            keyterms: activeKeyterms(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        )
+    }
+
+    static func validKeyterms(from terms: [String]) -> [String] {
+        var valid: [String] = []
+        for term in PluginDictionaryTerms.normalizedTerms(from: terms) {
+            guard term.count <= maximumKeytermCharacterCount,
+                  term.split(whereSeparator: { $0.isWhitespace }).count <= maximumKeytermWordCount,
+                  term.rangeOfCharacter(from: invalidKeytermCharacters) == nil else {
+                continue
+            }
+
+            valid.append(term)
+            if valid.count == maximumKeytermCount {
+                break
+            }
+        }
+        return valid
+    }
+
+    private func activeKeyterms(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) -> [String] {
+        guard _useDictionaryTerms else { return [] }
+        let terms = dictionaryTermHints.isEmpty
+            ? PluginDictionaryTerms.terms(fromPrompt: prompt)
+            : dictionaryTermHints.map(\.text)
+        return Self.validKeyterms(from: terms)
+    }
+
+    private func transcriptionTransport(keyterms: [String]) -> ElevenLabsTranscriptionTransport {
+        Self.transcriptionTransport(mode: _transcriptionMode, keyterms: keyterms)
+    }
+
+    static func realtimeURL(language: String?, modelId: String, noVerbatim: Bool) throws -> URL {
+        guard var components = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime") else {
+            throw PluginTranscriptionError.apiError("Invalid realtime URL")
+        }
+
+        var queryItems = [
+            URLQueryItem(name: "model_id", value: realtimeModelId(for: modelId)),
+            URLQueryItem(name: "audio_format", value: "pcm_16000"),
+            URLQueryItem(name: "commit_strategy", value: "manual"),
+            URLQueryItem(name: "no_verbatim", value: formattedBoolean(noVerbatim)),
+        ]
+
+        if let language, !language.isEmpty {
+            queryItems.append(URLQueryItem(name: "language_code", value: language))
+        }
+
+        components.queryItems = queryItems
+
+        guard let url = components.url else {
+            throw PluginTranscriptionError.apiError("Invalid realtime query parameters")
+        }
+
+        return url
+    }
+
+    static func normalizedSpeakerCount(_ speakerCount: Int) -> Int {
+        speakerCount == automaticSpeakerCount || (1...maximumSpeakerCount).contains(speakerCount)
+            ? speakerCount
+            : defaultSpeakerCount
+    }
+
+    private static func formattedBoolean(_ value: Bool) -> String {
+        value ? "true" : "false"
+    }
+
+    private static func realtimeModelId(for modelId: String) -> String {
+        switch modelId {
+        case "scribe_v1":
+            return "scribe_v2_realtime"
+        default:
+            return "scribe_v2_realtime"
+        }
+    }
+
+    private static func parseRESTResponse(_ data: Data, fallbackLanguage: String?) throws -> PluginTranscriptionResult {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw PluginTranscriptionError.apiError("Invalid ElevenLabs response")
+        }
+
+        let text = (json["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let detectedLanguage = json["language_code"] as? String ?? fallbackLanguage
+        return PluginTranscriptionResult(text: text, detectedLanguage: detectedLanguage)
+    }
+
+    private static func receivePayload(
+        from task: URLSessionWebSocketTask,
+        timeout: Duration
+    ) async throws -> ElevenLabsReceivePayload {
+        try await withThrowingTaskGroup(of: ElevenLabsReceivePayload.self) { group in
+            group.addTask {
+                let message = try await task.receive()
+                switch message {
+                case .string(let text):
+                    return .text(text)
+                case .data(let data):
+                    return .data(data)
+                @unknown default:
+                    return .timedOut
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return .timedOut
+            }
+
+            let result = try await group.next() ?? .timedOut
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private static func errorMessage(from json: [String: Any]) -> String? {
+        if let error = json["error"] as? String, !error.isEmpty {
+            return error
+        }
+        if let message = json["message"] as? String, !message.isEmpty {
+            return message
+        }
+        if let details = json["details"] as? String, !details.isEmpty {
+            return details
+        }
+        return nil
+    }
+
+    private static func floatToPCM16(_ samples: [Float]) -> Data {
+        var data = Data(capacity: samples.count * 2)
+        for sample in samples {
+            let clamped = max(-1.0, min(1.0, sample))
+            var int16 = Int16(clamped * 32767.0)
+            withUnsafeBytes(of: &int16) { data.append(contentsOf: $0) }
+        }
+        return data
+    }
+
+    fileprivate func validateApiKey(_ key: String) async -> ElevenLabsAPIKeyValidationResult {
+        guard let url = URL(string: "https://api.elevenlabs.io/v1/user") else {
+            return .invalid(message: nil)
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue(key, forHTTPHeaderField: "xi-api-key")
+        request.timeoutInterval = 10
+
+        do {
+            let (data, response) = try await PluginHTTPClient.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .invalid(message: nil)
+            }
+            return Self.apiKeyValidationResult(statusCode: httpResponse.statusCode, data: data)
+        } catch {
+            return .invalid(message: error.localizedDescription)
+        }
+    }
+
+    static func apiKeyValidationResult(statusCode: Int, data: Data) -> ElevenLabsAPIKeyValidationResult {
+        guard statusCode != 200 else { return .valid }
+
+        let detail = try? JSONDecoder().decode(ElevenLabsAPIErrorResponse.self, from: data).detail
+        let message = detail?.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ElevenLabs scopes API keys per endpoint. A key restricted to Speech to Text is valid for
+        // this plugin even though the optional user-profile validation endpoint returns HTTP 401.
+        if statusCode == 401,
+           detail?.status == "missing_permissions",
+           message?.caseInsensitiveCompare(Self.missingUserReadPermissionMessage) == .orderedSame {
+            return .valid
+        }
+
+        return .invalid(message: message?.isEmpty == false ? message : nil)
+    }
+
+    var settingsView: AnyView? {
+        AnyView(ElevenLabsSettingsView(plugin: self))
+    }
+
+    fileprivate func setApiKey(_ key: String) {
+        _apiKey = key
+        if let host {
+            do {
+                try host.storeSecret(key: "api-key", value: key)
+            } catch {
+                print("[ElevenLabsPlugin] Failed to store API key: \(error)")
+            }
+            host.notifyCapabilitiesChanged()
+        }
+    }
+
+    fileprivate func removeApiKey() {
+        _apiKey = nil
+        if let host {
+            do {
+                try host.storeSecret(key: "api-key", value: "")
+            } catch {
+                print("[ElevenLabsPlugin] Failed to delete API key: \(error)")
+            }
+            host.notifyCapabilitiesChanged()
+        }
+    }
+}
+
+private struct ElevenLabsSettingsView: View {
+    let plugin: ElevenLabsPlugin
+    @State private var apiKeyInput = ""
+    @State private var isValidating = false
+    @State private var validationResult: ElevenLabsAPIKeyValidationResult?
+    @State private var showApiKey = false
+    @State private var selectedModel = ""
+    @State private var transcriptionMode = ElevenLabsTranscriptionMode.automatic
+    @State private var tagAudioEvents = false
+    @State private var noVerbatim = true
+    @State private var speakerCount = ElevenLabsPlugin.defaultSpeakerCount
+    @State private var useDictionaryTerms = true
+    private let bundle = Bundle(for: ElevenLabsPlugin.self)
+    private var trimmedInputKey: String {
+        apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    private var storedKey: String {
+        plugin._apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    private var hasStoredKey: Bool {
+        !storedKey.isEmpty
+    }
+    private var isEditingStoredKey: Bool {
+        hasStoredKey && trimmedInputKey == storedKey
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("API Key", bundle: bundle)
+                    .font(.headline)
+
+                HStack(spacing: 8) {
+                    if showApiKey {
+                        TextField("API Key", text: $apiKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                    } else {
+                        SecureField("API Key", text: $apiKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    Button {
+                        showApiKey.toggle()
+                    } label: {
+                        Image(systemName: showApiKey ? "eye.slash" : "eye")
+                    }
+                    .buttonStyle(.borderless)
+
+                    if hasStoredKey && isEditingStoredKey && validationResult?.isValid != false {
+                        Button(String(localized: "Remove", bundle: bundle)) {
+                            apiKeyInput = ""
+                            validationResult = nil
+                            plugin.removeApiKey()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .foregroundStyle(.red)
+                    } else {
+                        Button(String(localized: "Save", bundle: bundle)) {
+                            saveApiKey()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(trimmedInputKey.isEmpty || isValidating)
+                    }
+                }
+
+                if isValidating {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.small)
+                        Text("Validating...", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let result = validationResult {
+                    HStack(spacing: 4) {
+                        Image(systemName: result.isValid ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(result.isValid ? .green : .red)
+                        Text(
+                            result.isValid
+                                ? String(localized: "Valid API Key", bundle: bundle)
+                                : result.errorMessage ?? String(localized: "Invalid API Key", bundle: bundle)
+                        )
+                        .font(.caption)
+                        .foregroundStyle(result.isValid ? .green : .red)
+                    }
+                }
+            }
+
+            if plugin.isConfigured {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Model", bundle: bundle)
+                        .font(.headline)
+
+                    Picker("Model", selection: $selectedModel) {
+                        ForEach(plugin.transcriptionModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .onChange(of: selectedModel) {
+                        plugin.selectModel(selectedModel)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Transcription mode", bundle: bundle)
+                        .font(.headline)
+
+                    Picker("Transcription mode", selection: $transcriptionMode) {
+                        Text("Auto (Realtime with REST fallback)", bundle: bundle)
+                            .tag(ElevenLabsTranscriptionMode.automatic)
+                        Text("REST only (Batch Scribe v2)", bundle: bundle)
+                            .tag(ElevenLabsTranscriptionMode.restOnly)
+                    }
+                    .labelsHidden()
+                    .onChange(of: transcriptionMode) {
+                        plugin.setTranscriptionMode(transcriptionMode)
+                    }
+
+                    Text("Auto streams partial results and falls back to batch REST. REST only avoids realtime concurrency limits and uses consistent batch transcription.", bundle: bundle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Transcription options", bundle: bundle)
+                        .font(.headline)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: $noVerbatim) {
+                            Text("Clean transcript", bundle: bundle)
+                        }
+                        .accessibilityIdentifier(ElevenLabsSettingsAccessibility.cleanTranscript)
+                        .onChange(of: noVerbatim) {
+                            plugin.setNoVerbatim(noVerbatim)
+                        }
+
+                        Text("Removes filler words, false starts, and other speech disfluencies using ElevenLabs' native non-verbatim mode.", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: $tagAudioEvents) {
+                            Text("Audio events", bundle: bundle)
+                        }
+                        .accessibilityIdentifier(ElevenLabsSettingsAccessibility.audioEvents)
+                        .onChange(of: tagAudioEvents) {
+                            plugin.setTagAudioEvents(tagAudioEvents)
+                        }
+
+                        Text("Include non-speech events such as [laughter] or [background music]. Applies to REST transcription only.", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("Audio events and Clean transcript can be enabled together.", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Speaker count", bundle: bundle)
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+
+                        Picker(
+                            String(localized: "Speaker count", bundle: bundle),
+                            selection: $speakerCount
+                        ) {
+                            Text("Automatic", bundle: bundle)
+                                .tag(ElevenLabsPlugin.automaticSpeakerCount)
+                            ForEach(1...ElevenLabsPlugin.maximumSpeakerCount, id: \.self) { count in
+                                Text(String(count)).tag(count)
+                            }
+                        }
+                        .labelsHidden()
+                        .accessibilityIdentifier(ElevenLabsSettingsAccessibility.speakerCount)
+                        .onChange(of: speakerCount) {
+                            plugin.setSpeakerCount(speakerCount)
+                        }
+
+                        Text("Choose Automatic or the maximum number of speakers (1–32). Applies to REST transcription only.", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: $useDictionaryTerms) {
+                            Text("Use TypeWhisper dictionary terms", bundle: bundle)
+                        }
+                        .accessibilityIdentifier(ElevenLabsSettingsAccessibility.useDictionaryTerms)
+                        .onChange(of: useDictionaryTerms) {
+                            plugin.setUseDictionaryTerms(useDictionaryTerms)
+                        }
+
+                        Text("Sends active TypeWhisper dictionary terms to ElevenLabs as recognition keyterms. ElevenLabs adds a 20% keyterm surcharge.", bundle: bundle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            Text("API keys are stored securely in the Keychain", bundle: bundle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding()
+        .onAppear {
+            if let key = plugin._apiKey, !key.isEmpty {
+                apiKeyInput = key
+                if ElevenLabsAutomaticValidationPolicy.allowsValidationOnAppear() {
+                    isValidating = true
+                    Task {
+                        let result = await plugin.validateApiKey(key)
+                        await MainActor.run {
+                            isValidating = false
+                            validationResult = result
+                        }
+                    }
+                }
+            }
+            selectedModel = plugin.selectedModelId ?? plugin.transcriptionModels.first?.id ?? ""
+            transcriptionMode = plugin.transcriptionMode
+            tagAudioEvents = plugin.tagAudioEvents
+            noVerbatim = plugin.noVerbatim
+            speakerCount = plugin.speakerCount
+            useDictionaryTerms = plugin.useDictionaryTerms
+        }
+    }
+
+    private func saveApiKey() {
+        let trimmedKey = trimmedInputKey
+        guard !trimmedKey.isEmpty else { return }
+
+        isValidating = true
+        validationResult = nil
+
+        Task {
+            let result = await plugin.validateApiKey(trimmedKey)
+            await MainActor.run {
+                if result.isValid {
+                    plugin.setApiKey(trimmedKey)
+                }
+                isValidating = false
+                validationResult = result
+            }
+        }
+    }
+}
+
+private extension Data {
+    mutating func appendMultipartField(boundary: String, name: String, value: String) {
+        append("--\(boundary)\r\n".data(using: .utf8)!)
+        append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+        append("\(value)\r\n".data(using: .utf8)!)
+    }
+
+    mutating func appendMultipartFile(
+        boundary: String,
+        name: String,
+        filename: String,
+        contentType: String,
+        data: Data
+    ) {
+        append("--\(boundary)\r\n".data(using: .utf8)!)
+        append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+        append("Content-Type: \(contentType)\r\n\r\n".data(using: .utf8)!)
+        append(data)
+        append("\r\n".data(using: .utf8)!)
+    }
+}

@@ -1,0 +1,430 @@
+import AppKit
+import SwiftUI
+import Combine
+
+/// Observable notch geometry passed from the panel to the SwiftUI view.
+@MainActor
+final class NotchGeometry: ObservableObject {
+    @Published var notchWidth: CGFloat = 185
+    @Published var notchHeight: CGFloat = NotchIndicatorLayout.notchedClosedHeight
+    @Published var hasNotch: Bool = false
+    @Published var isPresented: Bool = false
+
+    func update(for screen: NSScreen) {
+        hasNotch = screen.safeAreaInsets.top > 0
+        if hasNotch,
+           let left = screen.auxiliaryTopLeftArea?.width,
+           let right = screen.auxiliaryTopRightArea?.width {
+            notchWidth = screen.frame.width - left - right + 4
+        } else {
+            notchWidth = 0
+        }
+        notchHeight = NotchIndicatorLayout.closedHeight(
+            hasNotch: hasNotch,
+            safeAreaTopInset: screen.safeAreaInsets.top
+        )
+    }
+}
+
+/// Hosting view that accepts first mouse click without requiring a prior activation click.
+private class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// Panel that visually extends the MacBook notch, centered over the hardware notch.
+/// Only shown on displays with a hardware notch - hidden on non-notch displays regardless of settings.
+class NotchIndicatorPanel: NSPanel {
+    private static let presentationAnimationDuration: Duration = .milliseconds(220)
+
+    private let screenResolver: IndicatorScreenResolver
+    private let displayModeProvider: () -> NotchIndicatorDisplay
+    private let indicatorVisibleInScreenCapturesProvider: () -> Bool
+    private let countdownModel: CalendarMeetingCountdownModel
+    private let notchGeometry = NotchGeometry()
+    private var cancellables = Set<AnyCancellable>()
+    private var cachedScreen: NSScreen?
+    private var showTask: Task<Void, Never>?
+    private var dismissTask: Task<Void, Never>?
+    private var isActionFeedbackInteractive = false
+    private var actionFeedbackMessage: String?
+    private var actionFeedbackActionTitle: String?
+    private var isMeetingCountdownPresented = false
+    /// True while a deferred dismissal is in flight: content already blanked,
+    /// `orderOut` pending. Callers that only want to refresh an already-visible
+    /// panel (not change visibility policy) must not resurrect it in this window.
+    private var isDismissing = false
+
+    private var isFeedbackInteractive: Bool {
+        isActionFeedbackInteractive || isMeetingCountdownPresented
+    }
+
+    convenience init(
+        screenResolver: IndicatorScreenResolver,
+        countdownModel: CalendarMeetingCountdownModel
+    ) {
+        self.init(
+            screenResolver: screenResolver,
+            displayModeProvider: { DictationViewModel.shared.notchIndicatorDisplay },
+            indicatorVisibleInScreenCapturesProvider: {
+                DictationViewModel.shared.indicatorVisibleInScreenCaptures
+            },
+            countdownModel: countdownModel,
+            content: {
+                NotchIndicatorView(
+                    geometry: $0,
+                    countdownModel: countdownModel
+                )
+            }
+        )
+    }
+
+    init<Content: View>(
+        screenResolver: IndicatorScreenResolver,
+        displayModeProvider: @escaping () -> NotchIndicatorDisplay,
+        indicatorVisibleInScreenCapturesProvider: @escaping () -> Bool = { true },
+        countdownModel: CalendarMeetingCountdownModel = .init(),
+        @ViewBuilder content: (NotchGeometry) -> Content
+    ) {
+        self.screenResolver = screenResolver
+        self.displayModeProvider = displayModeProvider
+        self.indicatorVisibleInScreenCapturesProvider = indicatorVisibleInScreenCapturesProvider
+        self.countdownModel = countdownModel
+        let initialSize = IndicatorFeedbackPanelLayout.panelSize(
+            for: .notch,
+            isFeedbackInteractive: false
+        )
+        super.init(
+            contentRect: NSRect(origin: .zero, size: initialSize),
+            styleMask: [.borderless, .nonactivatingPanel, .utilityWindow, .hudWindow],
+            backing: .buffered,
+            defer: false
+        )
+
+        isFloatingPanel = true
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isMovable = false
+        appearance = NSAppearance(named: .darkAqua)
+        hidesOnDeactivate = false
+        ignoresMouseEvents = true
+        FloatingPanelSpacePolicy.applyIndicatorPolicy(
+            to: self,
+            displayMode: displayModeProvider(),
+            windowLevel: FloatingPanelSpacePolicy.notchIndicatorWindowLevel,
+            isVisibleInScreenCaptures: indicatorVisibleInScreenCapturesProvider()
+        )
+
+        let hostingView = FirstMouseHostingView(rootView: content(notchGeometry))
+        hostingView.sizingOptions = []
+        // The notch content lays itself out from NotchGeometry and never consumes
+        // the safe area; opting out also drops NSHostingView's safe-area-corner
+        // KVO observer, which this panel (the only window over the notch) would
+        // otherwise service on every frame change.
+        hostingView.safeAreaRegions = []
+
+        // The hosting view is never resized: it stays at the non-interactive
+        // panel size inside a plain container and only the window changes size.
+        // NSHostingView keeps a WindowSizeBridge that, whenever the root view's
+        // size changes inside an animated SwiftUI transaction, animates the
+        // window frame to follow it from windowDidLayout (observed live: the
+        // bridge asked to resize this panel back to 500x500 while it sat at the
+        // toast size). A window resize issued from inside the layout pass
+        // re-enters constraint updates and AppKit raises
+        // NSInternalInconsistencyException from _postWindowNeedsUpdateConstraints,
+        // which the display-cycle observer rethrows and the process aborts
+        // (#1229). With the hosting view's size constant the root size never
+        // animates, so the bridge has nothing to animate. The container explicitly
+        // centers and top-anchors the hosting view as the window changes size.
+        contentView = IndicatorHostingContainerView(hostingView: hostingView, size: initialSize)
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    func startObserving() {
+        let vm = DictationViewModel.shared
+        let recorder = AudioRecorderViewModel.shared
+
+        vm.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateVisibility(vm: vm, recorder: recorder)
+            }
+            .store(in: &cancellables)
+
+        recorder.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateVisibility(vm: vm, recorder: recorder)
+            }
+            .store(in: &cancellables)
+
+        vm.$notchIndicatorVisibility
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateVisibility(vm: vm, recorder: recorder)
+            }
+            .store(in: &cancellables)
+
+        vm.$notchIndicatorDisplay
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.cachedScreen = nil
+                self?.updateVisibility(vm: vm, recorder: recorder)
+            }
+            .store(in: &cancellables)
+
+        // The cap pins its own dark scheme in the view, so the panel can follow
+        // the theme like the other indicator panels. Glass then inherits the
+        // system appearance for the expanded body.
+        vm.$indicatorTheme
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] theme in
+                self?.appearance = theme.panelAppearance
+            }
+            .store(in: &cancellables)
+
+        IndicatorPreviewSession.shared.$isActive
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateVisibility(vm: vm, recorder: recorder)
+            }
+            .store(in: &cancellables)
+
+        vm.$indicatorVisibleInScreenCaptures
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isVisibleInScreenCaptures in
+                guard let self else { return }
+                FloatingPanelSpacePolicy.applyIndicatorCapturePolicy(
+                    to: self,
+                    isVisibleInScreenCaptures: isVisibleInScreenCaptures
+                )
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest3(vm.$state, vm.$actionFeedbackMessage, vm.$actionFeedbackActionTitle)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state, message, actionTitle in
+                self?.updateFeedbackInteraction(
+                    isInteractive: IndicatorFeedbackPanelLayout.isInteractive(
+                        state: state,
+                        message: message
+                    ),
+                    message: message,
+                    actionTitle: actionTitle
+                )
+            }
+            .store(in: &cancellables)
+
+        countdownModel.$presentation
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] presentation in
+                self?.updateMeetingCountdownPresentation(
+                    isPresented: presentation != nil,
+                    vm: vm,
+                    recorder: recorder
+                )
+            }
+            .store(in: &cancellables)
+    }
+
+    func updateVisibility(
+        vm: DictationViewModel = DictationViewModel.shared,
+        recorder: AudioRecorderViewModel = AudioRecorderViewModel.shared
+    ) {
+        guard vm.indicatorStyle == .notch else {
+            dismiss()
+            return
+        }
+
+        let presentation = IndicatorPresentationState.resolve(
+            dictationState: vm.state,
+            recorderState: recorder.state,
+            previewActive: IndicatorPreviewSession.shared.isActive
+        )
+        let normallyVisible = IndicatorPresentationState.shouldShow(
+            visibility: vm.notchIndicatorVisibility,
+            presentation: presentation
+        )
+        if CalendarMeetingCountdownIndicatorPolicy.shouldShow(
+            normalVisibilityAllowsPresentation: normallyVisible,
+            countdownPresented: isMeetingCountdownPresented
+        ) {
+            show()
+        } else {
+            dismiss()
+        }
+    }
+
+    // MARK: - Notch geometry
+
+    func show() {
+        showTask?.cancel()
+        dismissTask?.cancel()
+        isDismissing = false
+
+        let wasVisible = isVisible
+        placePanel()
+
+        guard !wasVisible else {
+            if !notchGeometry.isPresented {
+                withAnimation(.easeOut(duration: 0.22)) {
+                    notchGeometry.isPresented = true
+                }
+            }
+            return
+        }
+
+        notchGeometry.isPresented = false
+        showTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            withAnimation(.easeOut(duration: 0.22)) {
+                self.notchGeometry.isPresented = true
+            }
+            self.showTask = nil
+        }
+    }
+
+    private func placePanel() {
+        let screen: NSScreen
+        if let cached = cachedScreen, isVisible {
+            screen = cached
+        } else {
+            screen = resolveScreen()
+            cachedScreen = screen
+        }
+
+        notchGeometry.update(for: screen)
+
+        let screenFrame = screen.frame
+        let closedWidth = NotchIndicatorLayout.closedWidth(
+            hasNotch: notchGeometry.hasNotch,
+            notchWidth: notchGeometry.notchWidth
+        )
+        let panelSize = IndicatorFeedbackPanelLayout.panelSize(
+            for: .notch,
+            isFeedbackInteractive: isFeedbackInteractive,
+            notchClosedWidth: closedWidth,
+            notchClosedHeight: notchGeometry.notchHeight,
+            feedbackMessage: actionFeedbackMessage,
+            feedbackActionTitle: actionFeedbackActionTitle
+        )
+        let panelFrame = IndicatorFeedbackPanelLayout.panelFrame(
+            for: .notch,
+            size: panelSize,
+            in: screenFrame
+        )
+
+        // display: false — a synchronous display pass here re-enters the display
+        // cycle on the NSHostingView content and can raise
+        // NSInternalInconsistencyException from _postWindowNeedsUpdateConstraints
+        // (via NSHostingView.invalidateSafeAreaCornerInsets) when placement is
+        // triggered from a display-cycle observer such as the screen-parameters
+        // notification. The next regular display cycle picks up the new frame.
+        setFrame(panelFrame, display: false)
+        ignoresMouseEvents = !isFeedbackInteractive
+        FloatingPanelSpacePolicy.orderIndicatorFront(
+            self,
+            displayMode: displayModeProvider(),
+            windowLevel: FloatingPanelSpacePolicy.notchIndicatorWindowLevel,
+            isVisibleInScreenCaptures: indicatorVisibleInScreenCapturesProvider()
+        )
+    }
+
+    private func resolveScreen() -> NSScreen {
+        screenResolver.resolveScreen(for: displayModeProvider())
+    }
+
+    func refreshPlacementForActiveContextChange() {
+        guard isVisible, notchGeometry.isPresented else { return }
+        if displayModeProvider() == .activeScreen {
+            cachedScreen = nil
+        }
+        // Hop to the next runloop turn: this refresh is driven by
+        // display-cycle-adjacent triggers (screen-parameter changes, the global
+        // mouse monitor), and re-placing the hosting-view-backed window
+        // synchronously from inside the display cycle raises
+        // NSInternalInconsistencyException from _postWindowNeedsUpdateConstraints
+        // (via NSHostingView.invalidateSafeAreaCornerInsets).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isVisible, self.notchGeometry.isPresented else { return }
+            self.placePanel()
+        }
+    }
+
+    func updateFeedbackInteraction(
+        isInteractive: Bool,
+        message: String? = nil,
+        actionTitle: String? = nil
+    ) {
+        if !isInteractive && !isMeetingCountdownPresented {
+            ignoresMouseEvents = true
+        }
+        // The message decides how tall the feedback surface is, so a changed
+        // message needs a new frame even when interactivity stays the same.
+        let feedbackMessage = isInteractive ? message : nil
+        let feedbackActionTitle = isInteractive ? actionTitle : nil
+        guard isActionFeedbackInteractive != isInteractive
+            || actionFeedbackMessage != feedbackMessage
+            || actionFeedbackActionTitle != feedbackActionTitle else { return }
+        isActionFeedbackInteractive = isInteractive
+        actionFeedbackMessage = feedbackMessage
+        actionFeedbackActionTitle = feedbackActionTitle
+        // This callback only wants to resize/re-arm an already-visible panel.
+        // While a dismissal is in flight the window is still ordered in but its
+        // content is blanked; calling show() here cancelled the pending orderOut
+        // and left an empty panel stuck over the notch.
+        if isVisible, !isDismissing {
+            show()
+        }
+    }
+
+    private func updateMeetingCountdownPresentation(
+        isPresented: Bool,
+        vm: DictationViewModel,
+        recorder: AudioRecorderViewModel
+    ) {
+        guard isMeetingCountdownPresented != isPresented else { return }
+        isMeetingCountdownPresented = isPresented
+        updateVisibility(vm: vm, recorder: recorder)
+    }
+
+    func dismiss() {
+        ignoresMouseEvents = true
+        cachedScreen = nil
+        showTask?.cancel()
+        showTask = nil
+        dismissTask?.cancel()
+
+        guard isVisible else {
+            notchGeometry.isPresented = false
+            isDismissing = false
+            orderOut(nil)
+            return
+        }
+
+        isDismissing = true
+        withAnimation(.easeInOut(duration: 0.18)) {
+            notchGeometry.isPresented = false
+        }
+
+        dismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.presentationAnimationDuration)
+            guard !Task.isCancelled, let self else { return }
+            self.dismissTask = nil
+            guard !self.notchGeometry.isPresented else {
+                // A show() re-presented the panel during the animation window;
+                // it also cleared isDismissing. Leave the window up.
+                return
+            }
+            self.orderOut(nil)
+            self.isDismissing = false
+        }
+    }
+}

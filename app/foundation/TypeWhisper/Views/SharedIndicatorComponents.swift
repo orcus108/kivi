@@ -1,0 +1,473 @@
+import AppKit
+import SwiftUI
+
+// MARK: - Theme
+
+extension IndicatorTheme {
+    /// Color scheme the indicator content renders in. Glass follows the system appearance.
+    var preferredColorScheme: ColorScheme? {
+        switch self {
+        case .classic:
+            .dark
+        case .light:
+            .light
+        case .glass:
+            nil
+        }
+    }
+
+    /// Appearance for the hosting panel so semantic colors resolve to match the surface.
+    var panelAppearance: NSAppearance? {
+        switch self {
+        case .classic:
+            NSAppearance(named: .darkAqua)
+        case .light:
+            NSAppearance(named: .aqua)
+        case .glass:
+            nil
+        }
+    }
+
+    /// Hairline around the surface. Glass draws its own rim highlight.
+    var strokeColor: Color? {
+        switch self {
+        case .classic:
+            .white.opacity(0.15)
+        case .light:
+            .black.opacity(0.1)
+        case .glass:
+            nil
+        }
+    }
+
+    /// Multiplier for the drop shadow the indicator views draw. Glass ships its
+    /// own shadow, and a SwiftUI shadow would show through the translucent surface.
+    var shadowOpacityScale: Double {
+        switch self {
+        case .classic:
+            1
+        case .light:
+            0.5
+        case .glass:
+            0
+        }
+    }
+}
+
+/// Draws the themed background, clip and hairline stroke of a floating indicator.
+struct IndicatorSurfaceModifier<S: Shape>: ViewModifier {
+    let theme: IndicatorTheme
+    let shape: S
+    let strokeColor: Color?
+
+    func body(content: Content) -> some View {
+        themedBackground(content)
+            // The hosting panel itself is rectangular. Clip all rendered content,
+            // especially the feedback progress bar, to the visible surface.
+            .clipShape(shape)
+            .overlay {
+                if let stroke = strokeColor ?? theme.strokeColor {
+                    shape.stroke(stroke, lineWidth: 1)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func themedBackground(_ content: Content) -> some View {
+        switch theme {
+        case .classic:
+            content.background(.black.opacity(0.85), in: shape)
+        case .light:
+            content.background(.regularMaterial, in: shape)
+        case .glass:
+            if #available(macOS 26.0, *) {
+                content.glassEffect(.clear, in: shape)
+            } else {
+                content.background(.regularMaterial, in: shape)
+            }
+        }
+    }
+}
+
+extension View {
+    func indicatorSurface<S: Shape>(
+        theme: IndicatorTheme,
+        shape: S,
+        strokeColor: Color? = nil
+    ) -> some View {
+        modifier(IndicatorSurfaceModifier(theme: theme, shape: shape, strokeColor: strokeColor))
+    }
+}
+
+// MARK: - Motion
+
+enum IndicatorMotion {
+    /// Spring used when an indicator grows, shrinks or pops in.
+    static let expand = Animation.spring(response: 0.38, dampingFraction: 0.78)
+
+    /// Scale an indicator starts from when a recording begins, so it visibly
+    /// unfolds instead of switching content in place.
+    static let revealScale: CGFloat = 0.92
+
+    /// Runs the pop-in: snap to the reveal scale without animation, then spring to 1.
+    static func popIn(_ scale: Binding<CGFloat>) {
+        var snap = Transaction()
+        snap.disablesAnimations = true
+        withTransaction(snap) { scale.wrappedValue = revealScale }
+        DispatchQueue.main.async {
+            withAnimation(expand) { scale.wrappedValue = 1 }
+        }
+    }
+}
+
+// MARK: - Sizing
+
+struct IndicatorSizing {
+    let iconSize: CGFloat
+    let iconCornerRadius: CGFloat
+    let dotSize: CGFloat
+    let symbolSize: CGFloat
+    let timerFontSize: CGFloat
+    let timerOpacity: Double
+    let profileFontSize: CGFloat
+    let profilePaddingH: CGFloat
+    let profilePaddingV: CGFloat
+    let textFontSize: CGFloat
+    let textExpandedHeight: CGFloat
+
+    static let notch = IndicatorSizing(
+        iconSize: 14,
+        iconCornerRadius: 3,
+        dotSize: 6,
+        symbolSize: 11,
+        timerFontSize: 10,
+        timerOpacity: 0.6,
+        profileFontSize: 9,
+        profilePaddingH: 5,
+        profilePaddingV: 2,
+        textFontSize: IndicatorStyle.notch.transcriptPreviewBaseFontSize,
+        textExpandedHeight: IndicatorStyle.notch.transcriptPreviewBaseExpandedHeight
+    )
+
+    static let overlay = IndicatorSizing(
+        iconSize: 18,
+        iconCornerRadius: 4,
+        dotSize: 8,
+        symbolSize: 14,
+        timerFontSize: 12,
+        timerOpacity: 0.8,
+        profileFontSize: 11,
+        profilePaddingH: 6,
+        profilePaddingV: 3,
+        textFontSize: IndicatorStyle.overlay.transcriptPreviewBaseFontSize,
+        textExpandedHeight: IndicatorStyle.overlay.transcriptPreviewBaseExpandedHeight
+    )
+
+    static let minimal = IndicatorSizing(
+        iconSize: 14,
+        iconCornerRadius: 3,
+        dotSize: 6,
+        symbolSize: 12,
+        timerFontSize: 11,
+        timerOpacity: 0.75,
+        profileFontSize: 10,
+        profilePaddingH: 5,
+        profilePaddingV: 2,
+        textFontSize: 12,
+        textExpandedHeight: 0
+    )
+}
+
+// MARK: - App Icon
+
+struct IndicatorAppIconView: View {
+    let icon: NSImage
+    var borderColor: Color?
+    let sizing: IndicatorSizing
+
+    var body: some View {
+        Image(nsImage: icon)
+            .resizable()
+            .frame(width: sizing.iconSize, height: sizing.iconSize)
+            .clipShape(RoundedRectangle(cornerRadius: sizing.iconCornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: sizing.iconCornerRadius)
+                    .stroke(borderColor ?? .clear, lineWidth: 1.5)
+            )
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Left Status Indicator
+
+struct IndicatorLeftStatus: View {
+    let presentation: IndicatorPresentationData
+    let sizing: IndicatorSizing
+    let dotPulse: Bool
+    let hasActionFeedback: Bool
+
+    var body: some View {
+        statusContent
+            .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private var statusContent: some View {
+        switch presentation.state {
+        case .idle, .promptSelection, .promptProcessing:
+            Color.clear.frame(width: 0, height: 0)
+        case .recording:
+            if presentation.isPreparingMicrophone {
+                IndicatorPreparingView(sizing: sizing)
+            } else if let icon = presentation.activeAppIcon {
+                IndicatorAppIconView(icon: icon, sizing: sizing)
+            } else {
+                IndicatorDot(audioLevel: presentation.audioLevel, dotPulse: dotPulse, sizing: sizing)
+            }
+        case .processing:
+            if let icon = presentation.activeAppIcon {
+                IndicatorAppIconView(icon: icon, sizing: sizing)
+            } else {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.primary)
+            }
+        case .inserting:
+            if hasActionFeedback {
+                Color.clear.frame(width: 0, height: 0)
+            } else if let icon = presentation.activeAppIcon {
+                IndicatorAppIconView(icon: icon, sizing: sizing)
+            } else {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.system(size: sizing.symbolSize))
+            }
+        case .error:
+            if let icon = presentation.activeAppIcon {
+                IndicatorAppIconView(icon: icon, borderColor: .red, sizing: sizing)
+            } else {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .font(.system(size: sizing.symbolSize))
+            }
+        }
+    }
+}
+
+// MARK: - Preparing Indicator
+
+struct IndicatorPreparingView: View {
+    let sizing: IndicatorSizing
+
+    var body: some View {
+        ProgressView()
+            .controlSize(.mini)
+            .tint(.primary)
+            .frame(width: max(sizing.iconSize, sizing.dotSize), height: max(sizing.iconSize, sizing.dotSize))
+            .accessibilityHidden(true)
+    }
+}
+
+struct IndicatorPreparingLabel: View {
+    let presentation: IndicatorPresentationData
+    let sizing: IndicatorSizing
+
+    var body: some View {
+        Text(presentation.recordingStatusLabel)
+            .font(.system(size: sizing.profileFontSize, weight: .medium))
+            .foregroundStyle(Color.primary.opacity(sizing.timerOpacity))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .accessibilityLabel(presentation.recordingStatusLabel)
+    }
+}
+
+// MARK: - Recording Dot
+
+struct IndicatorDot: View {
+    let audioLevel: Float
+    let dotPulse: Bool
+    let sizing: IndicatorSizing
+
+    var body: some View {
+        Circle()
+            .fill(Color.red)
+            .frame(width: sizing.dotSize, height: sizing.dotSize)
+            .scaleEffect(1.0 + CGFloat(audioLevel) * 0.8)
+            .shadow(color: .yellow.opacity(dotPulse ? 0.8 : 0.2), radius: dotPulse ? 6 : 2)
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Recording Content
+
+struct IndicatorRecordingContent: View {
+    let presentation: IndicatorPresentationData
+    let content: NotchIndicatorContent
+    let sizing: IndicatorSizing
+    let dotPulse: Bool
+
+    var body: some View {
+        switch content {
+        case .indicator:
+            if presentation.isPreparingMicrophone {
+                IndicatorPreparingView(sizing: sizing)
+            } else {
+                IndicatorDot(audioLevel: presentation.audioLevel, dotPulse: dotPulse, sizing: sizing)
+            }
+        case .timer:
+            if presentation.isPreparingMicrophone {
+                IndicatorPreparingLabel(presentation: presentation, sizing: sizing)
+            } else {
+                Text(formatDuration(presentation.recordingDuration))
+                    .font(.system(size: sizing.timerFontSize, weight: .medium).monospacedDigit())
+                    .foregroundStyle(Color.primary.opacity(sizing.timerOpacity))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityLabel(String(localized: "Recording timer"))
+                    .accessibilityValue(formatDuration(presentation.recordingDuration))
+            }
+        case .waveform:
+            AudioWaveformView(
+                audioLevel: presentation.audioLevel,
+                isSetup: presentation.isPreparingMicrophone || (presentation.recordingDuration < 0.5 && presentation.audioLevel < 0.05),
+                compact: true
+            )
+        case .profile:
+            if let name = presentation.activeRuleName {
+                Text(name)
+                    .font(.system(size: sizing.profileFontSize, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, sizing.profilePaddingH)
+                    .padding(.vertical, sizing.profilePaddingV)
+                    .frame(maxWidth: NotchIndicatorLayout.profileChipMaxWidth, alignment: .leading)
+                    .accessibilityLabel(localizedAppText("Active workflow", de: "Aktiver Workflow"))
+                    .accessibilityValue(name)
+            } else {
+                Color.clear.frame(width: 0, height: 0)
+            }
+        case .none:
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+}
+
+// MARK: - Expandable Text
+
+struct IndicatorExpandableText: View {
+    let text: String
+    let fontSize: CGFloat
+    let expandedHeight: CGFloat
+    let expanded: Bool
+    let contentPadding: CGFloat
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                Text(text)
+                    .font(.system(size: fontSize))
+                    .foregroundStyle(Color.primary.opacity(0.85))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, contentPadding)
+                    .padding(.vertical, 14)
+                    .id("bottom")
+            }
+            .frame(height: expanded ? expandedHeight : 0)
+            .clipped()
+            .onChange(of: text) {
+                withAnimation(nil) {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
+            }
+        }
+        .accessibilityLabel(String(localized: "Streaming text"))
+        .accessibilityValue(text)
+    }
+}
+
+// MARK: - Action Feedback Banner
+
+struct IndicatorFeedbackProgressBar: View {
+    let remainingFraction: Double
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.65))
+            .frame(maxWidth: .infinity)
+            .frame(height: 2)
+            .scaleEffect(
+                x: CGFloat(min(max(remainingFraction, 0), 1)),
+                y: 1,
+                anchor: .leading
+            )
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+struct IndicatorActionFeedback: View {
+    let message: String
+    let icon: String?
+    let isError: Bool
+    let iconColor: Color?
+    let contentPadding: CGFloat
+    var actionTitle: String? = nil
+    var onAction: (() -> Void)? = nil
+    var remainingFraction: Double? = nil
+    var bodyHeight: CGFloat = IndicatorFeedbackPanelLayout.feedbackBodyHeight
+    var lineLimit = 2
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let remainingFraction {
+                IndicatorFeedbackProgressBar(remainingFraction: remainingFraction)
+            } else {
+                Color.clear
+                    .frame(height: 2)
+                    .accessibilityHidden(true)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: icon ?? (isError ? "xmark.circle.fill" : "checkmark.circle.fill"))
+                    .foregroundStyle(iconColor ?? (isError ? .red : .green))
+                    .font(.system(size: 16))
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.9))
+                    .lineLimit(lineLimit)
+
+                if let actionTitle, let onAction {
+                    Spacer(minLength: 8)
+                    Button(actionTitle, action: onAction)
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.12), in: Capsule())
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, contentPadding)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: bodyHeight)
+        .accessibilityElement(children: actionTitle == nil ? .combine : .contain)
+        .accessibilityLabel(message)
+    }
+}
+
+// MARK: - Helpers
+
+func formatDuration(_ seconds: TimeInterval) -> String {
+    let totalSeconds = Int(seconds)
+    let minutes = totalSeconds / 60
+    let secs = totalSeconds % 60
+    return String(format: "%d:%02d", minutes, secs)
+}
