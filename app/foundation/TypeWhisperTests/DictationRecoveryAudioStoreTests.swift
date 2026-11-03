@@ -4,6 +4,92 @@ import XCTest
 @testable import TypeWhisper
 
 final class DictationRecoveryAudioStoreTests: XCTestCase {
+    @MainActor
+    func testNoSpeechRetryUsesSavedAudioOnceAndMakesRecoveredTextAvailable() async throws {
+        for output in ["", "  recovered words  ", "error"] {
+            let directory = makeTemporaryDirectory()
+            let store = DictationRecoveryAudioStore(directory: directory)
+            store.startNewRecording()
+            store.append(Array(repeating: Float(0.1), count: 1600))
+            let url = try XCTUnwrap(store.preserveActiveRecording())
+            var calls = 0
+            let vm = makeDictationViewModel(appSupportDirectory: directory,
+                modelManager: ModelManagerService(), audioRecordingService: AudioRecordingService(recoveryAudioStore: store),
+                primaryTranscriptionRunner: { samples, _, _, _, _, _, _, _ in
+                    calls += 1
+                    XCTAssertEqual(samples.count, 1600)
+                    if output == "error" { throw NSError(domain: "synthetic", code: 1) }
+                    return TranscriptionResult(text: output, detectedLanguage: "en", duration: 0.1,
+                                               processingTime: 0.01, engineUsed: "synthetic", segments: [])
+                })
+            vm.showNoSpeechFeedback(recoveryURL: url)
+            XCTAssertTrue(vm.canRetryNoSpeech)
+            vm.retryNoSpeechRecording()
+            XCTAssertEqual(vm.noSpeechRetryState, .checking)
+            vm.retryNoSpeechRecording() // Double-click must not start another transcription.
+            for _ in 0..<200 where vm.noSpeechRetryState == .checking {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(calls, 1)
+            XCTAssertFalse(vm.canRetryNoSpeech)
+            XCTAssertFalse(vm.state == .recording)
+            if output == "error" {
+                XCTAssertEqual(vm.noSpeechRetryState, .failed)
+                XCTAssertFalse(vm.isInsertionRecoveryFeedback)
+            } else if output.isEmpty {
+                XCTAssertEqual(vm.noSpeechRetryState, .empty)
+                XCTAssertFalse(vm.isInsertionRecoveryFeedback)
+            } else {
+                XCTAssertEqual(vm.lastTranscribedText, "recovered words")
+                XCTAssertTrue(vm.isInsertionRecoveryFeedback)
+            }
+            vm.retryNoSpeechRecording()
+            XCTAssertEqual(calls, 1)
+        }
+    }
+
+    @MainActor
+    func testCancellingSavedAudioRetryCannotShowALateTranscript() async throws {
+        let directory = makeTemporaryDirectory()
+        let store = DictationRecoveryAudioStore(directory: directory)
+        store.startNewRecording()
+        store.append(Array(repeating: Float(0.1), count: 1600))
+        let url = try XCTUnwrap(store.preserveActiveRecording())
+        let vm = makeDictationViewModel(appSupportDirectory: directory, modelManager: ModelManagerService(),
+            audioRecordingService: AudioRecordingService(recoveryAudioStore: store),
+            primaryTranscriptionRunner: { _, _, _, _, _, _, _, _ in
+                try await Task.sleep(for: .seconds(1))
+                return TranscriptionResult(text: "late text", detectedLanguage: "en", duration: 0.1,
+                                           processingTime: 0.1, engineUsed: "synthetic", segments: [])
+            })
+        vm.showNoSpeechFeedback(recoveryURL: url)
+        vm.retryNoSpeechRecording()
+        try await Task.sleep(for: .milliseconds(30))
+        vm.handleCancelHotkey()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(vm.state, .idle)
+        XCTAssertNil(vm.actionFeedbackMessage)
+        XCTAssertFalse(vm.isInsertionRecoveryFeedback)
+    }
+
+    @MainActor
+    func testNoSpeechWithoutSavedAudioCannotRetryAndMissingFileEndsWithRecordAgain() async throws {
+        let directory = makeTemporaryDirectory()
+        let vm = makeDictationViewModel(appSupportDirectory: directory, modelManager: ModelManagerService(),
+            audioRecordingService: AudioRecordingService(recoveryAudioStore: DictationRecoveryAudioStore(directory: directory)))
+        vm.showNoSpeechFeedback(recoveryURL: nil)
+        vm.retryNoSpeechRecording()
+        XCTAssertFalse(vm.canRetryNoSpeech)
+        XCTAssertEqual(vm.noSpeechRetryState, .unavailable)
+        vm.showNoSpeechFeedback(recoveryURL: directory.appendingPathComponent("missing.wav"))
+        vm.retryNoSpeechRecording()
+        for _ in 0..<200 where vm.noSpeechRetryState == .checking {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(vm.noSpeechRetryState, .failed)
+        XCTAssertFalse(vm.canRetryNoSpeech)
+    }
+
     func testSuccessfulRetryBufferKeepsWholeAudioAndOnlyLastThreeWithoutEvictingFailures() throws {
         let directory = makeTemporaryDirectory()
         let store = DictationRecoveryAudioStore(directory: directory)
@@ -658,7 +744,8 @@ final class DictationRecoveryAudioStoreTests: XCTestCase {
     private func makeDictationViewModel(
         appSupportDirectory: URL,
         modelManager: ModelManagerService,
-        audioRecordingService: AudioRecordingService
+        audioRecordingService: AudioRecordingService,
+        primaryTranscriptionRunner: DictationViewModel.PrimaryTranscriptionRunner? = nil
     ) -> DictationViewModel {
         // Unit tests must start from the documented defaults (preview enabled,
         // preview engine = match dictation engine); the test host app's persisted
@@ -735,7 +822,8 @@ final class DictationRecoveryAudioStoreTests: XCTestCase {
             speechFeedbackService: SpeechFeedbackService(),
             accessibilityAnnouncementService: AccessibilityAnnouncementService(),
             errorLogService: ErrorLogService(appSupportDirectory: appSupportDirectory),
-            mediaPlaybackService: MediaPlaybackService(startListening: false)
+            mediaPlaybackService: MediaPlaybackService(startListening: false),
+            primaryTranscriptionRunner: primaryTranscriptionRunner
         )
     }
 }

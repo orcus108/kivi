@@ -200,6 +200,8 @@ final class TextInsertionService {
     var accessibilityGrantedOverride: Bool?
     var pasteboardProvider: () -> NSPasteboard = { .general }
     var focusedTextElementOverride: (() -> AXUIElement?)?
+    var pasteTargetAssessmentOverride: (() -> PasteTargetAssessment)?
+    var pasteCommandAvailabilityOverride: (() -> PasteCommandAvailability)?
     var focusedTextStateOverride: ((AXUIElement) -> FocusedTextSnapshot?)?
     var focusedTextPlaceholderOverride: ((AXUIElement) -> String?)?
     var liveFieldTargetEligibilityOverride: ((AXUIElement) -> Bool)?
@@ -223,7 +225,7 @@ final class TextInsertionService {
     var captureActiveAppOverride: (() -> (name: String?, bundleId: String?, url: String?))?
     var selectedTextOverride: (() -> String?)?
     var textSelectionViaCopyOverride: (() -> String?)?
-    var pasteVerificationAttempts = 10
+    var pasteVerificationAttempts = 20
     var pasteVerificationPollingDelay: Duration = .milliseconds(50)
     var defaultPasteFallbackRestoreDelay: Duration = .milliseconds(350)
     var richTextPasteFallbackRestoreDelay: Duration = .milliseconds(1500)
@@ -275,6 +277,7 @@ final class TextInsertionService {
 
     enum InsertionResult: Equatable {
         case insertedViaAccessibility
+        case notInsertedNoEditableTarget
         case pasted(verification: PasteVerification)
     }
 
@@ -286,6 +289,7 @@ final class TextInsertionService {
     }
 
     enum PasteVerificationFailure: String, Equatable {
+        case noEditableTarget = "no-editable-target"
         case focusedTextStateUnavailable = "focused-text-state-unavailable"
         case focusedTextUnchanged = "focused-text-unchanged"
     }
@@ -404,6 +408,7 @@ final class TextInsertionService {
 
     struct PasteVerificationState {
         fileprivate let focusedTextState: FocusedTextState?
+        fileprivate var expectedText: String? = nil
     }
 
     fileprivate struct FocusedTextState: Equatable {
@@ -504,28 +509,153 @@ final class TextInsertionService {
         return findSelectionInDescendants(of: element)
     }
 
-    /// Returns the focused text element (even without selection), for later insertion.
-    func getFocusedTextElement(messagingTimeout: Float? = nil) -> AXUIElement? {
+    enum PasteTargetAssessment: Equatable {
+        case editable
+        case nonEditable
+        case unknown
+    }
+
+    /// A document/web area is not an input merely because it has selectable text.
+    static func assessPasteTarget(role: String?, editable: Bool?, selectedTextSettable: Bool,
+                                  valueSettable: Bool, descendantsChecked: Bool) -> PasteTargetAssessment {
+        // Text roles describe keyboard input; AXEditable often describes direct AX mutation.
+        // A false/missing mutation flag must not veto ordinary Cmd+V in a real editor.
+        if ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXSecureTextField"].contains(role ?? "") {
+            return .editable
+        }
+        if editable == true || selectedTextSettable { return .editable }
+        guard let role else { return .unknown }
+        if valueSettable && ["AXWebArea", "AXGroup"].contains(role) { return .editable }
+        // An editor can be hosted inside a container whose AX tree omits focused descendants.
+        if ["AXUnknown", "AXCanvas", "AXGroup", "AXWindow", "AXScrollArea", "AXSplitGroup", "AXApplication"].contains(role) {
+            return .unknown
+        }
+        return .nonEditable
+    }
+
+    private func focusedTextTarget(messagingTimeout: Float? = nil) -> (assessment: PasteTargetAssessment, element: AXUIElement?) {
+        let messagingTimeout = messagingTimeout ?? 0.15
+        if let assessment = pasteTargetAssessmentOverride?(), assessment != .editable { return (assessment, nil) }
         if let focusedTextElementOverride {
-            guard let element = focusedTextElementOverride() else { return nil }
+            let element = focusedTextElementOverride()
+            return (element == nil ? .unknown : .editable, element)
+        }
+        guard isAccessibilityGranted else { return (.unknown, nil) }
+        let system = AXUIElementCreateSystemWide()
+        applyMessagingTimeout(messagingTimeout, to: system)
+        var focused: AnyObject?
+        let result = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused)
+        if result == .noValue { return (.nonEditable, nil) }
+        guard result == .success, var element = axElement(from: focused) else { return (.unknown, nil) }
+        // Follow the focused chain, rather than choosing an arbitrary editor in the window.
+        for _ in 0..<8 {
             applyMessagingTimeout(messagingTimeout, to: element)
-            return element
+            var nested: AnyObject?
+            guard AXUIElementCopyAttributeValue(element, kAXFocusedUIElementAttribute as CFString, &nested) == .success,
+                  let next = axElement(from: nested), !CFEqual(next, element) else { break }
+            element = next
         }
-        guard isAccessibilityGranted else { return nil }
+        func evidence(_ candidate: AXUIElement, descendantsChecked: Bool) -> PasteTargetAssessment {
+            applyMessagingTimeout(messagingTimeout, to: candidate)
+            var editableValue: AnyObject?
+            _ = AXUIElementCopyAttributeValue(candidate, "AXEditable" as CFString, &editableValue)
+            var textWritable = DarwinBoolean(false)
+            var valueWritable = DarwinBoolean(false)
+            _ = AXUIElementIsAttributeSettable(candidate, kAXSelectedTextAttribute as CFString, &textWritable)
+            _ = AXUIElementIsAttributeSettable(candidate, kAXValueAttribute as CFString, &valueWritable)
+            return Self.assessPasteTarget(role: stringAttribute(kAXRoleAttribute as CFString, from: candidate),
+                editable: editableValue as? Bool, selectedTextSettable: textWritable.boolValue,
+                valueSettable: valueWritable.boolValue, descendantsChecked: descendantsChecked)
+        }
+        if evidence(element, descendantsChecked: false) == .editable { return (.editable, element) }
+        func canEnumerateChildren(_ candidate: AXUIElement) -> Bool {
+            var value: AnyObject?
+            let result = AXUIElementCopyAttributeValue(candidate, kAXChildrenAttribute as CFString, &value)
+            return result == .success || result == .noValue
+        }
+        var queue = childElements(of: element).map { ($0, 1) }
+        var seen: [AXUIElement] = [element]
+        var visited = 0
+        var truncated = !canEnumerateChildren(element)
+        let traversalDeadline = ContinuousClock.now.advanced(by: .milliseconds(150))
+        while !queue.isEmpty && visited < 80 {
+            if ContinuousClock.now >= traversalDeadline { truncated = true; break }
+            let (candidate, depth) = queue.removeFirst()
+            if seen.contains(where: { CFEqual($0, candidate) }) { continue }
+            seen.append(candidate)
+            visited += 1
+            var isFocused: AnyObject?
+            _ = AXUIElementCopyAttributeValue(candidate, kAXFocusedAttribute as CFString, &isFocused)
+            if isFocused as? Bool == true, evidence(candidate, descendantsChecked: false) == .editable {
+                return (.editable, candidate)
+            }
+            let children = childElements(of: candidate)
+            let role = stringAttribute(kAXRoleAttribute as CFString, from: candidate)
+            if ["AXGroup", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXLayoutArea", "AXUnknown"].contains(role ?? "AXUnknown"),
+               !canEnumerateChildren(candidate) { truncated = true }
+            if depth < 6 { queue.append(contentsOf: children.map { ($0, depth + 1) }) }
+            else if !children.isEmpty { truncated = true }
+        }
+        let assessment = evidence(element, descendantsChecked: queue.isEmpty && !truncated)
+        return (assessment, nil)
+    }
 
-        let systemWide = AXUIElementCreateSystemWide()
-        applyMessagingTimeout(messagingTimeout, to: systemWide)
-        var focusedElement: AnyObject?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement) == .success else {
-            return nil
-        }
+    enum PasteCommandAvailability: Equatable {
+        case enabled
+        case disabled
+        case unknown
+    }
 
-        guard let element = axElement(from: focusedElement) else { return nil }
-        applyMessagingTimeout(messagingTimeout, to: element)
-        if isLiveFieldTextRole(element) {
-            return element
+    static func isPlainPasteCommand(character: String?, modifiers: Int?) -> Bool {
+        // AX menu modifiers encode Shift=1, Option=2, Control=4, NoCommand=8.
+        character?.lowercased() == "v" && modifiers == 0
+    }
+
+    static func shouldRecoverAfterPaste(verification: PasteVerification,
+        initialTarget: PasteTargetAssessment, finalTarget: PasteTargetAssessment,
+        commandBefore: PasteCommandAvailability, commandAfter: PasteCommandAvailability,
+        sameApplication: Bool) -> Bool {
+        verification != .verified && sameApplication
+            && initialTarget == .nonEditable && finalTarget == .nonEditable
+            && commandBefore == .disabled && commandAfter == .disabled
+    }
+
+    private func pasteCommandAvailability() -> PasteCommandAvailability {
+        if let override = pasteCommandAvailabilityOverride { return override() }
+        guard let app = NSWorkspace.shared.frontmostApplication else { return .unknown }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        applyMessagingTimeout(0.1, to: application)
+        var menuValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute as CFString, &menuValue) == .success,
+              let menuBar = axElement(from: menuValue) else { return .unknown }
+        var queue = [menuBar]
+        var seen: [AXUIElement] = []
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(150))
+        while !queue.isEmpty && seen.count < 150 && ContinuousClock.now < deadline {
+            let item = queue.removeFirst()
+            if seen.contains(where: { CFEqual($0, item) }) { continue }
+            seen.append(item)
+            applyMessagingTimeout(0.1, to: item)
+            var modifiersValue: AnyObject?
+            _ = AXUIElementCopyAttributeValue(item, "AXMenuItemCmdModifiers" as CFString, &modifiersValue)
+            if Self.isPlainPasteCommand(character: stringAttribute("AXMenuItemCmdChar" as CFString, from: item),
+                                        modifiers: (modifiersValue as? NSNumber)?.intValue) {
+                var enabledValue: AnyObject?
+                if AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabledValue) == .success,
+                   let enabled = enabledValue as? Bool {
+                    return enabled ? .enabled : .disabled
+                }
+            }
+            queue.append(contentsOf: childElements(of: item))
         }
-        return findEditableTextDescendant(of: element, messagingTimeout: messagingTimeout)
+        // Absence or incomplete traversal is uncertainty, never a disabled command.
+        return .unknown
+    }
+
+    /// Returns only the actual focused input, including custom editable web areas.
+    /// Read-only web documents and unrelated inputs elsewhere in a window are excluded.
+    func getFocusedTextElement(messagingTimeout: Float? = nil) -> AXUIElement? {
+        focusedTextTarget(messagingTimeout: messagingTimeout).element
     }
 
     /// Replaces the selected text on a previously captured AXUIElement.
@@ -786,8 +916,15 @@ final class TextInsertionService {
         return defaultPasteFallbackRestoreDelay
     }
 
-    func capturePasteVerificationState() -> PasteVerificationState {
-        PasteVerificationState(focusedTextState: captureFocusedTextState())
+    func capturePasteVerificationState(expectedText: String? = nil) -> PasteVerificationState {
+        PasteVerificationState(focusedTextState: captureFocusedTextState(), expectedText: expectedText)
+    }
+
+    static func shouldOfferPasteRecovery(_ verification: PasteVerification) -> Bool {
+        switch verification {
+        case .unverified(.noEditableTarget): true
+        default: false
+        }
     }
 
     func captureInsertionContext() -> InsertionContext? {
@@ -1113,23 +1250,28 @@ final class TextInsertionService {
         return focusedElement == observation.element ? .same : .different
     }
 
+    static func matchesExpectedPaste(before: String, range: NSRange, inserted: String, after: String) -> Bool {
+        guard before != after, let replacement = Range(range, in: before) else { return false }
+        return before.replacingCharacters(in: replacement, with: inserted) == after
+    }
+
     func canRestoreClipboard(afterPasteUsing state: PasteVerificationState) -> Bool {
-        guard let initialState = state.focusedTextState,
-              let currentState = captureFocusedTextState(for: initialState.element) else {
-            return false
+        guard let initial = state.focusedTextState else { return false }
+        if let current = captureFocusedTextState(for: initial.element),
+           Self.focusedTextDidChange(from: (initial.value, initial.selectedText, initial.selectedRange),
+                                    to: (current.value, current.selectedText, current.selectedRange)) {
+            return true
         }
-        return Self.focusedTextDidChange(
-            from: (
-                value: initialState.value,
-                selectedText: initialState.selectedText,
-                selectedRange: initialState.selectedRange
-            ),
-            to: (
-                value: currentState.value,
-                selectedText: currentState.selectedText,
-                selectedRange: currentState.selectedRange
-            )
-        )
+        guard let expected = state.expectedText,
+              let current = captureFocusedTextState(),
+              let before = initial.value, let after = current.value,
+              let range = initial.selectedRange else { return false }
+        var initialPID: pid_t = 0
+        var currentPID: pid_t = 0
+        guard AXUIElementGetPid(initial.element, &initialPID) == .success,
+              AXUIElementGetPid(current.element, &currentPID) == .success,
+              initialPID == currentPID else { return false }
+        return Self.matchesExpectedPaste(before: before, range: range, inserted: expected, after: after)
     }
 
     /// Inserts text into the focused application.
@@ -1159,6 +1301,8 @@ final class TextInsertionService {
         let activeApp = captureActiveApp()
         let appName = activeApp.name
         let bundleId = activeApp.bundleId
+        let initialTargetAssessment = focusedTextTarget().assessment
+        // AX assessment informs feedback, never permission to send the normal keyboard paste.
         let isTerminalApp = bundleId.map { syntheticPastePreferredBundleIdentifiers.contains($0) } ?? false
         let requiresSyntheticPaste = bundleId.map {
             accessibilityInsertionExcludedBundleIdentifiers.contains($0)
@@ -1194,7 +1338,7 @@ final class TextInsertionService {
             : []
         let verifiesBeforeReturning = autoEnter || awaitPasteVerification
         let pasteVerificationState = verifiesBeforeReturning || preserveClipboard
-            ? capturePasteVerificationState()
+            ? capturePasteVerificationState(expectedText: text)
             : nil
         let initialChangeCount = pasteboard.changeCount
 
@@ -1207,6 +1351,7 @@ final class TextInsertionService {
         logger.info(
             "insertText using synthetic paste: bundle=\(bundleId ?? "nil", privacy: .public), preserveClipboard=\(preserveClipboard, privacy: .public), changeCountBefore=\(initialChangeCount, privacy: .public), changeCountAfterWrite=\(ownedChangeCount, privacy: .public)"
         )
+        let pasteCommandBefore = initialTargetAssessment == .nonEditable ? pasteCommandAvailability() : .unknown
         simulatePaste()
         let pasteID = UUID()
         let pastedAt = ContinuousClock.now
@@ -1253,19 +1398,29 @@ final class TextInsertionService {
             verification = .notAwaited
         }
 
-        if autoEnter {
+        // A confirmed insertion needs no additional focus-tree or menu inspection.
+        let finalTargetAssessment = verification == .verified ? initialTargetAssessment : focusedTextTarget().assessment
+        let sameApplication = bundleId != nil && captureActiveApp().bundleId == bundleId
+        let pasteCommandAfter = pasteCommandBefore == .disabled && verification != .verified && sameApplication
+            && finalTargetAssessment == .nonEditable ? pasteCommandAvailability() : .unknown
+        let needsRecovery = Self.shouldRecoverAfterPaste(verification: verification,
+            initialTarget: initialTargetAssessment, finalTarget: finalTargetAssessment,
+            commandBefore: pasteCommandBefore, commandAfter: pasteCommandAfter, sameApplication: sameApplication)
+        if autoEnter, !needsRecovery,
+           verification == .verified || (initialTargetAssessment == .editable && finalTargetAssessment == .editable) {
             try? await Task.sleep(for: autoEnterDelay)
             simulateReturn()
         }
 
-        return .pasted(verification: verification)
+        return needsRecovery ? .notInsertedNoEditableTarget : .pasted(verification: verification)
     }
 
     private func waitForPasteVerification(using state: PasteVerificationState) async -> PasteVerification {
+        // Every verification path needs the original element. Without it, polling cannot
+        // produce evidence; retain the ordinary clipboard fallback delay instead.
         guard state.focusedTextState != nil else {
             return .unverified(.focusedTextStateUnavailable)
         }
-
         let attempts = max(0, pasteVerificationAttempts)
         for attempt in 0...attempts {
             if canRestoreClipboard(afterPasteUsing: state) {
@@ -1275,9 +1430,15 @@ final class TextInsertionService {
             try? await Task.sleep(for: pasteVerificationPollingDelay)
         }
 
-        return canRestoreClipboard(afterPasteUsing: state)
-            ? .verified
-            : .unverified(.focusedTextUnchanged)
+        if canRestoreClipboard(afterPasteUsing: state) { return .verified }
+        // Missing/stale/incomplete AX data is uncertainty, not evidence that paste failed.
+        guard let initial = state.focusedTextState, initial.value != nil,
+              initial.selectedRange != nil,
+              let current = captureFocusedTextState(), current.element == initial.element,
+              current.value != nil, current.selectedRange != nil else {
+            return .unverified(.focusedTextStateUnavailable)
+        }
+        return .unverified(.focusedTextUnchanged)
     }
 
     private func logPasteVerification(_ verification: PasteVerification, bundleId: String?) {
@@ -1585,33 +1746,6 @@ final class TextInsertionService {
 
     private func findSelectionInDescendants(of root: AXUIElement) -> TextSelection? {
         findSelectionInDescendants(of: root, maxDepth: 6, maxNodes: 80)
-    }
-
-    private func findEditableTextDescendant(
-        of root: AXUIElement,
-        messagingTimeout: Float? = nil
-    ) -> AXUIElement? {
-        var queue: [(element: AXUIElement, depth: Int)] = childElements(of: root).map { ($0, 1) }
-        var visited = 0
-
-        while !queue.isEmpty && visited < 80 {
-            let current = queue.removeFirst()
-            visited += 1
-            applyMessagingTimeout(messagingTimeout, to: current.element)
-
-            if isLiveFieldTextRole(current.element),
-               selectedRangeAttribute(from: current.element) != nil {
-                return current.element
-            }
-
-            if current.depth < 6 {
-                queue.append(contentsOf: childElements(of: current.element).map {
-                    ($0, current.depth + 1)
-                })
-            }
-        }
-
-        return nil
     }
 
     private func findSelectionInDescendants(

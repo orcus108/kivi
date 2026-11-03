@@ -168,7 +168,7 @@ enum IntentEditingError: LocalizedError {
     case invalidInput, unavailable, missingModel, invalidResponse, truncated
     var errorDescription: String? {
         switch self {
-        case .invalidInput: return "Use a nonempty selection of up to 8,000 characters and an instruction of up to 1,000 characters."
+        case .invalidInput: return "Use a nonempty selection of up to 8,000 characters and an instruction of up to 4,000 characters."
         case .unavailable: return "The local editor is unavailable. Start Ollama and check the editing model in Setup."
         case .missingModel: return "Install the local editing model with: ollama pull llama3.2"
         case .invalidResponse: return "The editor returned an unusable result. Your original text is unchanged. Try a more specific instruction."
@@ -206,7 +206,7 @@ final class IntentLocalTextEditor: IntentTextEditing, Sendable {
     func rewrite(source: String, instruction: String) async throws -> String {
         guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              source.count <= 8000, instruction.count <= 1000 else { throw IntentEditingError.invalidInput }
+              source.count <= 8000, instruction.count <= 4000 else { throw IntentEditingError.invalidInput }
         if Bundle.main.object(forInfoDictionaryKey: "KiviCombinedEditorPort") != nil { await KiviLocalEditorRuntime.shared.ensureRunning() }
         let requestText = "Editing instruction:\n\(instruction)\n\nSource text:\n<source>\n\(source)\n</source>"
         let payload: [String: Any] = [

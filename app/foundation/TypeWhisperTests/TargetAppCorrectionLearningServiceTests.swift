@@ -1273,6 +1273,129 @@ final class SettledEditDetectionTests: XCTestCase {
         var pinnedText: String? = nil
     }
 
+    private func runLearningSequence(
+        original: String = "Meet Rohan today.", takes: [[Frame]],
+        onFrame: (@MainActor (Int, Int, TargetAppCorrectionLearningService, DictionaryService, UserDefaults) -> Void)? = nil,
+        body: @MainActor (TargetAppCorrectionLearningService, DictionaryService, UserDefaults) throws -> Void
+    ) async throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        let suite = "LearningSequence.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set(true, forKey: TargetAppCorrectionLearningService.localEnabledKey)
+        defer { TestSupport.remove(directory); defaults.removePersistentDomain(forName: suite) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let insertion = TextInsertionService()
+        let element = AXUIElementCreateSystemWide(), other = AXUIElementCreateApplication(1)
+        var take = 0, index = -1
+        var time = Date(timeIntervalSince1970: 1_000)
+        insertion.focusedTextElementOverride = { index < 0 || takes[take][index].sameFocus ? element : other }
+        insertion.focusedTextStateOverride = { target in
+            guard index >= 0 else { return (original, nil, NSRange(location: original.utf16.count, length: 0)) }
+            let frame = takes[take][index]
+            guard let value = !frame.sameFocus && target == element ? frame.pinnedText : frame.text else { return nil }
+            return (value, nil, frame.selection)
+        }
+        var service: TargetAppCorrectionLearningService!
+        service = TargetAppCorrectionLearningService(textInsertionService: insertion, textDiffService: TextDiffService(), dictionaryService: dictionary,
+            pollSchedule: (1...(takes.map(\.count).max() ?? 1)).map { .seconds($0) },
+            sleep: { _ in
+                index = min(index + 1, takes[take].count - 1)
+                time += 1
+                onFrame?(take, index, service, dictionary, defaults)
+            }, defaults: defaults, persistLatestAttempt: false, observeSettledEdits: true, now: { time })
+        for current in takes.indices {
+            take = current; index = -1
+            let baseline = TextInsertionService.FocusedTextObservation(element: element, value: original, selectedText: nil,
+                selectedRange: NSRange(location: original.utf16.count, length: 0), ownedInsertionRange: NSRange(location: 0, length: original.utf16.count))
+            _ = await service.trackInsertion(insertedText: original, baseline: baseline)
+        }
+        try body(service, dictionary, defaults)
+    }
+
+    func testRepeatedMultiCorrectionLearnsBeforeObservationEndsAndFeedsFreshText() async throws {
+        let frames = Array(repeating: Frame(text: "Ask Rohaan and Vedant today!"), count: 6)
+        try await runLearningSequence(original: "Ask Rohan and Vedan today.", takes: [frames, frames], onFrame: { take, frame, _, dictionary, _ in
+            if take == 0 { XCTAssertEqual(dictionary.correctionsCount, 0) }
+            if take == 1 && frame == 4 { XCTAssertEqual(dictionary.correctionsCount, 2, "Feedback must not wait for the two-minute timeout") }
+        }) { _, dictionary, _ in
+            XCTAssertEqual(dictionary.previewCorrections(to: "Vedan called Rohan yesterday."), "Vedant called Rohaan yesterday.")
+            XCTAssertEqual(Set(dictionary.enabledTerms()), Set(["Rohaan", "Vedant"]))
+        }
+    }
+
+    func testOneTakeManySnapshotsIsOnlyOneObservation() async throws {
+        try await runLearningSequence(takes: [Array(repeating: Frame(text: "Meet Rohaan today."), count: 15)]) { service, dictionary, _ in
+            XCTAssertEqual(service.detectedEdits.count, 1)
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+        }
+    }
+
+    func testFailedAutomaticSaveKeepsEvidenceUnconsumedForRetry() async throws {
+        let frames = Array(repeating: Frame(text: "Meet Rohaan today."), count: 5)
+        try await runLearningSequence(takes: [frames, frames], onFrame: { _, _, _, dictionary, _ in
+            dictionary.learningSaveOverride = { throw NSError(domain: "SyntheticSaveFailure", code: 1) }
+        }) { service, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+            XCTAssertTrue(service.detectedEdits.allSatisfy { $0.consumedCandidateKeys?.isEmpty ?? true })
+            XCTAssertTrue(service.reviewedCorrections.isEmpty)
+            XCTAssertTrue(service.reviewMessage?.contains("Could not save") == true)
+            dictionary.learningSaveOverride = nil
+            service.rememberDetectedEdit(id: try XCTUnwrap(service.detectedEdits.last).id)
+            XCTAssertEqual(dictionary.correctionsCount, 1)
+        }
+    }
+
+    func testRevertingSecondTakeWithdrawsProvisionalMemoryAndRestoresEvidence() async throws {
+        let settled = Array(repeating: Frame(text: "Meet Rohaan today."), count: 5)
+        let reverted = settled + Array(repeating: Frame(text: "Meet Rohan today."), count: 4)
+        try await runLearningSequence(takes: [settled, reverted], onFrame: { take, frame, _, dictionary, _ in
+            if take == 1 && frame == 4 { XCTAssertEqual(dictionary.correctionsCount, 1) }
+        }) { service, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+            XCTAssertTrue(dictionary.enabledTerms().isEmpty)
+            XCTAssertTrue(service.reviewedCorrections.isEmpty)
+            XCTAssertFalse(dictionary.isLearningDismissed(original: "Rohan", replacement: "Rohaan"))
+            XCTAssertEqual(service.detectedEdits.count, 1)
+            XCTAssertTrue(service.detectedEdits[0].consumedCandidateKeys?.isEmpty ?? true)
+        }
+        try await runLearningSequence(takes: [settled, reverted, settled]) { _, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 1, "A later independent correction may confirm the lesson")
+        }
+    }
+
+    func testConflictingSpellingsAbstainAndAutomaticOffStillAllowsRemember() async throws {
+        let a = Array(repeating: Frame(text: "Meet Rohaan today."), count: 5)
+        let b = Array(repeating: Frame(text: "Meet Rohann today."), count: 5)
+        try await runLearningSequence(takes: [a, b, a]) { _, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+        }
+        try await runLearningSequence(takes: [a, a], onFrame: { _, _, _, _, defaults in
+            defaults.set(false, forKey: TargetAppCorrectionLearningService.automaticLearningKey)
+        }) { service, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+            service.rememberDetectedEdit(id: try XCTUnwrap(service.detectedEdits.first).id)
+            XCTAssertEqual(dictionary.correctionsCount, 1)
+        }
+    }
+
+    func testCommonWordLearningIsVocabularyOnlyAcrossIndependentTakes() async throws {
+        let frames = Array(repeating: Frame(text: "Try Kivi today."), count: 5)
+        try await runLearningSequence(original: "Try kiwi today.", takes: [frames, frames]) { service, dictionary, _ in
+            XCTAssertEqual(dictionary.termsCount, 1)
+            XCTAssertEqual(dictionary.correctionsCount, 0)
+            XCTAssertEqual(dictionary.previewCorrections(to: "Buy kiwi fruit."), "Buy kiwi fruit.")
+            service.undoReviewedCorrections()
+            XCTAssertTrue(dictionary.enabledTerms().isEmpty)
+        }
+    }
+
+    func testQuickFocusExitCanConfirmPreviouslyObservedCorrection() async throws {
+        let frames = [Frame(text: "Other field", sameFocus: false, pinnedText: "Meet Rohaan today.")]
+        try await runLearningSequence(takes: [frames, frames]) { _, dictionary, _ in
+            XCTAssertEqual(dictionary.correctionsCount, 1)
+        }
+    }
+
     private func runFrames(
         before: String = "", inserted: String = "Meet Rohan today.", selection: NSRange = NSRange(location: 0, length: 0),
         frames: [Frame], onFrame: (@MainActor (Int, TargetAppCorrectionLearningService) -> Void)? = nil,

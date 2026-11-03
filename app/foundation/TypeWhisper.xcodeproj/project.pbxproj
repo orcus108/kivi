@@ -7,6 +7,23 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		6C0F8AC68E16EFA200B871BB /* KiviTalkHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61A1A1A911ECB0D969D03AE6 /* KiviTalkHistoryView.swift */; };
+		8B2A5F406AB430DC8CB84AF9 /* KiviTalkChangeHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0C92BFF68E3C9C1DEF10C78 /* KiviTalkChangeHistory.swift */; };
+		84F33210AC860127E3EE835B /* KiviTalkComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1ED001A96B66AD193B807EFB /* KiviTalkComposer.swift */; };
+		4497AFF721DEE05CF90DE7A9 /* KiviTalkService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AC0BAE7E0B5735F0DB3E4E7 /* KiviTalkService.swift */; };
+		8DDF0632D4B8FE2E737CF712 /* KiviTalkPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D640F2D5496803EFC7FFD12C /* KiviTalkPage.swift */; };
+		5FB67A8D474649E2B0867B99 /* KiviTalkConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 747090C7B4191286BEB69396 /* KiviTalkConversation.swift */; };
+		A20DA9535C70850CB49E3492 /* KiviInsightsShare.swift in Sources */ = {isa = PBXBuildFile; fileRef = A37029E4C8A9CEDF492C7D52 /* KiviInsightsShare.swift */; };
+		AEF211C36CB630C778FD2A8B /* KiviSettingsNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02A87A68A8A50CAA54E6977B /* KiviSettingsNavigation.swift */; };
+		CF3FDE46A558EDAFCF2F22C3 /* KiviSettingsControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 869E866C75A4B0C0E0492939 /* KiviSettingsControls.swift */; };
+		04BA02889E28643E2C4F1BE5 /* KiviHomeActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21D004734A7C07EFEB71CA18 /* KiviHomeActions.swift */; };
+		73C3C471F1174AA96CDC3D59 /* KiviGlobalRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51FBB39BD0B4F272C4ED8F39 /* KiviGlobalRules.swift */; };
+		06FE86BAE2A35A0F7A01CEF3 /* KiviDictionaryMatchPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59233A6C8D80FBFF8B9B10D8 /* KiviDictionaryMatchPreview.swift */; };
+		847A1A81004F1C3F4F1C13BC /* InsightsPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90F84814F72C68F101DFF09C /* InsightsPage.swift */; };
+		4F518A50B960C01FA46DED85 /* InsightsData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 307A2E04D25633359B0630BE /* InsightsData.swift */; };
+		8A9A11351A4C0C97AECD2FF3 /* KiviShortcutRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 711E87C0234008AE1EF9C08B /* KiviShortcutRow.swift */; };
+		B0EBA311BD6122F414FD041C /* KiviRecoveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A418ADB3560336D511CCB7D /* KiviRecoveryView.swift */; };
+		87F50D90B077C33CF5D94D16 /* KiviDictionaryImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FDA7ACFB1B73450AB2C8A4F /* KiviDictionaryImportView.swift */; };
 		5C11FF2FB5E0611103B4B53C /* KiviSettingsSignals.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5D4126FFAAA1C6B64C393DA /* KiviSettingsSignals.swift */; };
 		EDAA98A60829C209F2D68837 /* KiviPresentationWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA2F79591A4C0234714B42A1 /* KiviPresentationWriter.swift */; };
 		431AEAD5FC59C90A33E224B7 /* KiviHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8638D28BD726B4DBB70AE94 /* KiviHistoryStore.swift */; };
@@ -737,6 +754,23 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		61A1A1A911ECB0D969D03AE6 /* KiviTalkHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkHistoryView.swift; sourceTree = SOURCE_ROOT; };
+		E0C92BFF68E3C9C1DEF10C78 /* KiviTalkChangeHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkChangeHistory.swift; sourceTree = SOURCE_ROOT; };
+		1ED001A96B66AD193B807EFB /* KiviTalkComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkComposer.swift; sourceTree = SOURCE_ROOT; };
+		9AC0BAE7E0B5735F0DB3E4E7 /* KiviTalkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkService.swift; sourceTree = SOURCE_ROOT; };
+		D640F2D5496803EFC7FFD12C /* KiviTalkPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkPage.swift; sourceTree = SOURCE_ROOT; };
+		747090C7B4191286BEB69396 /* KiviTalkConversation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviTalkConversation.swift; sourceTree = SOURCE_ROOT; };
+		A37029E4C8A9CEDF492C7D52 /* KiviInsightsShare.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviInsightsShare.swift; sourceTree = SOURCE_ROOT; };
+		02A87A68A8A50CAA54E6977B /* KiviSettingsNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviSettingsNavigation.swift; sourceTree = SOURCE_ROOT; };
+		869E866C75A4B0C0E0492939 /* KiviSettingsControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviSettingsControls.swift; sourceTree = SOURCE_ROOT; };
+		21D004734A7C07EFEB71CA18 /* KiviHomeActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviHomeActions.swift; sourceTree = SOURCE_ROOT; };
+		51FBB39BD0B4F272C4ED8F39 /* KiviGlobalRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviGlobalRules.swift; sourceTree = SOURCE_ROOT; };
+		59233A6C8D80FBFF8B9B10D8 /* KiviDictionaryMatchPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviDictionaryMatchPreview.swift; sourceTree = SOURCE_ROOT; };
+		90F84814F72C68F101DFF09C /* InsightsPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/InsightsPage.swift; sourceTree = SOURCE_ROOT; };
+		307A2E04D25633359B0630BE /* InsightsData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/InsightsData.swift; sourceTree = SOURCE_ROOT; };
+		711E87C0234008AE1EF9C08B /* KiviShortcutRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviShortcutRow.swift; sourceTree = SOURCE_ROOT; };
+		5A418ADB3560336D511CCB7D /* KiviRecoveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviRecoveryView.swift; sourceTree = SOURCE_ROOT; };
+		6FDA7ACFB1B73450AB2C8A4F /* KiviDictionaryImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviDictionaryImportView.swift; sourceTree = SOURCE_ROOT; };
 		E5D4126FFAAA1C6B64C393DA /* KiviSettingsSignals.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviSettingsSignals.swift; sourceTree = SOURCE_ROOT; };
 		DA2F79591A4C0234714B42A1 /* KiviPresentationWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviPresentationWriter.swift; sourceTree = SOURCE_ROOT; };
 		B8638D28BD726B4DBB70AE94 /* KiviHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TypeWhisper/KiviUI/KiviHistoryStore.swift; sourceTree = SOURCE_ROOT; };
@@ -5027,6 +5061,23 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				6C0F8AC68E16EFA200B871BB /* KiviTalkHistoryView.swift in Sources */,
+				8B2A5F406AB430DC8CB84AF9 /* KiviTalkChangeHistory.swift in Sources */,
+				84F33210AC860127E3EE835B /* KiviTalkComposer.swift in Sources */,
+				4497AFF721DEE05CF90DE7A9 /* KiviTalkService.swift in Sources */,
+				8DDF0632D4B8FE2E737CF712 /* KiviTalkPage.swift in Sources */,
+				5FB67A8D474649E2B0867B99 /* KiviTalkConversation.swift in Sources */,
+				A20DA9535C70850CB49E3492 /* KiviInsightsShare.swift in Sources */,
+				AEF211C36CB630C778FD2A8B /* KiviSettingsNavigation.swift in Sources */,
+				CF3FDE46A558EDAFCF2F22C3 /* KiviSettingsControls.swift in Sources */,
+				04BA02889E28643E2C4F1BE5 /* KiviHomeActions.swift in Sources */,
+				73C3C471F1174AA96CDC3D59 /* KiviGlobalRules.swift in Sources */,
+				06FE86BAE2A35A0F7A01CEF3 /* KiviDictionaryMatchPreview.swift in Sources */,
+				847A1A81004F1C3F4F1C13BC /* InsightsPage.swift in Sources */,
+				4F518A50B960C01FA46DED85 /* InsightsData.swift in Sources */,
+				8A9A11351A4C0C97AECD2FF3 /* KiviShortcutRow.swift in Sources */,
+				B0EBA311BD6122F414FD041C /* KiviRecoveryView.swift in Sources */,
+				87F50D90B077C33CF5D94D16 /* KiviDictionaryImportView.swift in Sources */,
 				5C11FF2FB5E0611103B4B53C /* KiviSettingsSignals.swift in Sources */,
 				EDAA98A60829C209F2D68837 /* KiviPresentationWriter.swift in Sources */,
 				431AEAD5FC59C90A33E224B7 /* KiviHistoryStore.swift in Sources */,

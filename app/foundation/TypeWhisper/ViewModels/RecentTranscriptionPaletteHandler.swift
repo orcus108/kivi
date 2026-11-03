@@ -10,6 +10,8 @@ final class RecentTranscriptionPaletteHandler {
     private var isInsertionInProgress = false
 
     var onShowNotchFeedback: ((String, String, TimeInterval, Bool, String?) -> Void)?
+    var onInsertionNeedsRecovery: ((RecentTranscriptionStore.Entry) -> Void)?
+    var onInsertionVerified: ((UUID) -> Void)?
     var getPreserveClipboard: (() -> Bool)?
 
     init(
@@ -92,14 +94,24 @@ final class RecentTranscriptionPaletteHandler {
 
     private func insert(_ entry: RecentTranscriptionStore.Entry) async {
         do {
-            _ = try await textInsertionService.insertText(
+            let result = try await textInsertionService.insertText(
                 entry.finalText,
                 preserveClipboard: getPreserveClipboard?() ?? false,
-                autoEnter: false
+                autoEnter: false,
+                awaitPasteVerification: true
             )
+            if result == .notInsertedNoEditableTarget {
+                onInsertionNeedsRecovery?(entry)
+                return
+            }
+            if case .pasted(let verification) = result, verification != .verified {
+                if TextInsertionService.shouldOfferPasteRecovery(verification) { onInsertionNeedsRecovery?(entry) }
+                return
+            }
+            onInsertionVerified?(entry.id)
             onShowNotchFeedback?(String(localized: "Text inserted"), "checkmark.circle.fill", 2.5, false, nil)
         } catch {
-            onShowNotchFeedback?(error.localizedDescription, "xmark.circle.fill", 2.5, true, "recentTranscriptions")
+            onInsertionNeedsRecovery?(entry)
         }
     }
 

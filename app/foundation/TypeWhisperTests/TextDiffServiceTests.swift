@@ -2,6 +2,49 @@ import XCTest
 @testable import TypeWhisper
 
 final class TextDiffServiceTests: XCTestCase {
+    func testLearningExtractsIndependentNamesDespitePunctuationAndFactEdits() {
+        let result = CorrectionLearningAnalysis.candidates(
+            original: "Meet Rohan, then Vedan on Tuesday for 500.",
+            edited: "Meet Rohaan; then Vedant on Wednesday for 600!")
+        XCTAssertEqual(result.map(\.original), ["Rohan", "Vedan"])
+        XCTAssertEqual(result.map(\.replacement), ["Rohaan", "Vedant"])
+        XCTAssertTrue(result.allSatisfy { $0.kind == .spelling })
+    }
+
+    func testLearningHandlesSplitMergedAndRepeatedTerms() {
+        XCTAssertEqual(CorrectionLearningAnalysis.candidates(original: "Talk to Sar vam today.", edited: "Talk to Sarvam today.").first?.replacement, "Sarvam")
+        let result = CorrectionLearningAnalysis.candidates(original: "Rohan will ask Rohan.", edited: "Rohaan will ask Rohaan.")
+        XCTAssertEqual(result.count, 1, "Repeated names within one paragraph are one piece of evidence")
+    }
+
+    func testLearningCommonWordConfusionIsVocabularyOnly() {
+        let result = CorrectionLearningAnalysis.candidates(original: "Try kiwi today.", edited: "Try Kivi today.")
+        XCTAssertEqual(result.first?.kind, .vocabulary)
+        XCTAssertEqual(result.first?.replacement, "Kivi")
+        XCTAssertEqual(CorrectionLearningAnalysis.candidates(original: "Try KIVI today.", edited: "Try Kivi today.").first?.kind, .vocabulary)
+    }
+
+    func testLearningRejectsFactsNegationOrdinarySpellingAndCode() {
+        for (old, new) in [("Tuesday works", "Wednesday works"), ("Pay 500", "Pay 5000"),
+                           ("We can go", "We cannot go"), ("Send it", "Sent it"),
+                           ("Color the box", "Colour the box"), ("Meet Rohan", "Meet Rohit"),
+                           ("Use `Rohan`", "Use `Rohaan`"), ("Meet Rohan_id", "Meet Rohaan_id"),
+                           ("Meet Rohan at x.com", "Meet Rohan at y.com")] {
+            XCTAssertTrue(CorrectionLearningAnalysis.candidates(original: old, edited: new).isEmpty, "\(old) → \(new)")
+        }
+        XCTAssertTrue(CorrectionLearningAnalysis.candidates(original: String(repeating: "x", count: 2_001), edited: "Rohaan").isEmpty)
+    }
+
+    func testLearningDoesNotMineAddressesOrPathsButKeepsIndependentNameEdit() {
+        for (old, new) in [("Email Rohan@example.com", "Email Rohaan@example.com"),
+                           ("Open https://Rohan.com", "Open https://Rohaan.com"),
+                           ("Open /Users/Rohan/file", "Open /Users/Rohaan/file")] {
+            XCTAssertTrue(CorrectionLearningAnalysis.candidates(original: old, edited: new).isEmpty)
+        }
+        let result = CorrectionLearningAnalysis.candidates(original: "Ask Rohan at Rohan@example.com.", edited: "Ask Rohaan at Rohaan@example.com.")
+        XCTAssertEqual(result.map(\.replacement), ["Rohaan"])
+    }
+
     func testWordDiffPreservesRepeatedWordTieBreaking() {
         let service = TextDiffService()
         XCTAssertEqual(service.computeWordDiff(original: "a b", processed: "b a"), [

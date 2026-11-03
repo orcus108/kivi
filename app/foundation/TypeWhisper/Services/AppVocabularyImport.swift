@@ -6,10 +6,11 @@ enum AppVocabularyImport {
     }
 
     enum Source: String, CaseIterable, Identifiable, Sendable {
-        case wisprFlow, handy, wisprCSV
+        case wisprFlow, handy, wisprCSV, aquaVoice
         var id: String { rawValue }
         var name: String {
             switch self {
+            case .aquaVoice: "Aqua Voice"
             case .wisprFlow: "Wispr Flow"
             case .handy: "Handy"
             case .wisprCSV: "CSV (Wispr Flow-compatible)"
@@ -25,7 +26,7 @@ enum AppVocabularyImport {
             switch self {
             case .wisprFlow: return support.appendingPathComponent("Wispr Flow/flow.sqlite")
             case .handy: return support.appendingPathComponent("com.pais.handy/settings_store.json")
-            case .wisprCSV: return nil
+            case .wisprCSV, .aquaVoice: return nil
             }
         }
     }
@@ -110,6 +111,20 @@ enum AppVocabularyImport {
 
     static func load(source: Source, url: URL, destination: Destination, csvHasHeader: Bool = false) throws -> Batch {
         switch source {
+        case .aquaVoice:
+            guard destination == .dictionary else { throw AppVocabularyImportError.invalidFormat }
+            let data = try boundedData(url)
+            guard var text = String(data: data, encoding: .utf8) else { throw AppVocabularyImportError.invalidFormat }
+            if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+            let lines = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n")
+            guard lines.count <= maximumRows else { throw AppVocabularyImportError.tooLarge }
+            var batch = Batch()
+            for line in lines {
+                let word = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !word.isEmpty, word != "#", !word.hasPrefix("# ") else { continue }
+                append(original: word, replacement: nil, destination: destination, to: &batch)
+            }
+            return batch
         case .wisprFlow:
             return try WisprFlowImportReader.read(url: url, destination: destination)
         case .handy:

@@ -34,7 +34,7 @@ final class AppVocabularyImportViewModel: ObservableObject {
     }
 
     var sources: [AppVocabularyImport.Source] {
-        destination == .dictionary ? [.wisprFlow, .handy, .wisprCSV] : [.wisprFlow, .wisprCSV]
+        destination == .dictionary ? [.wisprFlow, .handy, .wisprCSV, .aquaVoice] : [.wisprFlow, .wisprCSV]
     }
 
     var additions: [AppVocabularyImport.Entry] {
@@ -67,6 +67,7 @@ final class AppVocabularyImportViewModel: ObservableObject {
         case .wisprFlow:
             // SQLite files may have no registered UTType. The reader validates the schema.
             panel.allowedContentTypes = [.data]
+        case .aquaVoice: panel.allowedContentTypes = [.plainText]
         case .handy: panel.allowedContentTypes = [.json]
         case .wisprCSV: panel.allowedContentTypes = [.commaSeparatedText, .plainText]
         }

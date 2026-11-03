@@ -26,10 +26,32 @@ enum DictionaryCorrectionMatchPolicy {
     case substring
 }
 
+struct DictionaryAliasSuggestion: Equatable {
+    let heard: String
+    let written: String
+}
+
+/// A reviewable result from the same resolver used by final and streaming dictation.
+struct DictionaryMatchReview {
+    struct Change: Equatable {
+        let entryID: UUID
+        let correctionID: UUID?
+        let heard: String
+        let written: String
+        let reason: String
+    }
+    let text: String
+    let changes: [Change]
+    let conflicts: [String]
+    var correctionIDs: Set<UUID> { Set(changes.compactMap(\.correctionID)) }
+}
+
 struct LearnedDictionaryCorrection: Identifiable, Equatable, Sendable {
     let id: UUID
     let original: String
     let replacement: String
+    var isVocabulary = false
+    var savedAt: Date? = nil
 }
 
 struct DictionaryCorrectionLearningResult: Equatable, Sendable {
@@ -50,6 +72,8 @@ final class DictionaryService: ObservableObject {
     private var modelContainer: ModelContainer?
     private var modelContext: ModelContext?
     private var hasDeferredUsageCountChanges = false
+    private let dismissedLearningURL: URL
+    private var dismissedLearning: Set<String> = []
 
     @Published private(set) var entries: [DictionaryEntry] = []
     @Published private(set) var terms: [DictionaryEntry] = []
@@ -65,6 +89,7 @@ final class DictionaryService: ObservableObject {
 
     #if DEBUG
     private var trainingSaveOverride: (() throws -> Void)?
+    var learningSaveOverride: (() throws -> Void)?
 
     func setTrainingSaveOverrideForTesting(_ override: (() throws -> Void)?) {
         trainingSaveOverride = override
@@ -72,7 +97,44 @@ final class DictionaryService: ObservableObject {
     #endif
 
     init(appSupportDirectory: URL = AppConstants.appSupportDirectory) {
+        dismissedLearningURL = appSupportDirectory.appendingPathComponent("dismissed-correction-learning.json")
+        if let data = try? Data(contentsOf: dismissedLearningURL),
+           let saved = try? JSONDecoder().decode(Set<String>.self, from: data) {
+            dismissedLearning = saved
+        }
         setupModelContainer(appSupportDirectory: appSupportDirectory)
+    }
+
+    private static func learningKey(original: String, replacement: String, vocabulary: Bool = false) -> String {
+        vocabulary ? "term|\(replacement.lowercased())" : "correction|\(original.lowercased())|\(replacement.lowercased())"
+    }
+
+    func isLearningDismissed(original: String, replacement: String, vocabulary: Bool = false) -> Bool {
+        dismissedLearning.contains(Self.learningKey(original: original, replacement: replacement, vocabulary: vocabulary))
+    }
+
+    private func suppressLearning(for entries: [DictionaryEntry]) throws {
+        var updated = dismissedLearning
+        for entry in entries where entry.source == .autoLearned {
+            updated.insert(Self.learningKey(original: entry.original,
+                replacement: entry.replacement ?? entry.original, vocabulary: entry.type == .term))
+        }
+        guard updated != dismissedLearning else { return }
+        try JSONEncoder().encode(updated).write(to: dismissedLearningURL, options: .atomic)
+        dismissedLearning = updated
+    }
+
+    /// Explicitly reviewed teaching is the only way to permit a dismissed lesson again.
+    @discardableResult
+    func allowLearning(original: String, replacement: String, vocabulary: Bool = false) -> Bool {
+        var updated = dismissedLearning
+        updated.remove(Self.learningKey(original: original, replacement: replacement, vocabulary: vocabulary))
+        guard updated != dismissedLearning else { return true }
+        do {
+            try JSONEncoder().encode(updated).write(to: dismissedLearningURL, options: .atomic)
+            dismissedLearning = updated
+            return true
+        } catch { return false }
     }
 
     private func setupModelContainer(appSupportDirectory: URL) {
@@ -227,6 +289,10 @@ final class DictionaryService: ObservableObject {
     ) {
         guard let context = modelContext else { return }
 
+        if entry.original != original || entry.replacement != replacement {
+            do { try suppressLearning(for: [entry]) }
+            catch { logger.error("Could not preserve dismissed learning before edit: \(error.localizedDescription)"); return }
+        }
         entry.original = original
         entry.replacement = replacement
         entry.caseSensitive = caseSensitive
@@ -244,6 +310,8 @@ final class DictionaryService: ObservableObject {
     func deleteEntry(_ entry: DictionaryEntry) {
         guard let context = modelContext else { return }
 
+        do { try suppressLearning(for: [entry]) }
+        catch { logger.error("Could not preserve dismissed learning before delete: \(error.localizedDescription)"); return }
         context.delete(entry)
 
         do {
@@ -407,6 +475,7 @@ final class DictionaryService: ObservableObject {
         let entriesToDelete = entries.filter { ids.contains($0.id) }
         guard !entriesToDelete.isEmpty else { return }
 
+        try suppressLearning(for: entriesToDelete)
         for entry in entriesToDelete {
             context.delete(entry)
         }
@@ -425,13 +494,22 @@ final class DictionaryService: ObservableObject {
     /// Get all enabled terms as a comma-separated string for Whisper prompt.
     /// Truncates at 600 characters to stay within the API's 224-token limit.
     func enabledTerms() -> [String] {
-        PluginDictionaryTerms.normalizedTerms(from: terms.map(\.original))
+        PluginDictionaryTerms.normalizedTerms(from: terms.map(\.original) + learnedRecognitionSpellings())
     }
 
     func enabledTermHints() -> [PluginDictionaryTermHint] {
         PluginDictionaryTerms.normalizedTermHints(from: terms.map {
             PluginDictionaryTermHint(text: $0.original, ctcMinSimilarity: $0.ctcMinSimilarity)
-        })
+        } + learnedRecognitionSpellings().map { PluginDictionaryTermHint(text: $0) })
+    }
+
+    private func learnedRecognitionSpellings() -> [String] {
+        let disabled = Set(entries.filter { !$0.isEnabled }.map { ($0.replacement ?? $0.original).lowercased() })
+        return corrections.filter { $0.source == .autoLearned }.compactMap { entry in
+            guard let target = entry.replacement, !target.isEmpty, target.count <= 64,
+                  !disabled.contains(target.lowercased()) else { return nil }
+            return target
+        }
     }
 
     func setTerms(_ rawTerms: [String], replaceExisting: Bool) {
@@ -702,34 +780,12 @@ final class DictionaryService: ObservableObject {
         deferUsageCountSave: Bool,
         countedCorrectionIDs: inout Set<UUID>
     ) -> [String] {
-        var results = texts
-        var needsSave = false
-
-        for correction in correctionsForApplication {
-            guard let replacement = correction.replacement else { continue }
-
-            var correctionWasApplied = false
-            for index in results.indices {
-                let before = results[index]
-                results[index] = applyCorrection(correction, to: before, replacement: replacement)
-                correctionWasApplied = correctionWasApplied || results[index] != before
-            }
-
-            if correctionWasApplied, countedCorrectionIDs.insert(correction.id).inserted {
-                correction.usageCount += 1
-                needsSave = true
-            }
-        }
-
-        if needsSave {
-            if deferUsageCountSave {
-                hasDeferredUsageCountChanges = true
-            } else {
-                saveUsageCounts()
-            }
-        }
-
-        return results
+        let reviews = texts.map { reviewMatches(in: $0) }
+        let usedIDs = reviews.reduce(into: Set<UUID>()) { $0.formUnion($1.correctionIDs) }
+        let newlyCounted = usedIDs.subtracting(countedCorrectionIDs)
+        countedCorrectionIDs.formUnion(usedIDs)
+        recordUsage(ofCorrectionIDs: newlyCounted, deferUsageCountSave: deferUsageCountSave)
+        return reviews.map(\.text)
     }
 
     /// Applies all enabled corrections without touching usage counters, for text that is
@@ -743,16 +799,9 @@ final class DictionaryService: ObservableObject {
     /// text to `appliedCorrectionIDs`, so a caller can count their usage later with
     /// `recordUsage(ofCorrectionIDs:deferUsageCountSave:)` once the result is actually used.
     func previewCorrections(to text: String, appliedCorrectionIDs: inout Set<UUID>) -> String {
-        var result = text
-        for correction in correctionsForApplication {
-            guard let replacement = correction.replacement else { continue }
-            let before = result
-            result = applyCorrection(correction, to: before, replacement: replacement)
-            if result != before {
-                appliedCorrectionIDs.insert(correction.id)
-            }
-        }
-        return result
+        let review = reviewMatches(in: text)
+        appliedCorrectionIDs.formUnion(review.correctionIDs)
+        return review.text
     }
 
     /// Counts one use for each enabled correction whose id is in `correctionIDs`.
@@ -786,30 +835,247 @@ final class DictionaryService: ObservableObject {
         }
     }
 
-    private func applyCorrection(_ correction: DictionaryEntry, to text: String, replacement: String) -> String {
+    private struct MatchCandidate {
+        let matchRange: Range<String.Index>
+        let isDeletion: Bool
+        let range: Range<String.Index>
+        let replacement: String
+        let entryID: UUID
+        let priority: Int
+        let reason: String
+    }
+
+    /// Resolve against the input once. Preferred spellings are terminal, explicit aliases
+    /// beat inferred formatting, and equally strong conflicting matches leave text alone.
+    func reviewMatches(in text: String) -> DictionaryMatchReview {
+        guard !text.isEmpty else { return .init(text: text, changes: [], conflicts: []) }
+        var candidates: [MatchCandidate] = []
+        var conflicts = Set<String>()
+        let preferred = terms.map { ($0, $0.original) } + corrections.compactMap { entry in
+            entry.replacement.map { (entry, $0) }
+        }
+        // Protect complete preferred outputs across passes, including aliases that point
+        // into another rule. This also prevents a shorter alias corrupting a saved name.
+        var terminalRanges: [Range<String.Index>] = []
+        for (_, spelling) in preferred where !spelling.isEmpty {
+            var start = text.startIndex
+            while start < text.endIndex,
+                  let range = text.range(of: spelling, range: start..<text.endIndex) {
+                if isBoundaryMatch(range, in: text, original: spelling) { terminalRanges.append(range) }
+                start = range.upperBound
+            }
+        }
+        func append(_ range: Range<String.Index>, _ replacement: String,
+                    entry: DictionaryEntry, priority: Int, reason: String) {
+            guard text[range] != replacement,
+                  !self.isStructuredTokenFragment(range, in: text) else { return }
+            if terminalRanges.contains(where: { $0.lowerBound <= range.lowerBound && range.upperBound <= $0.upperBound }) {
+                // Self-expansion is handled by the legacy matcher; report cross-rule
+                // collisions only when the source itself is a complete preferred output.
+                if terminalRanges.contains(range) {
+                    conflicts.insert("“\(text[range])” is already a preferred spelling; its competing rule was skipped.")
+                }
+                return
+            }
+            let isDeletion = entry.type == .correction && entry.replacement?.isEmpty == true
+            let matchRange = isDeletion ? self.boundaryEvaluationRange(for: range, in: text) : range
+            candidates.append(.init(matchRange: matchRange, isDeletion: isDeletion,
+                                    range: range, replacement: replacement, entryID: entry.id,
+                                    priority: priority, reason: reason))
+        }
+        for correction in correctionsForApplication {
+            guard let replacement = correction.replacement else { continue }
+            _ = applyCorrection(correction, to: text, replacement: replacement) { range, output in
+                let comparisonRange = replacement.isEmpty ? self.boundaryEvaluationRange(for: range, in: text) : range
+                let source = replacement.isEmpty ? correction.original.trimmingCharacters(in: .whitespacesAndNewlines) : correction.original
+                let literal = self.textMatches(String(text[comparisonRange]), source, caseSensitive: correction.caseSensitive)
+                append(range, output, entry: correction, priority: literal ? 3 : 2,
+                       reason: literal ? "saved alias" : "alias formatting variant")
+            }
+        }
+        // Plain vocabulary remains an engine hint: it is not authority to rewrite common
+        // words (for example, Linear / linear). Only distinctive compound spellings have
+        // enough structure for deterministic formatting without guessing their meaning.
+        for (entry, spelling) in preferred where Self.hasDistinctiveWordStructure(spelling) {
+            _ = replacingBoundaryMatches(of: spelling, in: text, with: spelling,
+                                         caseSensitive: entry.caseSensitive) { range, output in
+                append(range, output, entry: entry, priority: 1, reason: "preferred spelling")
+            }
+        }
+        // Longest matched span wins; within the same span, a literal alias wins over
+        // formatting inference. Stable identifiers affect ordering, never conflict outcomes.
+        candidates.sort {
+            let left = text.distance(from: $0.matchRange.lowerBound, to: $0.matchRange.upperBound)
+            let right = text.distance(from: $1.matchRange.lowerBound, to: $1.matchRange.upperBound)
+            if left != right { return left > right }
+            if $0.priority != $1.priority { return $0.priority > $1.priority }
+            if $0.range.lowerBound != $1.range.lowerBound { return $0.range.lowerBound < $1.range.lowerBound }
+            return $0.entryID.uuidString < $1.entryID.uuidString
+        }
+        var occupied: [Range<String.Index>] = []
+        var selected: [MatchCandidate] = []
+        for candidate in candidates {
+            guard !occupied.contains(where: { $0.overlaps(candidate.matchRange) }) else { continue }
+            let peers = candidates.filter { $0.matchRange == candidate.matchRange && $0.priority == candidate.priority }
+            occupied.append(candidate.matchRange)
+            guard Set(peers.map(\.replacement)).count == 1 else {
+                conflicts.insert("“\(text[candidate.range])” matches different preferred spellings; no replacement was made.")
+                continue
+            }
+            selected.append(candidate)
+        }
+        selected.sort { $0.matchRange.lowerBound < $1.matchRange.lowerBound }
+        var edits: [(range: Range<String.Index>, replacement: String, isDeletion: Bool)] = []
+        var changes: [DictionaryMatchReview.Change] = []
+        for candidate in selected {
+            changes.append(.init(entryID: candidate.entryID, correctionID: candidate.priority > 1 ? candidate.entryID : nil,
+                                 heard: String(text[candidate.matchRange]),
+                                 written: candidate.isDeletion ? "" : candidate.replacement, reason: candidate.reason))
+            // Adjacent deletions can share whitespace padding. Merge their removal spans
+            // before rendering so one deletion cannot hide another or leave a stray space.
+            if candidate.isDeletion, let last = edits.last, last.isDeletion,
+               last.range.upperBound >= candidate.range.lowerBound {
+                let union = min(last.range.lowerBound, candidate.range.lowerBound)..<max(last.range.upperBound, candidate.range.upperBound)
+                let merged = boundaryReplacement(for: union, in: text, replacement: "", lowerLimit: text.startIndex)
+                edits[edits.count - 1] = (merged.range, merged.text, true)
+            } else {
+                edits.append((candidate.range, candidate.replacement, candidate.isDeletion))
+            }
+        }
+        var output = ""
+        var cursor = text.startIndex
+        for edit in edits {
+            let lower = max(cursor, edit.range.lowerBound)
+            output += text[cursor..<lower]
+            output += edit.replacement
+            cursor = max(cursor, edit.range.upperBound)
+        }
+        output += text[cursor...]
+        return .init(text: output, changes: changes, conflicts: conflicts.sorted())
+    }
+
+    /// A word rule must not silently rewrite part of an address, URL, filename or
+    /// code token. A saved rule covering the entire token still has explicit authority.
+    private func isStructuredTokenFragment(_ range: Range<String.Index>, in text: String) -> Bool {
+        var lower = range.lowerBound
+        var upper = range.upperBound
+        while lower > text.startIndex {
+            let previous = text.index(before: lower)
+            guard !text[previous].isWhitespace, !"()[]{}<>,;\"".contains(text[previous]) else { break }
+            lower = previous
+        }
+        while upper < text.endIndex, !text[upper].isWhitespace,
+              !"()[]{}<>,;\"".contains(text[upper]) { upper = text.index(after: upper) }
+        while upper > range.upperBound {
+            let previous = text.index(before: upper)
+            guard ".!?:".contains(text[previous]) else { break }
+            upper = previous
+        }
+        guard lower != range.lowerBound || upper != range.upperBound else { return false }
+        let token = String(text[lower..<upper])
+        return token.contains("@") || token.contains("://") || token.contains("`") ||
+            token.hasPrefix("/") || token.hasPrefix("~/") || token.hasPrefix("./") ||
+            token.range(of: #"[\p{L}\p{N}]\.[\p{L}]"#, options: .regularExpression) != nil
+    }
+
+    /// Suggestions are deliberately separate from dictation matching. A nearby spelling
+    /// is evidence to review, never authority to change the transcript or learn a rule.
+    func suggestedAliases(in text: String) -> [DictionaryAliasSuggestion] {
+        guard !text.isEmpty, text.count <= 2_000,
+              let tokenizer = try? NSRegularExpression(pattern: #"[\p{L}\p{N}]+(?:[-'’][\p{L}\p{N}]+)*"#) else { return [] }
+        let ranges = tokenizer.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            .compactMap { Range($0.range, in: text) }
+        let preferred = terms.map(\.original) + corrections.compactMap(\.replacement)
+        let mappings = preferred.map { ($0, $0) } + corrections.compactMap { entry in
+            entry.replacement.map { (entry.original, $0) }
+        }
+        let targets = mappings.map { (key: Self.suggestionKey($0.0), written: $0.1) }
+            .filter { $0.key.count >= 6 && $0.key.count <= 64 && !$0.written.isEmpty && $0.written.count <= 64 }
+        let knownKeys = Set(targets.map(\.key))
+        var suggestions: [DictionaryAliasSuggestion] = []
+        for index in ranges.indices {
+            for count in 1...min(4, ranges.count - index) {
+                let last = index + count - 1
+                if count > 1 {
+                    let gap = text[ranges[last - 1].upperBound..<ranges[last].lowerBound]
+                    // An n-gram may cross horizontal spaces, never punctuation or lines.
+                    guard !gap.isEmpty, gap.allSatisfy({ $0.isWhitespace && !$0.isNewline }) else { break }
+                }
+                let range = ranges[index].lowerBound..<ranges[last].upperBound
+                guard !isStructuredTokenFragment(range, in: text) else { continue }
+                let source = String(text[range])
+                let key = Self.suggestionKey(source)
+                guard key.count >= 6, key.count <= 64, !knownKeys.contains(key) else { continue }
+                let nearby = Set(targets.filter { Self.isOneEditApart(key, $0.key) }.map(\.written)).sorted()
+                guard !nearby.isEmpty, previewCorrections(to: source) == source else { continue }
+                for target in nearby {
+                    let suggestion = DictionaryAliasSuggestion(heard: source, written: target)
+                    if !suggestions.contains(suggestion) { suggestions.append(suggestion) }
+                    if suggestions.count == 3 { return suggestions }
+                }
+            }
+        }
+        return suggestions
+    }
+
+    private static func suggestionKey(_ text: String) -> String {
+        String(text.lowercased().filter { $0.isLetter || $0.isNumber })
+    }
+
+    private static func isOneEditApart(_ lhs: String, _ rhs: String) -> Bool {
+        guard lhs != rhs else { return false }
+        let a = Array(lhs), b = Array(rhs)
+        guard abs(a.count - b.count) <= 1 else { return false }
+        if a.count == b.count {
+            let differences = a.indices.filter { a[$0] != b[$0] }
+            if differences.count == 1 { return true }
+            return differences.count == 2 && differences[1] == differences[0] + 1 &&
+                a[differences[0]] == b[differences[1]] && a[differences[1]] == b[differences[0]]
+        }
+        let shorter = a.count < b.count ? a : b
+        let longer = a.count < b.count ? b : a
+        var shortIndex = 0, longIndex = 0, skipped = false
+        while shortIndex < shorter.count && longIndex < longer.count {
+            if shorter[shortIndex] == longer[longIndex] {
+                shortIndex += 1
+                longIndex += 1
+            } else {
+                guard !skipped else { return false }
+                skipped = true
+                longIndex += 1
+            }
+        }
+        return true
+    }
+
+    private static func hasDistinctiveWordStructure(_ spelling: String) -> Bool {
+        let characters = Array(spelling)
+        guard characters.count >= 4 else { return false }
+        return characters.indices.dropFirst().contains { index in
+            characters[index].isUppercase && characters[index - 1].isLetter &&
+                (characters[index - 1].isLowercase ||
+                 (index + 1 < characters.count && characters[index + 1].isLowercase))
+        }
+    }
+
+    private func applyCorrection(_ correction: DictionaryEntry, to text: String, replacement: String,
+                                 onMatch: ((Range<String.Index>, String) -> Void)? = nil) -> String {
         switch matchPolicy(for: correction) {
         case .exact:
-            return textMatches(text, correction.original, caseSensitive: correction.caseSensitive) ? replacement : text
+            guard textMatches(text, correction.original, caseSensitive: correction.caseSensitive) else { return text }
+            onMatch?(text.startIndex..<text.endIndex, replacement)
+            return replacement
         case .boundary:
             return replacingBoundaryMatches(
                 of: correction.original,
                 in: text,
                 with: replacement,
-                caseSensitive: correction.caseSensitive
+                caseSensitive: correction.caseSensitive,
+                onMatch: onMatch
             )
         case .substring:
             let options: String.CompareOptions = correction.caseSensitive ? [] : [.caseInsensitive]
             let contexts = Self.reexpansionContexts(of: correction.original, in: replacement, options: options, locale: nil)
-            guard !contexts.isEmpty else {
-                if correction.caseSensitive {
-                    return text.replacingOccurrences(of: correction.original, with: replacement)
-                }
-                return text.replacingOccurrences(
-                    of: correction.original,
-                    with: replacement,
-                    options: .caseInsensitive
-                )
-            }
             var result = ""
             var searchStart = text.startIndex
             while let range = text.range(of: correction.original, options: options, range: searchStart..<text.endIndex),
@@ -822,6 +1088,7 @@ final class DictionaryService: ObservableObject {
                     options: options,
                     locale: nil
                 )
+                if !alreadyCorrected { onMatch?(range, replacement) }
                 result += alreadyCorrected ? String(text[range]) : replacement
                 searchStart = range.upperBound
             }
@@ -845,19 +1112,17 @@ final class DictionaryService: ObservableObject {
         of original: String,
         in replacement: String,
         options: String.CompareOptions,
-        locale: Locale?
+        locale: Locale?,
+        flexibleSpacing: Bool = false
     ) -> [ReexpansionContext] {
         guard !original.isEmpty, !replacement.isEmpty else { return [] }
         let wholeReplacement = replacement.startIndex..<replacement.endIndex
         var contexts: [ReexpansionContext] = []
         var searchStart = replacement.startIndex
         while searchStart < replacement.endIndex,
-              let range = replacement.range(
-                  of: original,
-                  options: options,
-                  range: searchStart..<replacement.endIndex,
-                  locale: locale
-              ) {
+              let range = nextSpellingRange(of: original, in: replacement, options: options,
+                                            range: searchStart..<replacement.endIndex, locale: locale,
+                                            flexibleSpacing: flexibleSpacing) {
             if range != wholeReplacement {
                 contexts.append(ReexpansionContext(
                     prefix: String(replacement[..<range.lowerBound]),
@@ -919,11 +1184,70 @@ final class DictionaryService: ObservableObject {
         return text.compare(original, options: [.caseInsensitive], locale: .current) == .orderedSame
     }
 
+    /// Retain Foundation's existing Unicode comparison semantics for literal matches;
+    /// regex normalization supplements it rather than replacing it.
+    private static func nextSpellingRange(of original: String, in text: String,
+                                          options: String.CompareOptions, range: Range<String.Index>,
+                                          locale: Locale?, flexibleSpacing: Bool) -> Range<String.Index>? {
+        let literal = text.range(of: original, options: options, range: range, locale: locale)
+        guard flexibleSpacing, let pattern = boundarySearchPattern(original),
+              let normalized = text.range(of: pattern, options: options.union(.regularExpression), range: range, locale: locale) else {
+            return literal
+        }
+        guard let literal else { return normalized }
+        if literal.lowerBound != normalized.lowerBound {
+            return literal.lowerBound < normalized.lowerBound ? literal : normalized
+        }
+        return literal.upperBound >= normalized.upperBound ? literal : normalized
+    }
+
+    /// Normalize only boundaries that the saved spelling actually supplies. Preserve
+    /// significant punctuation, digits, diacritics, underscores and line boundaries.
+    private static func boundarySearchPattern(_ original: String) -> String? {
+        guard original == original.trimmingCharacters(in: .whitespacesAndNewlines),
+              !original.contains(where: { $0.isNewline }) else { return nil }
+        let characters = Array(original)
+        var pattern = ""
+        var changed = false
+        var previousWasSeparator = false
+        let separator = "[\\p{Zs}\\t]*[-‐‑]?[\\p{Zs}\\t]*"
+        for index in characters.indices {
+            let character = characters[index]
+            let before = index > 0 ? characters[index - 1] : nil
+            let after = index + 1 < characters.count ? characters[index + 1] : nil
+            let isSeparator = character.isWhitespace || "-‐‑".contains(character)
+            if isSeparator {
+                // Relax only internal word separators, not punctuation operators or
+                // leading/trailing whitespace used by explicit deletion rules.
+                if !previousWasSeparator { pattern += separator }
+                previousWasSeparator = true
+                changed = true
+                continue
+            }
+            if !previousWasSeparator, character.isUppercase, let before, before.isLetter,
+               before.isLowercase || (before.isUppercase && after?.isLowercase == true) {
+                pattern += separator
+                changed = true
+            }
+            if "'’".contains(character), before?.isLetter == true, after?.isLetter == true {
+                pattern += "['’]"
+                changed = true
+            } else {
+                pattern += NSRegularExpression.escapedPattern(for: String(character))
+            }
+            previousWasSeparator = false
+        }
+        // Operators and punctuation-only sources keep the original literal semantics.
+        guard changed, characters.first?.isLetter == true, characters.last?.isLetter == true else { return nil }
+        return pattern
+    }
+
     private func replacingBoundaryMatches(
         of original: String,
         in text: String,
         with replacement: String,
-        caseSensitive: Bool
+        caseSensitive: Bool,
+        onMatch: ((Range<String.Index>, String) -> Void)? = nil
     ) -> String {
         let boundaryOriginal = original.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !original.isEmpty, !boundaryOriginal.isEmpty else { return text }
@@ -931,9 +1255,11 @@ final class DictionaryService: ObservableObject {
         var result = ""
         var searchStart = text.startIndex
         let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
-        let contexts = Self.reexpansionContexts(of: original, in: replacement, options: options, locale: .current)
+        let contexts = Self.reexpansionContexts(of: original, in: replacement, options: options, locale: .current, flexibleSpacing: true)
 
-        while let range = text.range(of: original, options: options, range: searchStart..<text.endIndex, locale: .current) {
+        while let range = Self.nextSpellingRange(of: original, in: text, options: options,
+                                                range: searchStart..<text.endIndex, locale: .current,
+                                                flexibleSpacing: true) {
             guard range.lowerBound < range.upperBound else { break }
             let boundaryRange = boundaryEvaluationRange(for: range, in: text)
 
@@ -946,6 +1272,7 @@ final class DictionaryService: ObservableObject {
                     replacement: replacement,
                     lowerLimit: searchStart
                 )
+                onMatch?(resolvedReplacement.range, resolvedReplacement.text)
                 result += text[searchStart..<resolvedReplacement.range.lowerBound]
                 result += resolvedReplacement.text
                 searchStart = resolvedReplacement.range.upperBound
@@ -1041,13 +1368,13 @@ final class DictionaryService: ObservableObject {
         }
 
         if original.isAllLatinOrNumber {
-            return previous?.isLatinOrNumber != true && next?.isLatinOrNumber != true
+            return previous?.isLatinOrNumber != true && next?.isLatinOrNumber != true && previous != "_" && next != "_"
         }
 
-        let startsAtBoundary = previous?.isWordLike != true || previous?.isJapaneseParticleBoundary == true
-        let endsAtBoundary = next?.isWordLike != true ||
+        let startsAtBoundary = previous != "_" && (previous?.isWordLike != true || previous?.isJapaneseParticleBoundary == true)
+        let endsAtBoundary = next != "_" && (next?.isWordLike != true ||
             next?.isJapaneseParticleBoundary == true ||
-            (original.count > 1 && String(text[range.upperBound...]).startsWithJapaneseParticleBoundary)
+            (original.count > 1 && String(text[range.upperBound...]).startsWithJapaneseParticleBoundary))
         return startsAtBoundary && endsAtBoundary
     }
 
@@ -1078,6 +1405,7 @@ final class DictionaryService: ObservableObject {
         )
         let now = Date()
         var learned: [LearnedDictionaryCorrection] = []
+        var insertedEntries: [DictionaryEntry] = []
         var duplicateCount = 0
 
         for suggestion in suggestions {
@@ -1087,6 +1415,13 @@ final class DictionaryService: ObservableObject {
 
             guard !original.isEmpty,
                   originalKey != replacement.lowercased() else {
+                continue
+            }
+            guard !isLearningDismissed(original: original, replacement: replacement),
+                  !entries.contains(where: { !$0.isEnabled && ($0.original.lowercased() == originalKey || ($0.replacement ?? $0.original).lowercased() == replacement.lowercased()) }),
+                  !(entries + insertedEntries).contains(where: { $0.type == .correction &&
+                      ($0.original.lowercased() == replacement.lowercased() || $0.replacement?.lowercased() == originalKey) }) else {
+                duplicateCount += 1
                 continue
             }
             guard !existingOriginals.contains(originalKey) else {
@@ -1104,11 +1439,13 @@ final class DictionaryService: ObservableObject {
                 updatedAt: now
             )
             context.insert(entry)
+            insertedEntries.append(entry)
             existingOriginals.insert(originalKey)
             learned.append(LearnedDictionaryCorrection(
                 id: entry.id,
                 original: original,
-                replacement: replacement
+                replacement: replacement,
+                savedAt: now
             ))
         }
 
@@ -1121,6 +1458,9 @@ final class DictionaryService: ObservableObject {
         }
 
         do {
+            #if DEBUG
+            try learningSaveOverride?()
+            #endif
             try context.save()
             loadEntries()
             return DictionaryCorrectionLearningResult(
@@ -1129,13 +1469,47 @@ final class DictionaryService: ObservableObject {
                 failed: false
             )
         } catch {
-            context.rollback()
+            // A learning failure must not roll back deferred usage or other edits.
+            for entry in insertedEntries { context.delete(entry) }
+            context.processPendingChanges()
+            loadEntries()
             logger.error("Failed to learn corrections: \(error.localizedDescription)")
             return DictionaryCorrectionLearningResult(
                 learnedCorrections: [],
                 duplicateCount: duplicateCount,
                 failed: true
             )
+        }
+    }
+
+    /// Vocabulary-only memory cannot rewrite a legitimate common word. It uses the
+    /// same dictionary store, visibility, disabling, and deletion as manual terms.
+    func learnVocabularyWithResult(_ word: String) -> DictionaryCorrectionLearningResult {
+        let word = word.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let context = modelContext else {
+            return .init(learnedCorrections: [], duplicateCount: 0, failed: true)
+        }
+        guard !word.isEmpty, word.count <= 64,
+              !isLearningDismissed(original: word, replacement: word, vocabulary: true),
+              !entries.contains(where: { !$0.isEnabled && ($0.replacement ?? $0.original).lowercased() == word.lowercased() }),
+              !entries.contains(where: { $0.type == .term && $0.original.lowercased() == word.lowercased() }) else {
+            return .init(learnedCorrections: [], duplicateCount: 1, failed: false)
+        }
+        let date = Date()
+        let entry = DictionaryEntry(type: .term, original: word, source: .autoLearned, createdAt: date, updatedAt: date)
+        context.insert(entry)
+        do {
+            #if DEBUG
+            try learningSaveOverride?()
+            #endif
+            try context.save()
+            loadEntries()
+            return .init(learnedCorrections: [.init(id: entry.id, original: word, replacement: word, isVocabulary: true, savedAt: date)], duplicateCount: 0, failed: false)
+        } catch {
+            context.delete(entry)
+            context.processPendingChanges()
+            loadEntries()
+            return .init(learnedCorrections: [], duplicateCount: 0, failed: true)
         }
     }
 
@@ -1260,21 +1634,32 @@ final class DictionaryService: ObservableObject {
         }
     }
 
-    func undoLearnedCorrections(_ learned: [LearnedDictionaryCorrection]) {
-        guard let context = modelContext, !learned.isEmpty else { return }
+    @discardableResult
+    func undoLearnedCorrections(_ learned: [LearnedDictionaryCorrection], suppressRelearning: Bool = true) -> Bool {
+        guard !learned.isEmpty else { return true }
+        guard let context = modelContext else { return false }
 
         let learnedByID = Dictionary(uniqueKeysWithValues: learned.map { ($0.id, $0) })
         let entriesToDelete = entries.filter { entry in
-            guard entry.type == .correction,
-                  let learned = learnedByID[entry.id] else {
+            guard entry.source == .autoLearned,
+                  let learned = learnedByID[entry.id],
+                  entry.type == (learned.isVocabulary ? .term : .correction),
+                  learned.savedAt == nil || entry.effectiveUpdatedAt == learned.savedAt else {
                 return false
             }
 
             return entry.original == learned.original &&
-                (entry.replacement ?? "") == learned.replacement
+                (learned.isVocabulary ? entry.original : entry.replacement ?? "") == learned.replacement
         }
 
-        guard !entriesToDelete.isEmpty else { return }
+        guard !entriesToDelete.isEmpty else { return true }
+
+        do {
+            if suppressRelearning { try suppressLearning(for: entriesToDelete) }
+        } catch {
+            logger.error("Could not persist dismissed learning: \(error.localizedDescription)")
+            return false
+        }
 
         for entry in entriesToDelete {
             context.delete(entry)
@@ -1283,8 +1668,10 @@ final class DictionaryService: ObservableObject {
         do {
             try context.save()
             loadEntries()
+            return true
         } catch {
             logger.error("Failed to undo learned corrections: \(error.localizedDescription)")
+            return false
         }
     }
 

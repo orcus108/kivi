@@ -1494,3 +1494,39 @@ extension HistoryService {
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 }
+
+// Speech-only Insights uses retained History, not the mixed legacy usage counters.
+extension HistoryService {
+    func kiviInsightDays(calendar: Calendar = .current) async throws -> [KiviInsightDay] {
+        let container = modelContainer
+        let scan = Task.detached(priority: .utility) {
+            let context = ModelContext(container)
+            var days: [Date: KiviInsightDay] = [:]
+            try context.enumerate(FetchDescriptor<TranscriptionRecord>(), batchSize: 500) { record in
+                try Task.checkCancellation()
+                guard record.engineUsed != "typed", record.source == .mac,
+                      record.processingState == .ready else { return }
+                // Count recognised speech before snippet expansion / rewriting when available.
+                let original = record.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let tokens = (original.isEmpty ? record.finalText : original).split(whereSeparator: \.isWhitespace)
+                let words = tokens.count
+                guard words > 0 else { return }
+                let date = calendar.startOfDay(for: record.timestamp)
+                var day = days[date] ?? KiviInsightDay(id: date)
+                day.words += words; day.count += 1
+                if record.durationSeconds.isFinite, record.durationSeconds > 0 {
+                    day.seconds += record.durationSeconds; day.timedCount += 1
+                    day.timedWords += words
+                    day.timedCharacters += tokens.joined(separator: " ").count
+                }
+                let key = UsageStatisticsKeys.appKey(bundleIdentifier: record.appBundleIdentifier, appName: record.appName)
+                let name = record.appName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                var app = day.apps[key] ?? KiviInsightApp(id: key, name: name.flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown app")
+                app.count += 1; app.words += words; day.apps[key] = app
+                days[date] = day
+            }
+            return days.values.sorted { $0.id < $1.id }
+        }
+        return try await withTaskCancellationHandler { try await scan.value } onCancel: { scan.cancel() }
+    }
+}

@@ -3,6 +3,7 @@ import SwiftUI
 struct HotkeyRecorderView: View {
     enum Presentation {
         case row
+        case kivi
         case iconButton(systemName: String)
         case compactChip
     }
@@ -42,6 +43,8 @@ struct HotkeyRecorderView: View {
     var body: some View {
         Group {
             switch presentation {
+            case .kivi:
+                kiviControl
             case .row:
                 rowBody
             case .iconButton(let systemName):
@@ -50,6 +53,7 @@ struct HotkeyRecorderView: View {
                 compactChipBody
             }
         }
+        .onDisappear { if isRecording { cancelRecording() } }
         .sheet(isPresented: $showVisualKeyboard) {
             VisualShortcutKeyboardView(
                 editingHotkey: hotkey,
@@ -67,6 +71,18 @@ struct HotkeyRecorderView: View {
                 }
             )
             .id(visualKeyboardSession)
+        }
+    }
+
+    private var kiviControl: some View {
+        HStack(spacing: 8) {
+            Button(isRecording ? "press a key… esc to cancel" : label.isEmpty ? "set shortcut" : label) {
+                if isRecording { cancelRecording() } else { startRecording() }
+            }.buttonStyle(KiviButton())
+                .accessibilityLabel(isRecording ? "Recording shortcut - press a key or Escape to cancel" : "Change shortcut for \(title): \(label.isEmpty ? "not set" : label)")
+            if !isRecording && !label.isEmpty {
+                IconButton(icon: "xmark", label: "clear \(title) shortcut", action: onClear)
+            }
         }
     }
 

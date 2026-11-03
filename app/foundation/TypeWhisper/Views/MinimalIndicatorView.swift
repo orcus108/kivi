@@ -102,7 +102,8 @@ struct MinimalIndicatorView: View {
             for: .minimal,
             message: actionFeedbackMessage,
             actionTitle: presentation.actionFeedbackActionTitle,
-            kiviNoSpeech: viewModel.isNoSpeechFeedback
+            kiviNoSpeech: viewModel.isNoSpeechFeedback,
+            kiviInsertionRecovery: viewModel.isInsertionRecoveryFeedback
         )
     }
 
@@ -208,15 +209,22 @@ struct MinimalIndicatorView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if viewModel.isNoSpeechFeedback, actionFeedbackMessage != nil {
-            KiviNoSpeechNotice(hasRecovery: presentation.actionFeedbackActionTitle != nil,
-                               retry: { viewModel.kiviToggleRecording() },
-                               review: { viewModel.recoverLastRecording() })
-                .padding(.horizontal, 22).padding(.vertical, 16)
-                .frame(height: actionFeedbackBody.height)
-                .background { KiviBackground().clipShape(RoundedRectangle(cornerRadius: 14)) }
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(KiviTheme.green.opacity(0.3)))
-                .shadow(color: .black.opacity(0.25), radius: 14, y: 5)
+        if viewModel.isInsertionRecoveryFeedback, actionFeedbackMessage != nil {
+            KiviInsertionRecoveryNotice(shortcut: viewModel.insertionRecoveryShortcut,
+                                        copy: { viewModel.performActionFeedbackAction() })
+                .padding(.horizontal, 28).padding(.vertical, 14)
+                .frame(width: 300, height: 100)
+                .background(KiviTheme.background, in: RoundedRectangle(cornerRadius: 28))
+                .scaleEffect(0.75)
+                .frame(width: actionFeedbackBody.width, height: actionFeedbackBody.height)
+                .onHover { viewModel.setActionFeedbackHovered($0) }
+        } else if viewModel.isNoSpeechFeedback, actionFeedbackMessage != nil {
+            KiviNoSpeechNotice(state: viewModel.noSpeechRetryState, retry: { viewModel.retryNoSpeechRecording() })
+                .padding(.horizontal, 20).padding(.vertical, 20)
+                .frame(width: 300, height: 110)
+                .background(KiviTheme.background, in: RoundedRectangle(cornerRadius: 28))
+                .scaleEffect(0.75)
+                .frame(width: actionFeedbackBody.width, height: actionFeedbackBody.height)
                 .onHover { viewModel.setActionFeedbackHovered($0) }
         } else {
             contentBody

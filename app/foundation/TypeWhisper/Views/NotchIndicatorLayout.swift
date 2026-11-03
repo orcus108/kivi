@@ -26,10 +26,14 @@ enum IndicatorFeedbackPanelLayout {
         message: String?,
         actionTitle: String? = nil,
         notchClosedWidth: CGFloat = 0,
-        kiviNoSpeech: Bool = false
+        kiviNoSpeech: Bool = false,
+        kiviInsertionRecovery: Bool = false
     ) -> FeedbackBody {
+        if style == .minimal && kiviInsertionRecovery {
+            return FeedbackBody(width: 225, height: 75, lineLimit: 2)
+        }
         if style == .minimal && kiviNoSpeech {
-            return FeedbackBody(width: 340, height: 156, lineLimit: 2)
+            return FeedbackBody(width: 225, height: 82.5, lineLimit: 2)
         }
         let baseWidth: CGFloat
         switch style {
@@ -136,7 +140,8 @@ enum IndicatorFeedbackPanelLayout {
         notchClosedHeight: CGFloat = NotchIndicatorLayout.notchedClosedHeight,
         feedbackMessage: String? = nil,
         feedbackActionTitle: String? = nil,
-        kiviNoSpeech: Bool = false
+        kiviNoSpeech: Bool = false,
+        kiviInsertionRecovery: Bool = false
     ) -> CGSize {
         guard isFeedbackInteractive else {
             switch style {
@@ -154,7 +159,8 @@ enum IndicatorFeedbackPanelLayout {
             message: feedbackMessage,
             actionTitle: feedbackActionTitle,
             notchClosedWidth: notchClosedWidth,
-            kiviNoSpeech: kiviNoSpeech
+            kiviNoSpeech: kiviNoSpeech,
+            kiviInsertionRecovery: kiviInsertionRecovery
         )
         switch style {
         case .notch:

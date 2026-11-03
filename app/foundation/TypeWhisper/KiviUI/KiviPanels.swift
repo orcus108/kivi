@@ -4,26 +4,45 @@ import Combine
 
 /// Shared outcome card for the recording pill and the main writing pad.
 struct KiviNoSpeechNotice: View {
-    let hasRecovery: Bool
+    var state: DictationViewModel.NoSpeechRetryState
     var retry: () -> Void
-    var review: () -> Void
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "mic.slash").font(.system(size: 14)).foregroundStyle(KiviTheme.green)
-                    .frame(width: 30, height: 30).background(KiviTheme.green.opacity(0.1), in: Circle())
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("no speech recognised").font(KiviTheme.serif(23)).foregroundStyle(KiviTheme.ink)
-                    Text(hasRecovery ? "your recording is saved for review." : "ready for another take when you are.")
-                        .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
-                        .lineSpacing(3).fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
+        VStack(spacing: 12) {
+            Text(title).font(KiviTheme.medium(20)).foregroundStyle(KiviTheme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            if case .ready = state {
+                Button(action: retry) { Label("try again", systemImage: "arrow.clockwise") }
+                    .buttonStyle(KiviButton(primary: true)).help("Transcribe this saved recording again")
+            } else if state == .checking {
+                Text("listening to the saved audio").font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
+            } else {
+                Text("please record again").font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
             }
-            HStack(spacing: 8) {
-                Button(action: retry) { Label("try again", systemImage: "arrow.clockwise") }.buttonStyle(KiviButton(primary: true))
-                if hasRecovery { Button("review recording", action: review).buttonStyle(KiviButton()) }
-                Spacer(minLength: 0)
+        }.frame(maxWidth: .infinity)
+    }
+    private var title: String {
+        switch state {
+        case .checking: "checking your recording…"
+        case .empty: "no speech found"
+        case .failed: "couldn’t check recording"
+        default: "no speech recognised"
+        }
+    }
+}
+
+struct KiviInsertionRecoveryNotice: View {
+    let shortcut: String?
+    var copy: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("your text is ready").font(KiviTheme.medium(24)).foregroundStyle(KiviTheme.green)
+            if let shortcut {
+                (Text("press ").foregroundColor(KiviTheme.muted)
+                 + Text(shortcut).foregroundColor(KiviTheme.ink)
+                 + Text(" to paste").foregroundColor(KiviTheme.muted))
+                    .font(KiviTheme.body(15))
+            } else {
+                Button("copy your text", action: copy).buttonStyle(KiviButton(primary: true))
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -33,6 +52,7 @@ struct KiviNoSpeechNotice: View {
     static let shared = KiviAdvancedWindow()
     private var panel: NSWindow?
     func show(_ section: String) {
+        if section == "recovery" { KiviRecoveryWindow.shared.show(); return }
         let mapping: [String: SettingsTab] = ["general": .general, "appearance": .appearance, "dictionary": .dictionary, "shortcuts": .snippets, "models": .integrations, "microphone": .dictation, "hotkeys": .hotkeys, "recovery": .dictationRecovery, "files": .fileTranscription, "recorder": .recorder, "workflows": .workflows, "privacy": .advanced]
         let target = mapping[section] ?? .general
         if panel == nil {

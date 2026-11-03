@@ -6,6 +6,37 @@ import XCTest
 
 @MainActor
 final class RecentTranscriptionPaletteHandlerTests: XCTestCase {
+    func testFailedOlderTakeRecoveryCarriesSelectedTextRatherThanLatest() async throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let insertion = TextInsertionService()
+        insertion.accessibilityGrantedOverride = true
+        insertion.pasteboardProvider = { NSPasteboard.withUniqueName() }
+        insertion.pasteTargetAssessmentOverride = { .nonEditable }
+        insertion.pasteCommandAvailabilityOverride = { .disabled }
+        insertion.captureActiveAppOverride = { ("Fixture", "synthetic.fixture", nil) }
+        insertion.pasteVerificationAttempts = 0
+        insertion.pasteSimulatorOverride = {}
+        let store = RecentTranscriptionStore()
+        let older = UUID()
+        store.recordTranscription(id: older, finalText: "Older selected take", timestamp: Date().addingTimeInterval(-60), appName: nil, appBundleIdentifier: nil)
+        store.recordTranscription(id: UUID(), finalText: "Newer unrelated take", appName: nil, appBundleIdentifier: nil)
+        let controller = SelectionPaletteControllerSpy()
+        let handler = RecentTranscriptionPaletteHandler(textInsertionService: insertion,
+            historyService: HistoryService(appSupportDirectory: directory), recentTranscriptionStore: store,
+            paletteController: controller)
+        let recovered = expectation(description: "selected take recovery")
+        handler.onInsertionNeedsRecovery = { entry in
+            XCTAssertEqual(entry.id, older)
+            XCTAssertEqual(entry.finalText, "Older selected take")
+            recovered.fulfill()
+        }
+        handler.onInsertionVerified = { _ in XCTFail("Failed insertion must remain unresolved") }
+        handler.triggerSelection(currentState: .idle)
+        controller.select(id: older)
+        await fulfillment(of: [recovered], timeout: 3)
+    }
+
     func testTriggerSelectionOpensOnlyWhenIdle() throws {
         let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
         defer { TestSupport.remove(appSupportDirectory) }

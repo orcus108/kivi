@@ -234,6 +234,8 @@ final class TargetAppCorrectionLearningService: ObservableObject {
         let original: String
         let edited: String
         var usedForLearning: Bool? = nil
+        var consumedCandidateKeys: [String]? = nil
+        var observationID: UUID? = nil
     }
     static let detectedEditsKey = "intentDetectedEdits"
     static let automaticLearningKey = "intentAutomaticSpellingLearning"
@@ -246,8 +248,14 @@ final class TargetAppCorrectionLearningService: ObservableObject {
     private var currentBaseline: TextInsertionService.FocusedTextObservation?
     private var latestDetectedValue: String?
     private var ignoredCurrentValue: String?
+    private var provisionalMemories: [(key: String, memory: LearnedDictionaryCorrection)] = []
+    private var learnedPanel: KiviLearnedWordsPanel?
+    private var feedbackExpiry: Task<Void, Never>?
+    private var candidateCache: [UUID: (original: String, edited: String, candidates: [CorrectionLearningCandidate])] = [:]
 
     func clearDetectedEdits() {
+        // Clearing evidence is separate from Undoing a saved dictionary memory.
+        provisionalMemories = []
         detectedEdits = []
         ignoredCurrentValue = latestDetectedValue
         currentDetectedID = nil
@@ -255,19 +263,24 @@ final class TargetAppCorrectionLearningService: ObservableObject {
     }
 
     func removeDetectedEdit(id: UUID) {
+        let wasCurrent = currentDetectedID == id
+        let ignored = latestDetectedValue
+        if wasCurrent { discardCurrentDetectedEdit(userDismissed: true) }
         detectedEdits.removeAll { $0.id == id }
-        if currentDetectedID == id { ignoredCurrentValue = latestDetectedValue; currentDetectedID = nil }
+        if wasCurrent { ignoredCurrentValue = ignored; currentDetectedID = nil }
         persistDetectedEdits()
     }
 
-    func stopDetection() {
+    func stopDetection(hideFeedback: Bool = true) {
+        if hideFeedback { hideLearningFeedback() }
         // A new take may begin before another poll. Keep a captured edit only if the
         // same old element still has that exact text, including when it is unfocused.
         if let baseline = currentBaseline, let value = latestDetectedValue,
            textInsertionService.recapturePinnedTextObservation(baseline)?.value != value {
             discardCurrentDetectedEdit()
         }
-        if let id = currentDetectedID { learnRepeatedSpelling(id: id) }
+        // Settled captures learn immediately; stopping must never promote a partial edit.
+        provisionalMemories = []
         detectionGeneration = nil
         currentBaseline = nil
         currentDetectedID = nil
@@ -309,71 +322,154 @@ final class TargetAppCorrectionLearningService: ObservableObject {
         return candidate
     }
 
+    static func learningCandidates(for edit: DetectedEdit) -> [CorrectionLearningCandidate] {
+        CorrectionLearningAnalysis.candidates(original: edit.original, edited: edit.edited)
+    }
+
+    func cachedCandidates(for edit: DetectedEdit) -> [CorrectionLearningCandidate] {
+        if let cached = candidateCache[edit.id], cached.original == edit.original, cached.edited == edit.edited { return cached.candidates }
+        let result = Self.learningCandidates(for: edit)
+        candidateCache[edit.id] = (edit.original, edit.edited, result)
+        return result
+    }
+
+    private func evidenceCount(for candidate: CorrectionLearningCandidate) -> Int {
+        Set(detectedEdits.filter { edit in
+            edit.usedForLearning != true && now().timeIntervalSince(edit.timestamp) >= 0 &&
+            now().timeIntervalSince(edit.timestamp) < 86_400 &&
+            !(edit.consumedCandidateKeys ?? []).contains(candidate.key) &&
+            cachedCandidates(for: edit).contains(where: { $0.key == candidate.key })
+        }.map { $0.observationID ?? $0.id }).count
+    }
+
     func classification(for edit: DetectedEdit) -> String {
-        guard let suggestion = Self.spellingSuggestion(for: edit) else { return "Other edit · kept as a sample only" }
-        if edit.usedForLearning == true { return "Spelling evidence already used · review the rule in Dictionary" }
-        let count = detectedEdits.filter {
-            guard $0.usedForLearning != true, now().timeIntervalSince($0.timestamp) < 86_400 else { return false }
-            guard let other = Self.spellingSuggestion(for: $0) else { return false }
-            return other.original == suggestion.original && other.replacement == suggestion.replacement
-        }.count
-        return "Spelling candidate: \(suggestion.original) → \(suggestion.replacement) · \(count)/2 observations"
+        let candidates = cachedCandidates(for: edit)
+        guard !candidates.isEmpty else { return "No reusable spelling found · no rule saved" }
+        return candidates.map { candidate in
+            if dictionaryService.isLearningDismissed(original: candidate.original, replacement: candidate.replacement, vocabulary: candidate.kind == .vocabulary) {
+                return "\(candidate.replacement) · dismissed; automatic learning blocked"
+            }
+            if edit.usedForLearning == true || (edit.consumedCandidateKeys ?? []).contains(candidate.key) {
+                return "\(candidate.replacement) · evidence used; review in Dictionary"
+            }
+            let kind = candidate.kind == .vocabulary ? "vocabulary only" : "spelling"
+            return "\(candidate.original) → \(candidate.replacement) · \(kind) · \(evidenceCount(for: candidate))/2 takes"
+        }.joined(separator: "\n")
     }
 
     func rememberDetectedEdit(id: UUID) {
         guard defaults.bool(forKey: Self.localEnabledKey),
               let edit = detectedEdits.first(where: { $0.id == id }),
-              let suggestion = Self.spellingSuggestion(for: edit) else { return }
+              now().timeIntervalSince(edit.timestamp) >= 0,
+              now().timeIntervalSince(edit.timestamp) < 86_400 else { return }
         if currentDetectedID == id {
             guard let baseline = currentBaseline,
                   textInsertionService.recapturePinnedTextObservation(baseline)?.value == latestDetectedValue else {
                 discardCurrentDetectedEdit(); return
             }
         }
-        saveDetectedSpelling(suggestion)
+        for candidate in cachedCandidates(for: edit) {
+            // A deliberate Remember action may teach a previously dismissed lesson.
+            guard dictionaryService.allowLearning(original: candidate.original, replacement: candidate.replacement, vocabulary: candidate.kind == .vocabulary) else {
+                reviewMessage = "Could not update learning preferences. Try again in Dictionary."
+                continue
+            }
+            saveDetectedCandidate(candidate, provisional: currentDetectedID == id)
+        }
     }
 
-    private func learnRepeatedSpelling(id: UUID) {
+    private func learnRepeatedSpellings(id: UUID) {
         guard defaults.bool(forKey: Self.localEnabledKey),
               defaults.object(forKey: Self.automaticLearningKey) as? Bool ?? true,
-              let edit = detectedEdits.first(where: { $0.id == id }),
-              edit.usedForLearning != true,
-              let suggestion = Self.spellingSuggestion(for: edit) else { return }
-        let count = detectedEdits.filter {
-            guard $0.usedForLearning != true, now().timeIntervalSince($0.timestamp) < 86_400 else { return false }
-            guard let other = Self.spellingSuggestion(for: $0) else { return false }
-            return other.original == suggestion.original && other.replacement == suggestion.replacement
-        }.count
-        guard count >= 2 else { return }
-        saveDetectedSpelling(suggestion)
-    }
-
-    private func saveDetectedSpelling(_ suggestion: CorrectionSuggestion) {
-        let result = learnCorrections([suggestion])
-        if !result.failed {
-            // Consumed evidence cannot recreate a deleted/undone rule on the next
-            // take. Learning again needs two fresh independent observations.
-            for index in detectedEdits.indices {
-                if let other = Self.spellingSuggestion(for: detectedEdits[index]),
-                   other.original == suggestion.original, other.replacement == suggestion.replacement {
-                    detectedEdits[index].usedForLearning = true
+              let edit = detectedEdits.first(where: { $0.id == id }) else { return }
+        for candidate in cachedCandidates(for: edit) {
+            guard evidenceCount(for: candidate) >= 2 else { continue }
+            // Contradictory fresh teaching for one source needs human review.
+            let conflicting = detectedEdits.contains { other in
+                now().timeIntervalSince(other.timestamp) < 86_400 && other.usedForLearning != true &&
+                cachedCandidates(for: other).contains {
+                    $0.original.lowercased() == candidate.original.lowercased() && $0.replacement.lowercased() != candidate.replacement.lowercased()
                 }
             }
-            persistDetectedEdits()
+            guard !conflicting else { continue }
+            saveDetectedCandidate(candidate, provisional: true)
         }
-        if !result.learnedCorrections.isEmpty {
-            reviewedCorrections.append(contentsOf: result.learnedCorrections)
-            reviewMessage = "Learned \(suggestion.original) → \(suggestion.replacement) locally. Undo or edit it in Dictionary → Auto-learned."
-        } else if result.failed { reviewMessage = "Could not save spelling. Your document is unchanged." }
-        else { reviewMessage = "An existing dictionary rule was kept." }
+    }
+
+    private func saveDetectedCandidate(_ candidate: CorrectionLearningCandidate, provisional: Bool) {
+        let result = candidate.kind == .vocabulary
+            ? dictionaryService.learnVocabularyWithResult(candidate.replacement)
+            : learnCorrections([CorrectionSuggestion(original: candidate.original, replacement: candidate.replacement)])
+        guard !result.failed else {
+            reviewMessage = "Could not save this word. Try again in Dictionary."
+            return
+        }
+        guard !result.learnedCorrections.isEmpty else { return }
+        for index in detectedEdits.indices where cachedCandidates(for: detectedEdits[index]).contains(where: { $0.key == candidate.key }) {
+            var consumed = Set(detectedEdits[index].consumedCandidateKeys ?? [])
+            consumed.insert(candidate.key)
+            detectedEdits[index].consumedCandidateKeys = consumed.sorted()
+        }
+        persistDetectedEdits()
+        reviewedCorrections.append(contentsOf: result.learnedCorrections)
+        if provisional {
+            provisionalMemories.append(contentsOf: result.learnedCorrections.map { (candidate.key, $0) })
+        }
+        reviewMessage = candidate.kind == .vocabulary
+            ? "Learned \(candidate.replacement) as vocabulary. Other words stay unchanged."
+            : "Learned \(candidate.original) → \(candidate.replacement)."
+        showLearnedFeedback()
+    }
+
+    private func showLearnedFeedback() {
+        guard !AppConstants.isRunningTests else { return }
+        if learnedPanel == nil { learnedPanel = KiviLearnedWordsPanel(service: self) }
+        learnedPanel?.showFeedback()
+        setLearningFeedbackHovered(false)
+    }
+
+    func setLearningFeedbackHovered(_ hovered: Bool) {
+        feedbackExpiry?.cancel()
+        if hovered { return }
+        feedbackExpiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard !Task.isCancelled else { return }
+            self?.learnedPanel?.orderOut(nil)
+        }
+    }
+
+    func hideLearningFeedback() {
+        feedbackExpiry?.cancel()
+        learnedPanel?.orderOut(nil)
     }
 
     private func persistDetectedEdits() {
-        detectedEdits = Array(detectedEdits.filter { now().timeIntervalSince($0.timestamp) < 86_400 }.suffix(50))
+        detectedEdits = Array(detectedEdits.filter { now().timeIntervalSince($0.timestamp) >= 0 && now().timeIntervalSince($0.timestamp) < 86_400 }.suffix(50))
+        let ids = Set(detectedEdits.map(\.id))
+        candidateCache = candidateCache.filter { ids.contains($0.key) }
         if let data = try? JSONEncoder().encode(detectedEdits) { defaults.set(data, forKey: Self.detectedEditsKey) }
     }
 
-    private func discardCurrentDetectedEdit() {
+    private func discardCurrentDetectedEdit(userDismissed: Bool = false) {
+        // Continued typing or Undo invalidates only memories created by this active
+        // observation. Never delete an independently learned or subsequently edited rule.
+        if !provisionalMemories.isEmpty {
+            let memories = provisionalMemories.map(\.memory)
+            guard dictionaryService.undoLearnedCorrections(memories, suppressRelearning: userDismissed) else {
+                reviewMessage = "Could not withdraw the learned word. Review it in Dictionary."
+                showLearnedFeedback()
+                return
+            }
+            let ids = Set(memories.map(\.id))
+            reviewedCorrections.removeAll { ids.contains($0.id) }
+            let keys = Set(provisionalMemories.map(\.key))
+            for index in detectedEdits.indices {
+                detectedEdits[index].consumedCandidateKeys?.removeAll { keys.contains($0) }
+            }
+            provisionalMemories = []
+            reviewMessage = "Edit changed; the unconfirmed learning was withdrawn."
+            hideLearningFeedback()
+        }
         if let id = currentDetectedID { detectedEdits.removeAll { $0.id == id }; persistDetectedEdits() }
         currentDetectedID = nil
         latestDetectedValue = nil
@@ -392,6 +488,7 @@ final class TargetAppCorrectionLearningService: ObservableObject {
         reviewedCorrections = []
         reviewMessage = nil
         reviewPanel?.orderOut(nil)
+        hideLearningFeedback()
     }
 
     func rememberCorrection(id: UUID) {
@@ -412,7 +509,13 @@ final class TargetAppCorrectionLearningService: ObservableObject {
     }
 
     func undoReviewedCorrections() {
-        dictionaryService.undoLearnedCorrections(reviewedCorrections)
+        guard dictionaryService.undoLearnedCorrections(reviewedCorrections) else {
+            reviewMessage = "Could not undo learning. Your words are still in Dictionary; try again."
+            showLearnedFeedback()
+            return
+        }
+        provisionalMemories = []
+        hideLearningFeedback()
         reviewedCorrections = []
         reviewMessage = "Unchanged learned rules removed. Edited rules are kept. Your document was not changed."
     }
@@ -465,11 +568,13 @@ final class TargetAppCorrectionLearningService: ObservableObject {
 
     private func trackSettledInsertion(insertedText: String, baseline: TextInsertionService.FocusedTextObservation?) async -> TargetAppCorrectionLearningResult {
         stopDetection()
+        dismissReview()
         let id = UUID()
         activeAttemptID = id
         detectionGeneration = id
         currentBaseline = baseline
-        guard let baseline, baseline.ownedInsertionRange != nil else {
+        guard let baseline, baseline.ownedInsertionRange != nil,
+              insertedText.count <= 2_000, baseline.value.utf16.count <= 100_000 else {
             detectionStatus = "Insertion could not be verified; no edits captured"
             return completeAttempt(id: id, outcome: .unsupportedTextObservation, commitSignal: nil)
         }
@@ -482,7 +587,7 @@ final class TargetAppCorrectionLearningService: ObservableObject {
         defer {
             if detectionGeneration == id {
                 let finalStatus = detectionStatus
-                stopDetection()
+                stopDetection(hideFeedback: false)
                 detectionStatus = finalStatus
             }
         }
@@ -504,11 +609,12 @@ final class TargetAppCorrectionLearningService: ObservableObject {
                        insertedText.count <= 2_000, edited.count <= 2_000 {
                         if final.value != latestDetectedValue { discardCurrentDetectedEdit() }
                         if currentDetectedID == nil {
-                            let candidate = DetectedEdit(id: UUID(), timestamp: now(), original: insertedText, edited: edited)
+                            let candidate = DetectedEdit(id: UUID(), timestamp: now(), original: insertedText, edited: edited, observationID: id)
                             detectedEdits.append(candidate)
                             currentDetectedID = candidate.id
                             latestDetectedValue = final.value
                             persistDetectedEdits()
+                            learnRepeatedSpellings(id: candidate.id)
                         }
                         outcome = .capturedEdit
                     }
@@ -550,14 +656,15 @@ final class TargetAppCorrectionLearningService: ObservableObject {
                 continue
             }
             if currentDetectedID == nil {
-                let candidate = DetectedEdit(id: UUID(), timestamp: now(), original: insertedText, edited: edited)
+                let candidate = DetectedEdit(id: UUID(), timestamp: now(), original: insertedText, edited: edited, observationID: id)
                 detectedEdits.append(candidate)
                 currentDetectedID = candidate.id
                 latestDetectedValue = observation.value
                 persistDetectedEdits()
+                learnRepeatedSpellings(id: candidate.id)
             }
             outcome = .capturedEdit
-            detectionStatus = "Edit captured locally; spelling learning checks run when observation ends"
+            detectionStatus = "Edit captured locally; reusable words checked for learning"
         }
         return completeAttempt(id: id, outcome: outcome, commitSignal: nil)
     }

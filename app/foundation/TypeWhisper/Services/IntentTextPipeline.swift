@@ -156,7 +156,7 @@ enum IntentDictationProcessor {
         var steps = text == raw ? [] : ["Preferred spellings"]
         let terms = dictionary.vocabularyForPrompt(limit: .max)
         var usedAPI = false
-        if useAPI, defaults.bool(forKey: SelfCorrectionService.enabledKey),
+        if useAPI, defaults.object(forKey: SelfCorrectionService.enabledKey) as? Bool ?? true,
            SelfCorrectionService.hasRepairCue(text), let key = SelfCorrectionService.selectedKey {
             usedAPI = true
             let cleaned = try await SelfCorrectionService(apiKey: key, useGroq: SelfCorrectionService.groqSelected).clean(text)

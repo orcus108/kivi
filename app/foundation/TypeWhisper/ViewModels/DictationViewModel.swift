@@ -213,6 +213,16 @@ final class DictationViewModel: ObservableObject {
         case error(String)
     }
 
+    enum NoSpeechRetryState: Equatable {
+        case unavailable
+        case ready(URL)
+        case checking
+        case empty
+        case failed
+    }
+    @Published private(set) var noSpeechRetryState: NoSpeechRetryState = .unavailable
+    var canRetryNoSpeech: Bool { if case .ready = noSpeechRetryState { return true }; return false }
+
     private enum CancelWarningTarget {
         case recording
         case processing
@@ -221,12 +231,18 @@ final class DictationViewModel: ObservableObject {
     private enum ActionFeedbackAction {
         case undoLearnedCorrections([LearnedDictionaryCorrection])
         case openDictationRecovery
+        case copyReadyText
+        case retryNoSpeech
         case openSettings(SettingsTab)
 
         var title: String {
             switch self {
             case .undoLearnedCorrections:
                 String(localized: "Undo")
+            case .copyReadyText:
+                String(localized: "Copy")
+            case .retryNoSpeech:
+                "try again"
             case .openDictationRecovery:
                 String(localized: "Open Recovery")
             case .openSettings:
@@ -318,6 +334,8 @@ final class DictationViewModel: ObservableObject {
     @Published var spokenFeedbackEnabled: Bool {
         didSet { speechFeedbackService.spokenFeedbackEnabled = spokenFeedbackEnabled }
     }
+    @Published private(set) var pendingInsertionRecovery = KiviPendingRecovery()
+    private var feedbackRecoveryID: UUID?
     @Published private(set) var lastTranscribedText: String?
     @Published private(set) var lastTranscriptionLanguage: String?
     /// Updated only by the completed text-insertion path, never by indicator feedback.
@@ -756,6 +774,12 @@ final class DictationViewModel: ObservableObject {
         }
         promptPaletteHandler.getPreserveClipboard = { [weak self] in
             self?.preserveClipboard ?? false
+        }
+        recentTranscriptionPaletteHandler.onInsertionNeedsRecovery = { [weak self] entry in
+            self?.showLiveFieldRecoveryFeedback(id: entry.id, text: entry.finalText)
+        }
+        recentTranscriptionPaletteHandler.onInsertionVerified = { [weak self] id in
+            self?.pendingInsertionRecovery.resolve(id)
         }
         recentTranscriptionPaletteHandler.onShowNotchFeedback = { [weak self] message, icon, duration, isError, category in
             self?.showNotchFeedback(message: message, icon: icon, duration: duration, isError: isError, errorCategory: category ?? "general")
@@ -1555,6 +1579,8 @@ final class DictationViewModel: ObservableObject {
     }
 
     func handleCancelHotkey() {
+        if isNoSpeechFeedback { resetDictationState(); return }
+        if isInsertionRecoveryFeedback { dismissInsertionRecovery(); return }
         logger.info(
             "Cancel hotkey received: state=\(String(describing: self.state), privacy: .public), inputReady=\(self.isRecordingInputReady, privacy: .public), startPending=\(self.recordingStartTask != nil, privacy: .public)"
         )
@@ -1634,6 +1660,7 @@ final class DictationViewModel: ObservableObject {
     #endif
 
     private func cancelCurrentOperation() {
+        finishKiviTalkCapture(.failure(CancellationError()))
         if let token = selectionInstructionToken {
             IntentSelectionEditor.shared.spokenFailure("Instruction recording cancelled. Original unchanged; type an instruction or capture again.", token: token)
             selectionInstructionToken = nil
@@ -1685,6 +1712,36 @@ final class DictationViewModel: ObservableObject {
     }
 
     private var selectionInstructionToken: UUID?
+    private var kiviTalkCapture: (id: UUID, engineID: String, completion: (Result<String, Error>) -> Void)?
+    private var hasInstructionCapture: Bool { selectionInstructionToken != nil || kiviTalkCapture != nil }
+
+    /// Reuses recognition, but never inserts, runs workflows, or saves a conversation recording.
+    func kiviStartTalkCapture(id: UUID, completion: @escaping (Result<String, Error>) -> Void) -> Bool {
+        guard state == .idle, !hasInstructionCapture else { return false }
+        guard let provider = modelManager.selectedProviderId,
+              PluginManager.shared.loadedTranscriptionPlugin(for: provider)?.manifest.resolvedHosting == .local else {
+            completion(.failure(NSError(domain: "KiviTalk", code: 3, userInfo: [NSLocalizedDescriptionKey: "Choose a local speech engine to dictate a message here, or type your request."])))
+            return true
+        }
+        kiviTalkCapture = (id, provider, completion)
+        startRecording()
+        return true
+    }
+    func kiviStopTalkCapture() {
+        guard kiviTalkCapture != nil, state == .recording else { return }
+        hotkeyService.cancelDictation()
+        stopDictation()
+    }
+    func kiviCancelTalkCapture(id: UUID) {
+        guard kiviTalkCapture?.id == id else { return }
+        cancelCurrentOperation()
+    }
+    private func finishKiviTalkCapture(_ result: Result<String, Error>, id: UUID? = nil) {
+        guard let capture = kiviTalkCapture, id == nil || capture.id == id else { return }
+        kiviTalkCapture = nil
+        capture.completion(result)
+    }
+
 
     func startSelectionInstruction() {
         guard state == .idle, let token = IntentSelectionEditor.shared.captureSelection(spoken: true) else { return }
@@ -1754,6 +1811,7 @@ final class DictationViewModel: ObservableObject {
         urlResolutionTask = nil
 
         self.forcedWorkflowId = forcedWorkflowId
+        if kiviTalkCapture != nil { clearActiveRuleState() }
         beginDictationSession(id: sessionID)
 
         guard canDictate else {
@@ -1884,7 +1942,7 @@ final class DictationViewModel: ObservableObject {
                 }
                 try await self.audioRecordingService.startRecordingAsync(
                     requestUptimeNanoseconds: requestUptimeNanoseconds,
-                    storesRecoveryAudio: self.selectionInstructionToken == nil && !self.kiviRecordingWasPrivate
+                    storesRecoveryAudio: !self.hasInstructionCapture && !self.kiviRecordingWasPrivate
                 )
                 guard !Task.isCancelled,
                       self.activeDictationSessionID == sessionID,
@@ -1933,6 +1991,10 @@ final class DictationViewModel: ObservableObject {
         forcedWorkflowId: UUID? = nil,
         requestUptimeNanoseconds: UInt64
     ) {
+        if kiviTalkCapture != nil, state == .recording {
+            kiviStopTalkCapture()
+            return
+        }
         if selectionInstructionToken != nil, state == .recording {
             stopSelectionInstruction()
             return
@@ -2219,12 +2281,12 @@ final class DictationViewModel: ObservableObject {
     }
 
     private var effectiveTask: TranscriptionTask {
-        if selectionInstructionToken != nil { return .transcribe }
+        if hasInstructionCapture { return .transcribe }
         return settingsViewModel.selectedTask
     }
 
     private var effectiveTranslationTarget: String? {
-        if selectionInstructionToken != nil { return nil }
+        if hasInstructionCapture { return nil }
         if settingsViewModel.translationEnabled {
             return settingsViewModel.translationTargetLanguage
         }
@@ -2232,11 +2294,13 @@ final class DictationViewModel: ObservableObject {
     }
 
     private var effectiveEngineOverrideId: String? {
-        DictationTranscriptionOverrideResolver.engineId(for: matchedWorkflow)
+        if let capture = kiviTalkCapture { return capture.engineID }
+        return DictationTranscriptionOverrideResolver.engineId(for: matchedWorkflow)
     }
 
     private var effectiveCloudModelOverride: String? {
-        DictationTranscriptionOverrideResolver.modelId(for: matchedWorkflow)
+        if kiviTalkCapture != nil { return nil }
+        return DictationTranscriptionOverrideResolver.modelId(for: matchedWorkflow)
     }
 
     private var effectiveMicrophoneBoostEnabled: Bool {
@@ -2362,7 +2426,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     private var effectiveAutoEnterMode: WorkflowAutoEnterMode {
-        if selectionInstructionToken != nil { return .never }
+        if hasInstructionCapture { return .never }
         return matchedWorkflow?.output.autoEnterMode ?? .never
     }
 
@@ -2576,18 +2640,13 @@ final class DictationViewModel: ObservableObject {
             return
         case .discardNoSpeech:
             cancelLiveFieldTranscriptSession()
-            audioRecordingService.discardActiveRecoveryRecording()
+            let noSpeechPreservation = audioRecordingService.preserveActiveRecoveryRecordingResult()
             logger.info("Peak level too low (\(String(format: "%.4f", peakLevel))) - no speech detected")
             let errorMessage = String(localized: "No speech detected")
             if let sessionID {
                 failDictationSession(id: sessionID, error: errorMessage)
             }
-            showNotchFeedback(
-                message: errorMessage,
-                icon: "mic.slash",
-                duration: 8.0,
-                noSpeech: true
-            )
+            showNoSpeechFeedback(recoveryURL: noSpeechPreservation.newlyPreservedURL)
             soundService.playNoSpeech(enabled: soundFeedbackEnabled)
             return
         case .transcribe:
@@ -2622,6 +2681,7 @@ final class DictationViewModel: ObservableObject {
         }
         incrementalWorkflowPostProcessing = nil
         let instructionToken = selectionInstructionToken
+        let talkCaptureID = kiviTalkCapture?.id
         transcriptionTask = Task {
             var didTransferAccessibilityObservationLease = false
             defer {
@@ -2692,6 +2752,20 @@ final class DictationViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
 
                 var text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let talkCaptureID {
+                    cancelLiveFieldTranscriptSession()
+                    pinnedInsertionTarget = nil
+                    audioRecordingService.discardActiveRecoveryRecording()
+                    let spokenResult: Result<String, Error> = text.isEmpty
+                        ? .failure(NSError(domain: "KiviTalk", code: 1, userInfo: [NSLocalizedDescriptionKey: "No speech recognised. Try again or type your message."]))
+                        : .success(text)
+                    finishKiviTalkCapture(spokenResult, id: talkCaptureID)
+                    cancelActiveDictationSessionIfNeeded(message: "Conversation draft captured locally")
+                    state = .inserting
+                    scheduleInsertingReset(after: .milliseconds(100))
+                    self.transcriptionTask = nil
+                    return
+                }
                 if let instructionToken {
                     // This route ends here, before cleanup, plugins, submit commands,
                     // insertion, history events, or any external action dispatch.
@@ -2893,6 +2967,7 @@ final class DictationViewModel: ObservableObject {
                             || improveTypeWhisperCaptureEnabled
                     ) && resolvedOutputFormat == nil && !literalIntentRoute
                     var didInsertText = false
+                    var needsInsertionRecovery = false
                     var shouldUseNormalInsertion = true
                     if cleanupAttempted {
                         let current = cleanupObservation.flatMap { textInsertionService.recaptureFocusedTextObservation(matching: $0) }
@@ -2904,7 +2979,7 @@ final class DictationViewModel: ObservableObject {
                             shouldUseNormalInsertion = false
                             cancelLiveFieldTranscriptSession()
                             pinnedInsertionTarget = nil
-                            showLiveFieldRecoveryFeedback()
+                            needsInsertionRecovery = true
                         }
                     }
                     var insertionResult: TextInsertionService.InsertionResult?
@@ -2916,7 +2991,7 @@ final class DictationViewModel: ObservableObject {
                         shouldUseNormalInsertion = await textInsertionService
                             .focusPinnedInsertionTarget(pinnedInsertionTarget)
                         if !shouldUseNormalInsertion {
-                            showLiveFieldRecoveryFeedback()
+                            needsInsertionRecovery = true
                             cancelLiveFieldTranscriptSession()
                         }
                     }
@@ -2926,6 +3001,7 @@ final class DictationViewModel: ObservableObject {
                        let liveFieldTranscriptSession {
                         switch liveFieldTranscriptSession.finalize(with: insertionText) {
                         case .applied(let finalObservation):
+                            clearInsertionRecoveryFeedback()
                             shouldUseNormalInsertion = false
                             didInsertText = true
                             targetAppCorrectionBaseline = shouldObservePostInsertionEdits && !TargetAppCorrectionLearningService.isPrivateBuild
@@ -2948,7 +3024,7 @@ final class DictationViewModel: ObservableObject {
                             shouldUseNormalInsertion = !hadAttemptedMutation
                                 && (allowsFocusedFallback || pinnedInsertionTarget != nil)
                             if !shouldUseNormalInsertion {
-                                showLiveFieldRecoveryFeedback()
+                                needsInsertionRecovery = true
                             }
                         }
                         self.liveFieldTranscriptSession = nil
@@ -2962,7 +3038,7 @@ final class DictationViewModel: ObservableObject {
                         shouldUseNormalInsertion = await textInsertionService
                             .focusPinnedInsertionTarget(pinnedInsertionTarget)
                         if !shouldUseNormalInsertion {
-                            showLiveFieldRecoveryFeedback()
+                            needsInsertionRecovery = true
                         }
                     }
 
@@ -2972,14 +3048,28 @@ final class DictationViewModel: ObservableObject {
                             : nil
                         // Correction learning recaptures the field after insertion, so it
                         // needs the paste to have landed before insertText returns.
-                        insertionResult = try await textInsertionService.insertText(
-                            insertionText,
-                            preserveClipboard: preserveClipboard,
-                            autoEnter: shouldAutoEnterAfterInsertion,
-                            outputFormat: resolvedOutputFormat,
-                            awaitPasteVerification: learningPreInsertionObservation != nil
-                        )
+                        do {
+                            insertionResult = try await textInsertionService.insertText(
+                                insertionText,
+                                preserveClipboard: preserveClipboard,
+                                autoEnter: shouldAutoEnterAfterInsertion,
+                                outputFormat: resolvedOutputFormat,
+                                awaitPasteVerification: true
+                            )
+                        } catch {
+                            if Task.isCancelled { throw error }
+                            logger.error("Text insertion failed; transcript remains available for recovery: \(error.localizedDescription, privacy: .public)")
+                            needsInsertionRecovery = true
+                        }
+                        if let insertionResult {
+                            // The actual attempt owns the outcome; discard earlier focus guesses.
+                            needsInsertionRecovery = insertionResult == .notInsertedNoEditableTarget
+                        }
+                        if insertionResult == .notInsertedNoEditableTarget { needsInsertionRecovery = true }
                         if case .pasted(.unverified(let reason))? = insertionResult {
+                            if TextInsertionService.shouldOfferPasteRecovery(.unverified(reason)) {
+                                needsInsertionRecovery = true
+                            }
                             logger.info(
                                 "Text insertion paste could not be verified; continuing with clipboard paste fallback. reason=\(reason.rawValue, privacy: .public), app=\(activeApp.bundleId ?? "nil", privacy: .public)"
                             )
@@ -2998,10 +3088,15 @@ final class DictationViewModel: ObservableObject {
                                     insertedText: insertionText, before: learningPreInsertionObservation, after: targetAppCorrectionBaseline)
                                 : nil
                         }
-                        insertedTextForCorrectionTracking = insertionText
-                        didInsertText = true
+                        if !needsInsertionRecovery {
+                            insertedTextForCorrectionTracking = insertionText
+                            didInsertText = true
+                        }
                     }
                     self.pinnedInsertionTarget = nil
+                    if !shouldUseNormalInsertion && !didInsertText { needsInsertionRecovery = true }
+                    if needsInsertionRecovery { showLiveFieldRecoveryFeedback(id: transcriptionID, text: text) }
+                    else { clearInsertionRecoveryFeedback() }
 
                     if didInsertText {
                         dictionaryService.recordUsage(ofCorrectionIDs: intentCorrectionIDs, deferUsageCountSave: true)
@@ -3030,7 +3125,7 @@ final class DictationViewModel: ObservableObject {
                             switch insertionResult {
                             case .insertedViaAccessibility, .pasted(.verified):
                                 insertionIsVerifiable = true
-                            case .pasted(.unverified), .pasted(.notAwaited):
+                            case .notInsertedNoEditableTarget, .pasted(.unverified), .pasted(.notAwaited):
                                 insertionIsVerifiable = false
                             }
                         } else {
@@ -3073,7 +3168,7 @@ final class DictationViewModel: ObservableObject {
                 lastTranscribedText = text
                 lastTranscriptionLanguage = detectedLang
 
-                if postProcessingFallback != nil {
+                if postProcessingFallback != nil, !isInsertionRecoveryFeedback {
                     showNotchFeedback(
                         message: localizedAppText(
                             "AI post-processing failed — raw transcription inserted",
@@ -3114,11 +3209,20 @@ final class DictationViewModel: ObservableObject {
                 if actionFeedbackMessage != nil {
                     startActionFeedbackLifetime(duration: actionDisplayDuration)
                 } else {
-                    scheduleInsertingReset(after: .seconds(1.5))
+                    scheduleInsertingReset(after: .milliseconds(100))
                 }
             } catch {
                 saveDeferredPostProcessingUsageCounts()
                 guard !Task.isCancelled else { return }
+                if let talkCaptureID {
+                    audioRecordingService.discardActiveRecoveryRecording()
+                    finishKiviTalkCapture(.failure(error), id: talkCaptureID)
+                    if let sessionID { failDictationSession(id: sessionID, error: error.localizedDescription) }
+                    state = .inserting
+                    scheduleInsertingReset(after: .milliseconds(100))
+                    self.transcriptionTask = nil
+                    return
+                }
                 if let instructionToken {
                     self.selectionInstructionToken = nil
                     audioRecordingService.discardActiveRecoveryRecording()
@@ -3335,7 +3439,8 @@ final class DictationViewModel: ObservableObject {
         dictionaryTermHints: [PluginDictionaryTermHint],
         normalizeNumbers: Bool?
     ) async throws -> FinalTranscriptionOutput {
-        let fallbackConfiguration = recoveryFallbackConfigurationProvider(primaryEngineId, task)
+        // A conversation recording must not spill into a configured cloud recovery engine.
+        let fallbackConfiguration = kiviTalkCapture == nil ? recoveryFallbackConfigurationProvider(primaryEngineId, task) : nil
         do {
             // The provider is injectable; only a threshold that converts to a
             // sleep duration safely starts a race, anything else means no hedge
@@ -3695,6 +3800,7 @@ final class DictationViewModel: ObservableObject {
     func registerInitialProfileHotkeys() { registerInitialTriggerHotkeys() }
 
     private func resetDictationState() {
+        finishKiviTalkCapture(.failure(CancellationError()))
         if let token = selectionInstructionToken {
             IntentSelectionEditor.shared.spokenFailure("Instruction recording ended. Your selection is unchanged; type an instruction to continue.", token: token)
             selectionInstructionToken = nil
@@ -3734,6 +3840,7 @@ final class DictationViewModel: ObservableObject {
         processingPhase = nil
         actionFeedbackMessage = nil
         isNoSpeechFeedback = false
+        noSpeechRetryState = .unavailable
         actionFeedbackIcon = nil
         actionFeedbackIsError = false
         clearActionFeedbackAction()
@@ -3768,7 +3875,7 @@ final class DictationViewModel: ObservableObject {
         _ match: WorkflowMatchResult?,
         activeApp: (name: String?, bundleId: String?, url: String?)?
     ) {
-        guard selectionInstructionToken == nil else { clearActiveRuleState(); return }
+        guard !hasInstructionCapture else { clearActiveRuleState(); return }
         activeWorkflowMatch = match
         matchedWorkflow = match?.workflow
         updateSubmitOnEnterAvailability()
@@ -3803,7 +3910,7 @@ final class DictationViewModel: ObservableObject {
             normalizeNumbers: effectiveNumberNormalizationOverride
         )
         let resolution = Self.resolvePreviewEngine(
-            preferredPreviewEngineId: livePreviewEngineId,
+            preferredPreviewEngineId: kiviTalkCapture == nil ? livePreviewEngineId : nil,
             dictationEngineOverrideId: params.engineOverrideId,
             selectedProviderId: params.providerId,
             isEngineAvailable: { [weak self] engineId in
@@ -3879,7 +3986,7 @@ final class DictationViewModel: ObservableObject {
 
     private func captureLiveFieldTargetAtRecordingRequestIfEligible() {
         pendingLiveFieldCapture = nil
-        guard liveFieldTranscriptEnabled, selectionInstructionToken == nil else { return }
+        guard liveFieldTranscriptEnabled, !hasInstructionCapture else { return }
 
         targetAppAccessibilityObservationLease = textInsertionService
             .beginFocusedApplicationAccessibilityObservation()
@@ -3900,7 +4007,7 @@ final class DictationViewModel: ObservableObject {
         preCapturedTarget: TextInsertionService.LiveFieldTarget? = nil
     ) {
         liveFieldTranscriptSession = nil
-        guard liveFieldTranscriptEnabled, selectionInstructionToken == nil,
+        guard liveFieldTranscriptEnabled, !hasInstructionCapture,
               effectiveActionPluginId == nil,
               resolvedEffectiveOutputFormat(for: activeApp) == nil else {
             return
@@ -3955,13 +4062,62 @@ final class DictationViewModel: ObservableObject {
         }
     }
 
-    private func showLiveFieldRecoveryFeedback() {
+    private func clearInsertionRecoveryFeedback() {
+        guard isInsertionRecoveryFeedback else { return }
+        indicatorFeedbackLifetime.cancel()
+        actionFeedbackMessage = nil
+        actionFeedbackIcon = nil
+        clearActionFeedbackAction()
+    }
+
+    var isInsertionRecoveryFeedback: Bool {
+        if case .copyReadyText? = actionFeedbackAction { return true }
+        return false
+    }
+
+    func dismissInsertionRecovery() {
+        if let id = feedbackRecoveryID { pendingInsertionRecovery.resolve(id) }
+        if isInsertionRecoveryFeedback { resetDictationState() }
+    }
+
+    var insertionRecoveryShortcut: String? {
+        DictationSettingsHandler.loadHotkeys(for: .pasteLastTranscription).isEmpty ? nil : pasteLastTranscriptionHotkeyLabel
+    }
+
+    var insertionRecoveryInstruction: String {
+        let shortcut = pasteLastTranscriptionHotkeyLabel
+        return DictationSettingsHandler.loadHotkeys(for: .pasteLastTranscription).isEmpty
+            ? "copy your text, then paste it into a text field."
+            : "click a text field and press \(shortcut)."
+    }
+
+    @discardableResult
+    func copyPendingInsertionRecovery(_ id: UUID) -> Bool {
+        guard let item = pendingInsertionRecovery.items.first(where: { $0.id == id }) else { return false }
+        let pasteboard = pasteboardProvider()
+        pasteboard.clearContents()
+        guard pasteboard.setString(item.text, forType: .string) else { return false }
+        pendingInsertionRecovery.resolve(id)
+        if feedbackRecoveryID == id && isInsertionRecoveryFeedback { resetDictationState() }
+        return true
+    }
+
+    func dismissPendingInsertionRecovery(_ id: UUID) {
+        pendingInsertionRecovery.resolve(id)
+        if feedbackRecoveryID == id && isInsertionRecoveryFeedback { resetDictationState() }
+    }
+
+    private func showLiveFieldRecoveryFeedback(id: UUID? = nil, text: String? = nil) {
+        feedbackRecoveryID = id
+        if let id, let text {
+            pendingInsertionRecovery.add(id: id, text: text)
+            feedbackRecoveryID = id
+        }
         showNotchFeedback(
-            message: String(localized: "The text field changed. The final transcript is available in Recent Transcriptions."),
-            icon: "text.badge.xmark",
-            duration: 3.0,
-            isError: true,
-            errorCategory: "insertion"
+            message: "your text is ready — " + insertionRecoveryInstruction,
+            icon: "doc.on.clipboard",
+            duration: 3,
+            action: .copyReadyText
         )
     }
 
@@ -4429,6 +4585,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     func pasteLastTranscription() {
+        if isInsertionRecoveryFeedback { resetDictationState() }
         promptPaletteHandler.hide()
         recentTranscriptionPaletteHandler.hide()
         recentTranscriptionPaletteHandler.insertLatest(currentState: state)
@@ -4515,6 +4672,67 @@ final class DictationViewModel: ObservableObject {
         lastTranscribedText = rawText
     }
 
+    func showNoSpeechFeedback(recoveryURL: URL?) {
+        showNotchFeedback(message: "no speech recognised", icon: "mic.slash", duration: 3,
+                          action: recoveryURL == nil ? nil : .retryNoSpeech, noSpeech: true)
+        noSpeechRetryState = recoveryURL.map(NoSpeechRetryState.ready) ?? .unavailable
+    }
+
+    func retryNoSpeechRecording() {
+        guard isNoSpeechFeedback, case .ready(let url) = noSpeechRetryState else { return }
+        let retryLanguage = effectiveLanguageSelection
+        let engine = effectiveEngineOverrideId ?? modelManager.selectedProviderId
+        let model = effectiveCloudModelOverride
+        let prompt = dictionaryService.getTermsForPrompt(providerId: engine)
+        let hints = dictionaryService.getTermHints(providerId: engine)
+        let normalize = effectiveNumberNormalizationOverride
+        resetDictationState()
+        showNotchFeedback(message: "checking your recording…", icon: "waveform", duration: 3, noSpeech: true)
+        noSpeechRetryState = .checking
+        indicatorFeedbackLifetime.cancel() // Work owns the lifetime; no timeout can cancel the retry.
+        transcriptionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let samples = try await AudioFileService().loadAudioSamples(from: url)
+                try Task.checkCancellation()
+                let transcription = try await transcribeFinalAudio(audioSamples: samples,
+                    languageSelection: retryLanguage, task: .transcribe, primaryEngineId: engine,
+                    primaryCloudModelOverride: model, prompt: prompt, dictionaryTermHints: hints,
+                    normalizeNumbers: normalize)
+                let result = transcription.result
+                try Task.checkCancellation()
+                let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty {
+                    showNotchFeedback(message: "no speech found — please record again", icon: "mic.slash",
+                                      duration: 2, noSpeech: true)
+                    noSpeechRetryState = .empty
+                } else {
+                    let id = UUID()
+                    recentTranscriptionStore.recordTranscription(id: id, finalText: text, timestamp: Date(),
+                                                                 appName: nil, appBundleIdentifier: nil)
+                    if UserDefaults.standard.object(forKey: UserDefaultsKeys.historyEnabled) as? Bool ?? true {
+                        historyService.addRecord(id: id, rawText: result.text, finalText: text,
+                            appName: "Dictation Recovery", appBundleIdentifier: Bundle.main.bundleIdentifier,
+                            durationSeconds: result.duration, language: result.detectedLanguage ?? retryLanguage.requestedLanguage,
+                            engineUsed: result.engineUsed,
+                            modelUsed: modelManager.resolvedModelDisplayName(engineOverrideId: engine, cloudModelOverride: model),
+                            pipelineSteps: ["Recovered recording"])
+                    }
+                    lastTranscribedText = text
+                    // Explicit paste avoids inserting into a destination that changed while checking audio.
+                    noSpeechRetryState = .unavailable
+                    showLiveFieldRecoveryFeedback(id: id, text: text)
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                showNotchFeedback(message: "couldn’t check your recording — please record again",
+                                  icon: "exclamationmark.circle", duration: 2, noSpeech: true)
+                noSpeechRetryState = .failed
+            }
+            transcriptionTask = nil
+        }
+    }
+
     var canRecoverLastRecording: Bool {
         audioRecordingService.latestRecoveryRecordingURL != nil
     }
@@ -4527,7 +4745,7 @@ final class DictationViewModel: ObservableObject {
         }
         if openSettingsWindow {
             if Bundle.main.bundleIdentifier == "dev.vedant.kivi-combined" {
-                KiviAdvancedWindow.shared.show("recovery")
+                KiviRecoveryWindow.shared.show()
             } else {
                 ManagedAppWindowOpener.shared.open(id: "settings")
             }
@@ -4635,11 +4853,7 @@ final class DictationViewModel: ObservableObject {
         if targetAppAccessibilityObservationLease != nil {
             return
         }
-        guard shouldTrackTargetAppCorrectionLearning
-                || improveTypeWhisperCaptureEnabled
-                || liveFieldTranscriptEnabled else {
-            return
-        }
+        // Paste verification also needs Electron/Chromium to expose its editable field.
         targetAppAccessibilityObservationLease = textInsertionService
             .beginChromiumAccessibilityObservation(bundleIdentifier: bundleIdentifier)
     }
@@ -4701,6 +4915,12 @@ final class DictationViewModel: ObservableObject {
         guard let actionFeedbackAction else { return }
 
         switch actionFeedbackAction {
+        case .retryNoSpeech:
+            retryNoSpeechRecording()
+        case .copyReadyText:
+            if let id = feedbackRecoveryID { copyPendingInsertionRecovery(id) }
+            else { copyLastTranscriptionToClipboard() }
+            showNotchFeedback(message: "copied — paste with ⌘V", icon: "checkmark.circle", duration: 3)
         case .undoLearnedCorrections(let learnedCorrections):
             dictionaryService.undoLearnedCorrections(learnedCorrections)
             showNotchFeedback(
@@ -4792,6 +5012,10 @@ final class DictationViewModel: ObservableObject {
         fallbackAction: ActionFeedbackAction? = nil,
         noSpeech: Bool = false
     ) {
+        if noSpeech {
+            showNoSpeechFeedback(recoveryURL: recoveryPreservation.newlyPreservedURL)
+            return
+        }
         guard recoveryPreservation.newlyPreservedURL != nil else {
             showNotchFeedback(
                 message: message,
@@ -4827,6 +5051,7 @@ final class DictationViewModel: ObservableObject {
         recoveryPreservation: DictationRecoveryPreservationResult? = nil,
         settingsTab: SettingsTab? = nil
     ) {
+        finishKiviTalkCapture(.failure(NSError(domain: "KiviTalk", code: 2, userInfo: [NSLocalizedDescriptionKey: message])))
         if let token = selectionInstructionToken {
             IntentSelectionEditor.shared.spokenFailure(message, token: token)
             selectionInstructionToken = nil

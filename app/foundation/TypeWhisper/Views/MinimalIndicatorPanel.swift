@@ -261,7 +261,8 @@ class MinimalIndicatorPanel: NSPanel {
             isFeedbackInteractive: isFeedbackInteractive,
             feedbackMessage: actionFeedbackMessage,
             feedbackActionTitle: actionFeedbackActionTitle,
-            kiviNoSpeech: DictationViewModel.shared.isNoSpeechFeedback
+            kiviNoSpeech: DictationViewModel.shared.isNoSpeechFeedback,
+            kiviInsertionRecovery: DictationViewModel.shared.isInsertionRecoveryFeedback
         )
         let panelFrame = IndicatorFeedbackPanelLayout.panelFrame(
             for: .minimal,

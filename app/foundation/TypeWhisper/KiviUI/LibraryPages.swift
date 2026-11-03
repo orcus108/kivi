@@ -1,80 +1,56 @@
 import SwiftUI
+import AppKit
 
-struct KiviHistoryPage: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View { KiviHistoryContent(history: model.history) }
-}
-
-private struct KiviHistoryContent: View {
+struct KiviHistoryControls: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var history: KiviHistoryStore
     @State private var showFilter = false
+    @State private var filterHovered = false
     @FocusState private var searchFocused: Bool
-
+    private var filtered: Bool { history.source != nil || history.period != "all time" || history.kind != "all" }
     var body: some View {
-        ScrollView {
-            PageContent {
-                VStack(alignment: .leading, spacing: 28) {
-                    PageTitle(title: "history")
+        VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 12) {
                         HStack(spacing: 12) {
                             Image(systemName: "magnifyingglass").font(.system(size: 16)).foregroundStyle(KiviTheme.muted)
-                            TextField("search your words — try: the offsite flights", text: $history.search)
+                            TextField("search your words", text: $history.search)
                                 .textFieldStyle(.plain).font(KiviTheme.body(16)).focused($searchFocused)
                                 .onSubmit { model.notify("showing matching words from your local history") }
+                                .onExitCommand { searchFocused = false }
                             if !history.search.isEmpty {
                                 IconButton(icon: "xmark", label: "clear search") { history.search = "" }
                             }
-                            Text("press enter to ask").font(KiviTheme.mono(10)).foregroundStyle(KiviTheme.muted).fixedSize()
                         }
                         .padding(.horizontal, 16).frame(height: 50)
                         .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(searchFocused ? libraryGold : KiviTheme.line))
-                        Button { showFilter.toggle() } label: {
-                            HStack(spacing: 5) { Image(systemName: "line.3.horizontal.decrease").font(.system(size: 11)); Text("filter") }
-                                .font(KiviTheme.body(13)).frame(width: 63, height: 30)
-                                .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 7))
-                                .overlay(RoundedRectangle(cornerRadius: 7).stroke(KiviTheme.line))
-                        }.buttonStyle(.plain)
-                            .popover(isPresented: $showFilter, arrowEdge: .bottom) { filterPopover }
-                    }
-                    LazyVStack(alignment: .leading, spacing: 23) {
-                        if history.sections.isEmpty && !history.loading {
-                            EmptyState(icon: "clock", title: history.search.isEmpty ? "your words will find a home here." : "no words found.", subtitle: history.search.isEmpty ? "Your saved takes will appear here." : "Try another word, or change the filter.")
-                        }
-                        ForEach(history.sections) { section in
-                            let day = section.id
-                            let takes = section.takes
-                            LazyVStack(alignment: .leading, spacing: 9) {
-                                HStack(spacing: 12) {
-                                    Text(dayTitle(day)).foregroundStyle(KiviTheme.green)
-                                    Rectangle().fill(KiviTheme.green.opacity(0.32)).frame(height: 1)
-                                    Text("\(takes.count)").foregroundStyle(KiviTheme.muted)
-                                }.font(KiviTheme.body(14))
-                                LazyVStack(spacing: 0) {
-                                    ForEach(takes) { take in
-                                        HistoryTakeRow(take: take) { model.selectedTake = take }
-                                        Rectangle().fill(KiviTheme.line).frame(height: 1)
-                                    }
-                                }
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(searchFocused ? KiviTheme.green : KiviTheme.line))
+                        .background(KiviSearchFocusBoundary(focused: $searchFocused))
+                        Button { searchFocused = false; showFilter.toggle() } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "line.3.horizontal.decrease").font(.system(size: 14))
+                                Text("filter")
+                                if filtered { Circle().fill(KiviTheme.green).frame(width: 6, height: 6).accessibilityHidden(true) }
                             }
-                        }
-                        if history.loading { ProgressView().controlSize(.small) }
-                        if history.hasMore && !history.loading {
-                            Button("load more") { history.loadMore() }.buttonStyle(KiviButton())
-                                .onAppear { history.loadMore() }
-                        }
-                        if let error = history.error { Text(error).font(KiviTheme.body(13)).foregroundStyle(.orange) }
-                    }.padding(.top, 10)
+                                .font(KiviTheme.body(16)).foregroundStyle(filterHovered || showFilter ? KiviTheme.ink : KiviTheme.muted)
+                                .padding(.horizontal, 16).frame(height: 50)
+                                .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
+                        }.buttonStyle(.plain).onHover { filterHovered = $0 }
+                            .accessibilityValue("\(showFilter ? "expanded" : "collapsed"), \(filtered ? "filters active" : "no active filters")")
+                            .popover(isPresented: $showFilter, arrowEdge: .bottom) {
+                                ScrollView { filterPopover }.frame(maxHeight: 480)
+                                    .onExitCommand { showFilter = false }
+                            }
+                    }
+            if filtered {
+                HStack {
+                    Text([history.source, history.period == "all time" ? nil : history.period, history.kind == "all" ? nil : history.kind].compactMap { $0 }.joined(separator: " · "))
+                        .font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
+                    Spacer()
+                    Button("clear filters") { history.source = nil; history.period = "all time"; history.kind = "all" }.buttonStyle(KiviButton())
                 }
             }
-        }.onAppear { history.activate() }.onDisappear { history.deactivate() }
-    }
-
-    private func dayTitle(_ date: Date) -> String {
-        if Calendar.current.isDateInToday(date) { return "Today" }
-        if Calendar.current.isDateInYesterday(date) { return "Yesterday" }
-        return date.formatted(.dateTime.month(.wide).day())
+        }
     }
     private var filterPopover: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -84,7 +60,7 @@ private struct KiviHistoryContent: View {
                 Button { history.source = source } label: {
                     HStack(spacing: 10) { AppGlyph(name: source, size: 18); Text(source.lowercased()); Spacer(); if history.source == source { Image(systemName: "checkmark").font(.system(size: 11)) } }
                         .font(KiviTheme.body(14)).padding(.horizontal, 10).frame(height: 34).contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                }.buttonStyle(KiviButton())
             }
             Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.vertical, 6)
             Text("time").font(KiviTheme.mono(11)).foregroundStyle(KiviTheme.muted).padding(.horizontal, 10)
@@ -93,7 +69,7 @@ private struct KiviHistoryContent: View {
             }
             Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.vertical, 6)
             filterRow("system clipboard", checked: history.source == "system clipboard", icon: "clipboard") { history.source = "system clipboard" }
-        }.padding(10).frame(width: 256).background(Color(nsColor: .init(white: 0.125, alpha: 1))).foregroundStyle(KiviTheme.ink)
+        }.padding(10).frame(width: 256).background(KiviTheme.background).foregroundStyle(KiviTheme.ink)
     }
     private func filterRow(_ title: String, checked: Bool, icon: String?, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -101,27 +77,70 @@ private struct KiviHistoryContent: View {
                 if let icon { Image(systemName: icon).frame(width: 18).foregroundStyle(KiviTheme.muted) }
                 Text(title); Spacer(); if checked { Image(systemName: "checkmark").font(.system(size: 11)).foregroundStyle(KiviTheme.green) }
             }.font(KiviTheme.body(14)).padding(.horizontal, 10).frame(height: 34).contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        }.buttonStyle(KiviButton())
     }
 }
 
-private struct HistoryTakeRow: View {
-    @EnvironmentObject var model: AppModel
-    var take: Take
-    var action: () -> Void
-    @State private var hovering = false
-    var body: some View {
-        HStack(spacing: 14) {
-            Button(action: action) {
-                HStack(spacing: 14) { AppGlyph(name: take.source, size: 18); Text(take.text.replacingOccurrences(of: "\n", with: " ")).font(KiviTheme.body(16)).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading) }
-                    .contentShape(Rectangle())
-            }.buttonStyle(.plain)
-            Text(take.date, format: .dateTime.hour().minute()).font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
-            IconButton(icon: "doc.on.doc", label: "copy take") { model.copy(take.text) }
-        }.padding(.horizontal, 8).frame(height: 51)
-            .background(hovering ? KiviTheme.panel.opacity(0.5) : .clear, in: RoundedRectangle(cornerRadius: 7))
-            .contentShape(Rectangle()).onHover { hovering = $0 }
-            .animation(.easeOut(duration: 0.12), value: hovering)
+// Observe clicks without consuming them, so row actions and text selection still work.
+private struct KiviSearchFocusBoundary: NSViewRepresentable {
+    @FocusState.Binding var focused: Bool
+    func makeNSView(context: Context) -> BoundaryView {
+        let view = BoundaryView()
+        view.clearFocus = { focused = false }
+        view.isSearchFocused = { focused }
+        return view
+    }
+    func updateNSView(_ view: BoundaryView, context: Context) {
+        view.clearFocus = { focused = false }
+        view.isSearchFocused = { focused }
+    }
+    static func dismantleNSView(_ view: BoundaryView, coordinator: ()) { view.stopObserving() }
+    final class BoundaryView: NSView {
+        var clearFocus: (() -> Void)?
+        var isSearchFocused: (() -> Bool)?
+        private var monitor: Any?
+        private var initialActivation: NSObjectProtocol?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stopObserving()
+            guard let window else { return }
+            // A window can pick its initial field after the view attaches. Clear it
+            // once at activation as well, without disturbing later app switches.
+            let clearInitialFocus: () -> Void = { [weak self, weak window] in
+                DispatchQueue.main.async {
+                    guard let self, let window, self.window === window else { return }
+                    self.clearFocus?()
+                    if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+                        window.makeFirstResponder(nil)
+                    }
+                }
+            }
+            if window.isKeyWindow { clearInitialFocus() }
+            else {
+                initialActivation = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+                    clearInitialFocus()
+                    if let token = self?.initialActivation {
+                        NotificationCenter.default.removeObserver(token)
+                        self?.initialActivation = nil
+                    }
+                }
+            }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+                guard let self, let window = self.window, event.window === window,
+                      self.isSearchFocused?() == true else { return event }
+                let point = self.convert(event.locationInWindow, from: nil)
+                if !self.bounds.contains(point) {
+                    self.clearFocus?()
+                    window.makeFirstResponder(nil)
+                }
+                return event
+            }
+        }
+        func stopObserving() {
+            if let initialActivation { NotificationCenter.default.removeObserver(initialActivation); self.initialActivation = nil }
+            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        }
     }
 }
 
@@ -135,6 +154,7 @@ struct TakeDetail: View {
                 Text(take.source.lowercased()).font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
                 Spacer()
                 IconButton(icon: "xmark", label: "close take") { model.selectedTake = nil }
+                    .keyboardShortcut(.cancelAction)
             }.padding(.horizontal, 28).padding(.vertical, 20)
             Rectangle().fill(KiviTheme.line).frame(height: 1)
             ScrollView {
@@ -182,7 +202,9 @@ private struct KiviDeleteButton: ButtonStyle {
 }
 
 struct DictionaryPage: View {
+    @State private var showImport = false
     @EnvironmentObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var showForm = false
     @State private var misspelling = ""
     @State private var correctMisspelling = false
@@ -192,16 +214,22 @@ struct DictionaryPage: View {
     @State private var editID: UUID?
     @State private var pendingDeletion: LexiconEntry?
     var body: some View {
+        let terms = visibleTerms
         ScrollView {
             PageContent {
                 VStack(alignment: .leading, spacing: 27) {
-                    HStack { PageTitle(title: "dictionary"); Spacer(); Button { model.importTerms() } label: { Label("import", systemImage: "tray.and.arrow.down") }.buttonStyle(KiviButton()) }
-                    dictionaryDemo
-                    LibraryAddBar(title: "add a word", expanded: false) { beginNewTerm() }
-                        .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
+                    HStack(spacing: 12) {
+                        PageTitle(title: "dictionary")
+                        Spacer()
+                        Button { showImport = true } label: {
+                            Label("import", systemImage: "tray.and.arrow.down")
+                        }.buttonStyle(KiviButton())
+                        Button { beginNewTerm() } label: {
+                            Label("add a word", systemImage: "plus")
+                        }.buttonStyle(KiviButton(primary: true))
+                    }
                     LazyVStack(spacing: 0) {
-                        ForEach(visibleTerms) { term in
+                        ForEach(terms) { term in
                             KiviHoverRow { hoverState in
                             HStack {
                                 Button { beginEditing(term) } label: {
@@ -220,17 +248,24 @@ struct DictionaryPage: View {
                                     IconButton(icon: "pencil", label: "edit \(term.written)") { beginEditing(term) }
                                     IconButton(icon: "trash", label: "remove \(term.written)") { pendingDeletion = term }
                                 }.opacity(hoverState.wrappedValue ? 1 : 0)
-                            }.frame(height: 55).contentShape(Rectangle()).onHover { hoverState.wrappedValue = $0 }
+                            }.frame(minHeight: 55).padding(.vertical, 8).contentShape(Rectangle()).onHover { hoverState.wrappedValue = $0 }
                             }
-                            Rectangle().fill(KiviTheme.line).frame(height: 1)
+                            if term.id != terms.last?.id {
+                                Rectangle().fill(KiviTheme.line).frame(height: 1)
+                            }
                         }
                     }.padding(.top, 6)
-                    KiviLearningView().padding(.top, 28)
                 }
             }
         }
-        .sheet(isPresented: $showForm) { termForm }
+        .sheet(isPresented: $showImport) { KiviDictionaryImportView() }
         .sheet(item: $pendingDeletion) { term in deletionDialog(for: term) }
+        .overlay {
+            if showForm {
+                libraryFormOverlay(reduceMotion: reduceFormMotion, onDismiss: { showForm = false }) { termForm }
+            }
+        }
+        .animation(reduceFormMotion ? nil : .easeOut(duration: 0.2), value: showForm)
     }
     private func deletionDialog(for term: LexiconEntry) -> some View {
         let isCorrection = term.heard != term.written
@@ -241,7 +276,7 @@ struct DictionaryPage: View {
                 Spacer(minLength: 0)
                 IconButton(icon: "xmark", label: "cancel deletion") { pendingDeletion = nil }
             }
-            Text(isCorrection ? "kivi will no longer correct this spelling." : "kivi will no longer remember this word.")
+            Text(isCorrection ? "kivi will no longer correct these mishearings." : "kivi will no longer remember this word.")
                 .font(KiviTheme.body(15)).foregroundStyle(KiviTheme.muted)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 12) {
@@ -249,7 +284,7 @@ struct DictionaryPage: View {
                 Button("cancel") { pendingDeletion = nil }
                     .buttonStyle(KiviButton()).keyboardShortcut(.defaultAction)
                 Button(isCorrection ? "delete correction" : "delete word", role: .destructive) {
-                    model.saved.terms.removeAll { $0.id == term.id }
+                    model.saved.terms.removeAll { $0.written == term.written }
                     model.persistTerms()
                     pendingDeletion = nil
                 }.buttonStyle(KiviDeleteButton())
@@ -260,24 +295,16 @@ struct DictionaryPage: View {
         .onExitCommand { pendingDeletion = nil }
     }
     private var visibleTerms: [LexiconEntry] {
-        model.saved.terms
+        KiviDictionaryAdapter.grouped(model.saved.terms)
     }
-    private var dictionaryDemo: some View {
-        HStack(spacing: 18) {
-            HStack(spacing: 0) {
-                Text("kivi spells the way ")
-                Text("you")
-                    .overlay(alignment: .bottom) { LibraryBrush().fill(KiviTheme.green.opacity(0.45)).frame(height: 5).offset(y: 3) }
-                Text(" do")
-            }.font(KiviTheme.serif(24)).fixedSize()
-                .accessibilityElement(children: .combine)
-            Spacer(minLength: 10)
-            Rectangle().fill(KiviTheme.line).frame(width: 1, height: 38).padding(.horizontal, 8)
-            VStack(alignment: .leading, spacing: 6) { Text("you say").font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted); Text("“aditya shatriya”").font(KiviTheme.serif(17)).italic() }
-            LibraryArrow().stroke(KiviTheme.green, style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round)).frame(width: 65, height: 22)
-            VStack(alignment: .leading, spacing: 6) { Text("kivi writes").font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted); Text("Aaditya Kshatriya").font(KiviTheme.medium(18)).fixedSize() }
-        }.padding(.horizontal, 24).frame(maxWidth: .infinity).frame(height: 134)
-            .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
+    private var reduceFormMotion: Bool { model.saved.reduceMotion || systemReduceMotion }
+    private var canSaveTerm: Bool {
+        let word = written.trimmingCharacters(in: .whitespacesAndNewlines)
+        let heard = correctMisspelling ? misspelling.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        guard !word.isEmpty, !correctMisspelling || !heard.isEmpty else { return false }
+        guard let editID else { return true }
+        guard let original = visibleTerms.first(where: { $0.id == editID }) else { return false }
+        return word != original.written || heard != (original.heard == original.written ? "" : original.heard)
     }
     private var termForm: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -288,22 +315,25 @@ struct DictionaryPage: View {
             }
             HStack(alignment: .bottom, spacing: 22) {
                 if correctMisspelling {
-                    wordField("misspelling", prompt: "e.g. sir vum", text: $misspelling)
+                    wordField("what kivi hears", prompt: "e.g. Kiwi, KV", text: $misspelling)
                     Image(systemName: "arrow.right").foregroundStyle(KiviTheme.muted).padding(.bottom, 12)
                 }
-                wordField(correctMisspelling ? "correct spelling" : "word", prompt: "e.g. Sarvam", text: $written)
+                wordField("preferred spelling", prompt: "e.g. Sarvam", text: $written)
                     .focused($wordFocused)
             }
-            Toggle("correct a misspelling", isOn: $correctMisspelling)
-                .toggleStyle(.switch).tint(KiviTheme.green).font(KiviTheme.body(15))
+            HStack {
+                Text("correct a known mishearing").font(KiviTheme.body(15)).accessibilityHidden(true)
+                Spacer()
+                Toggle("correct a known mishearing", isOn: $correctMisspelling)
+                    .labelsHidden().toggleStyle(SettingsSwitchStyle())
+            }
             if let formError { Text(formError).font(KiviTheme.body(13)).foregroundStyle(KiviTheme.ink) }
             HStack(spacing: 12) {
                 Spacer()
                 Button("cancel") { showForm = false }.buttonStyle(KiviButton()).keyboardShortcut(.cancelAction)
                 Button(editID == nil ? "add word" : "save changes") { saveTerm() }
                     .buttonStyle(KiviButton(primary: true)).keyboardShortcut(.defaultAction)
-                    .disabled(written.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                              (correctMisspelling && misspelling.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                    .disabled(!canSaveTerm)
             }
         }
         .padding(32).frame(width: 560).foregroundStyle(KiviTheme.ink)
@@ -312,6 +342,7 @@ struct DictionaryPage: View {
         .onChange(of: written) { _, _ in formError = nil }
         .onChange(of: misspelling) { _, _ in formError = nil }
         .onChange(of: correctMisspelling) { _, _ in formError = nil }
+        .onExitCommand { showForm = false }
     }
     private func wordField(_ label: String, prompt: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -329,8 +360,9 @@ struct DictionaryPage: View {
         correctMisspelling = term.heard != term.written; editID = term.id; formError = nil; showForm = true
     }
     private func saveTerm() {
+        guard canSaveTerm else { return }
         do {
-            try KiviDictionaryAdapter.saveWord(written: written, misspelling: correctMisspelling ? misspelling : nil,
+            try KiviDictionaryAdapter.saveGroupedWord(written: written, misspellings: correctMisspelling ? misspelling : nil,
                                                editing: editID, service: model.services.dictionaryService)
             model.refreshTerms()
             showForm = false
@@ -341,6 +373,7 @@ struct DictionaryPage: View {
 
 struct ShortcutsPage: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var showForm = false
     @State private var trigger = ""
     @State private var expansion = ""
@@ -351,11 +384,13 @@ struct ShortcutsPage: View {
         ScrollView {
             PageContent {
                 VStack(alignment: .leading, spacing: 27) {
-                    PageTitle(title: "shortcuts")
-                    shortcutDemo
-                    LibraryAddBar(title: "add a shortcut", expanded: false) { beginNewShortcut() }
-                        .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
+                    HStack {
+                        PageTitle(title: "shortcuts")
+                        Spacer()
+                        Button { beginNewShortcut() } label: {
+                            Label("add a shortcut", systemImage: "plus")
+                        }.buttonStyle(KiviButton(primary: true))
+                    }
                     if model.saved.shortcuts.isEmpty && !showForm {
                         VStack(spacing: 22) {
                             if let bird = KiviTheme.image("onboarding-sitting") { Image(nsImage: bird).resizable().scaledToFit().frame(width: 96, height: 128).opacity(0.32) }
@@ -383,14 +418,21 @@ struct ShortcutsPage: View {
                                 }.opacity(hoverState.wrappedValue ? 1 : 0)
                             }.frame(height: 55).contentShape(Rectangle()).onHover { hoverState.wrappedValue = $0 }
                             }
-                            Rectangle().fill(KiviTheme.line).frame(height: 1)
+                            if item.id != model.saved.shortcuts.last?.id {
+                                Rectangle().fill(KiviTheme.line).frame(height: 1)
+                            }
                         }
                     }.padding(.top, 6)
                 }
             }
         }
-        .sheet(isPresented: $showForm) { shortcutForm }
         .sheet(item: $pendingDeletion) { item in deletionDialog(for: item) }
+        .overlay {
+            if showForm {
+                libraryFormOverlay(reduceMotion: reduceFormMotion, onDismiss: { showForm = false }) { shortcutForm }
+            }
+        }
+        .animation(reduceFormMotion ? nil : .easeOut(duration: 0.2), value: showForm)
     }
     private func deletionDialog(for item: ExpansionEntry) -> some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -417,26 +459,19 @@ struct ShortcutsPage: View {
         .background(KiviTheme.panel)
         .onExitCommand { pendingDeletion = nil }
     }
-    private var shortcutDemo: some View {
-        HStack(spacing: 18) {
-            Text("say less. write more.").font(KiviTheme.serif(24)).fixedSize()
-            Spacer(minLength: 10)
-            Rectangle().fill(KiviTheme.line).frame(width: 1, height: 38).padding(.horizontal, 8)
-            VStack(alignment: .leading, spacing: 7) { Text("you say").font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted); Text("“my sign-off”").font(KiviTheme.serif(18)).italic() }
-            LibraryArrow().stroke(KiviTheme.green, style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round)).frame(width: 60, height: 28)
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 5) { ForEach(0..<3) { _ in Circle().fill(KiviTheme.muted.opacity(0.35)).frame(width: 5, height: 5) }; Spacer() }.frame(height: 16).padding(.horizontal, 10).background(KiviTheme.line.opacity(0.55))
-                Text("Warm regards,\nPranav Sridhar\nSarvam AI").font(KiviTheme.body(13)).lineSpacing(2).fixedSize(horizontal: false, vertical: true).padding(.horizontal, 14).padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading)
-            }.frame(width: 340, height: 90).background(KiviTheme.background.opacity(0.65), in: RoundedRectangle(cornerRadius: 6)).clipShape(RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(KiviTheme.line))
-        }.padding(.horizontal, 24).frame(maxWidth: .infinity).frame(height: 134).background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
-    }
     private var duplicateShortcut: ExpansionEntry? {
         let phrase = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
         return model.saved.shortcuts.first { $0.id != editID && $0.trigger.caseInsensitiveCompare(phrase) == .orderedSame }
     }
+    private var reduceFormMotion: Bool { model.saved.reduceMotion || systemReduceMotion }
     private var canSave: Bool {
         !trigger.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !expansion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && duplicateShortcut == nil
+        !expansion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && duplicateShortcut == nil && shortcutChanged
+    }
+    private var shortcutChanged: Bool {
+        guard let editID else { return true }
+        guard let original = model.saved.shortcuts.first(where: { $0.id == editID }) else { return false }
+        return trigger.trimmingCharacters(in: .whitespacesAndNewlines) != original.trigger || expansion != original.expansion
     }
     private var shortcutForm: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -475,6 +510,7 @@ struct ShortcutsPage: View {
         .padding(32).frame(width: 560).foregroundStyle(KiviTheme.ink)
         .background(KiviTheme.panel)
         .onAppear { triggerFocused = true }
+        .onExitCommand { showForm = false }
     }
     private func beginNewShortcut() {
         trigger = ""; expansion = ""; editID = nil; showForm = true
@@ -494,6 +530,30 @@ struct ShortcutsPage: View {
         }
         if model.persistShortcuts() { showForm = false; model.notify("shortcut saved") }
     }
+}
+
+func libraryFormOverlay<Content: View>(reduceMotion: Bool, onDismiss: @escaping () -> Void, @ViewBuilder content: () -> Content) -> some View {
+    ZStack {
+        Color.black.opacity(0.58)
+            .ignoresSafeArea()
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onDismiss)
+            .accessibilityHidden(true)
+            .transition(reduceMotion ? .identity : .opacity)
+
+        content()
+            .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(KiviTheme.line))
+            .shadow(color: .black.opacity(0.35), radius: 28, y: 12)
+            .padding(24)
+            .transition(reduceMotion ? .identity : .asymmetric(
+                insertion: .opacity.combined(with: .scale(scale: 0.98).combined(with: .offset(y: 8))),
+                removal: .opacity.combined(with: .scale(scale: 0.99))
+            ))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .zIndex(10)
 }
 
 private let libraryGold = Color(red: 0.80, green: 0.71, blue: 0.42)
@@ -528,32 +588,7 @@ private struct LibraryUnderlinedField: View {
     }
 }
 
-private struct LibraryArrow: Shape {
-    func path(in rect: CGRect) -> Path {
-        Path { path in
-            path.move(to: CGPoint(x: 1, y: rect.height * 0.25))
-            path.addQuadCurve(to: CGPoint(x: rect.maxX - 2, y: rect.height * 0.28), control: CGPoint(x: rect.midX, y: rect.height * 1.2))
-            path.move(to: CGPoint(x: rect.maxX - 11, y: rect.height * 0.2))
-            path.addLine(to: CGPoint(x: rect.maxX - 2, y: rect.height * 0.28))
-            path.addLine(to: CGPoint(x: rect.maxX - 7, y: rect.height * 0.65))
-        }
-    }
-}
-
-private struct LibraryBrush: Shape {
-    func path(in rect: CGRect) -> Path {
-        Path { path in
-            path.move(to: CGPoint(x: 0, y: rect.height * 0.5))
-            path.addLine(to: CGPoint(x: rect.width * 0.08, y: 0))
-            path.addLine(to: CGPoint(x: rect.width * 0.98, y: rect.height * 0.2))
-            path.addLine(to: CGPoint(x: rect.width, y: rect.height * 0.7))
-            path.addLine(to: CGPoint(x: rect.width * 0.12, y: rect.height))
-            path.closeSubpath()
-        }
-    }
-}
-
-private struct KiviHoverRow<Content: View>: View {
+struct KiviHoverRow<Content: View>: View {
     @State private var hovering = false
     @ViewBuilder var content: (Binding<Bool>) -> Content
     var body: some View {

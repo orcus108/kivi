@@ -4,8 +4,7 @@ import AVFoundation
 import Speech
 import ServiceManagement
 
-/// The settings surface follows the observed native app. Account and service controls
-/// are session-only visual previews; local controls retain their real behavior.
+/// Kivi-owned settings, grouped by the task each preference affects.
 struct SettingsPage: View {
     @EnvironmentObject var model: AppModel
     private let dictation = DictationViewModel.shared
@@ -13,18 +12,28 @@ struct SettingsPage: View {
     private let devices = ServiceContainer.shared.audioDeviceService
     @AppStorage(IntentTextPipeline.cleanupKey) private var cleanup = true
     @AppStorage(IntentTextPipeline.structureKey) private var structure = true
-    @AppStorage(TargetAppCorrectionLearningService.localEnabledKey) private var learning = false
+    @AppStorage(SelfCorrectionService.enabledKey) private var spokenSelfCorrection = true
     @AppStorage(UserDefaultsKeys.historyEnabled) private var keepHistory = true
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var search = ""
-    @State private var previewValues: [String: Bool] = [:]
+    @State private var detailWidth: CGFloat = 800
+    @State private var hoveredSettingsSection: KiviSettingsSection?
+    @State private var showMoreShortcuts = false
+    @State private var showMicrophones = false
+    @FocusState private var focusedCancellation: CancellationBehavior?
     private let pillPreview = IndicatorPreviewSession.shared
-    @State private var inactivity = "3 min"
-    @State private var confirmClear = false
     @State private var permissionRefresh = false
-    private let mainSections = ["general", "shortcuts", "the orb", "microphone", "permissions"]
-    private let personalSections = ["privacy & data", "plan & billing", "account", "about"]
-    private let icons = ["general": "gearshape", "shortcuts": "keyboard", "the orb": "circle", "microphone": "mic", "permissions": "checkmark.shield", "privacy & data": "lock", "plan & billing": "creditcard", "account": "person.crop.circle", "about": "info.circle"]
+    private let mainSections: [KiviSettingsSection] = [.general, .writing, .keyboardShortcuts, .recording, .recordingIndicator]
+    private let privacySections: [KiviSettingsSection] = [.permissions, .privacy]
+    private let moreSections: [KiviSettingsSection] = [.advanced, .billing, .account, .about]
+    private var section: KiviSettingsSection { .resolve(model.settingsSection) }
+    private var resetTitle: String? {
+        switch section {
+        case .general: "reset appearance"
+        case .recordingIndicator: "reset indicator look"
+        default: nil
+        }
+    }
 
     var body: some View {
         let _ = signals.revision
@@ -32,24 +41,23 @@ struct SettingsPage: View {
             sidebar
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack {
-                        Text(model.settingsSection).font(.custom("Matter-SemiBold", size: 22))
-                        Spacer()
-                        if mainSections.contains(model.settingsSection) {
-                            Button { resetPage() } label: { Label("reset", systemImage: "arrow.counterclockwise") }.buttonStyle(KiviButton()).help("Reset this page’s local display preferences")
+                    adaptiveRow {
+                        Text(section.title).font(.custom("Matter-SemiBold", size: 22))
+                        if detailWidth >= 600 { Spacer() }
+                        if let resetTitle {
+                            Button { resetPage() } label: { Label(resetTitle, systemImage: "arrow.counterclockwise") }.buttonStyle(KiviButton()).help(section == .general ? "Restore system appearance and allow animations. Other settings stay unchanged." : "Restore the compact indicator, classic theme and waveform. Position, visibility and feedback stay unchanged.")
                         }
-                    }.frame(height: 30).padding(.bottom, 30)
+                    }.frame(minHeight: 30, alignment: .leading).padding(.bottom, 30)
                     detail
                 }.padding(.horizontal, 32).padding(.top, 44).padding(.bottom, 44).frame(maxWidth: .infinity, alignment: .leading)
             }.id(model.settingsSection)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { detailWidth = $0 }
         }
         .foregroundStyle(KiviTheme.ink)
         .onAppear { model.refreshEngineStatus() }
+        .onChange(of: section) { _, _ in showMicrophones = false }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in permissionRefresh.toggle(); model.refreshEngineStatus() }
-        .confirmationDialog("Clear all saved takes?", isPresented: $confirmClear) {
-            Button("clear history", role: .destructive) { model.clearHistory() }
-            Button("cancel", role: .cancel) {}
-        } message: { Text("This permanently removes your saved takes and their stored audio.") }
+
     }
 
     private var sidebar: some View {
@@ -69,42 +77,66 @@ struct SettingsPage: View {
                     Spacer(minLength: 0)
                 }.padding(.horizontal, 10).padding(.vertical, 18)
             }.buttonStyle(.plain)
-            sidebarLabel("kivi")
-            ForEach(mainSections.filter(matches), id: \.self) { sidebarRow($0) }
-            sidebarLabel("you").padding(.top, 20)
-            ForEach(personalSections.filter(matches), id: \.self) { sidebarRow($0) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    sidebarLabel("kivi")
+                    ForEach(mainSections.filter { $0.matches(search) }) { sidebarRow($0) }
+                    if privacySections.contains(where: { $0.matches(search) }) {
+                        sidebarLabel("privacy").padding(.top, 20)
+                        ForEach(privacySections.filter { $0.matches(search) }) { sidebarRow($0) }
+                    }
+                    if moreSections.contains(where: { $0.matches(search) }) {
+                        sidebarLabel("more").padding(.top, 20)
+                        ForEach(moreSections.filter { $0.matches(search) }) { sidebarRow($0) }
+                    }
+                    if !KiviSettingsSection.allCases.contains(where: { $0.matches(search) }) {
+                        Text("no settings match").font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted).padding(10)
+                        Button("clear search") { search = "" }.buttonStyle(KiviButton()).padding(.horizontal, 10)
+                    }
+                }.padding(.bottom, 12)
+            }
             Spacer()
             Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.bottom, 14)
             Text("kivi 2026.10.18.0630").font(KiviTheme.mono(10)).foregroundStyle(KiviTheme.muted).padding(.leading, 10).padding(.bottom, 5)
         }.padding(.horizontal, 10).padding(.top, 44).padding(.bottom, 12).frame(width: 232)
             .background(KiviTheme.panel.opacity(0.13)).overlay(alignment: .trailing) { Rectangle().fill(KiviTheme.line).frame(width: 1) }
     }
-    private func matches(_ title: String) -> Bool { search.isEmpty || title.localizedCaseInsensitiveContains(search) }
     private func sidebarLabel(_ title: String) -> some View {
         Text(title).font(KiviTheme.mono(10)).foregroundStyle(KiviTheme.muted).padding(.leading, 10).padding(.bottom, 7)
     }
-    private func sidebarRow(_ title: String) -> some View {
-        Button { model.settingsSection = title } label: {
+    private func sidebarRow(_ destination: KiviSettingsSection) -> some View {
+        let isSelected = section == destination
+        let isHovered = hoveredSettingsSection == destination
+        return Button { model.settingsSection = destination.rawValue } label: {
             HStack(spacing: 9) {
-                Image(systemName: icons[title] ?? "circle").font(.system(size: 13)).frame(width: 17)
-                Text(title).font(KiviTheme.body(14))
+                Image(systemName: destination.icon).font(.system(size: 13)).frame(width: 17)
+                    .foregroundStyle(isSelected || isHovered ? KiviTheme.green : KiviTheme.muted)
+                Text(destination.title).font(KiviTheme.body(14))
                 Spacer()
             }.padding(.horizontal, 10).frame(height: 34)
-                .foregroundStyle(model.settingsSection == title ? KiviTheme.green : KiviTheme.ink)
-                .background(model.settingsSection == title ? KiviTheme.green.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                .foregroundStyle(isSelected ? KiviTheme.green : KiviTheme.ink)
+                .background(isSelected ? KiviTheme.green.opacity(0.10) : (isHovered ? KiviTheme.panel.opacity(0.55) : .clear), in: RoundedRectangle(cornerRadius: 8))
+                .contentShape(RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain)
+            .onHover { hovering in
+                hoveredSettingsSection = hovering ? destination : (isHovered ? nil : hoveredSettingsSection)
+            }
+            .animation(.easeOut(duration: 0.12), value: isHovered)
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
     @ViewBuilder private var detail: some View {
-        switch model.settingsSection {
-        case "shortcuts": shortcuts
-        case "the orb": orb
-        case "microphone": microphone
-        case "permissions": permissions
-        case "privacy & data": privacy
-        case "plan & billing": billing
-        case "account": account
-        case "about": about
-        default: general
+        switch section {
+        case .general: general
+        case .writing: writing
+        case .keyboardShortcuts: keyboardShortcuts
+        case .recordingIndicator: recordingIndicator
+        case .recording: recording
+        case .permissions: permissions
+        case .privacy: privacy
+        case .advanced: advancedTools
+        case .billing: billing
+        case .account: account
+        case .about: about
         }
     }
 
@@ -116,22 +148,19 @@ struct SettingsPage: View {
                     ForEach(["light", "dark", "system"], id: \.self) { appearanceChoice($0) }
                 }.padding(18)
             }
-            caption("the orb and its transcript box follow this too.").padding(.top, 5)
+
             sectionLabel("behavior").padding(.top, 30)
             group {
-                settingsRow("open at restart", "open kivi automatically when you log in to your Mac.") { Toggle("open at restart", isOn: $launchAtLogin).labelsHidden().toggleStyle(.checkbox).tint(KiviTheme.green).onChange(of: launchAtLogin) { _, enabled in Task { do { if enabled { try SMAppService.mainApp.register() } else { try await SMAppService.mainApp.unregister() } } catch { launchAtLogin = SMAppService.mainApp.status == .enabled; model.notify(error.localizedDescription) } } } }
+                settingsRow("open at login", "start Kivi when you log in to your Mac") { Toggle("open at login", isOn: $launchAtLogin).labelsHidden().toggleStyle(SettingsSwitchStyle()).onChange(of: launchAtLogin) { _, enabled in Task { do { if enabled { try SMAppService.mainApp.register() } else { try await SMAppService.mainApp.unregister() } } catch { launchAtLogin = SMAppService.mainApp.status == .enabled; model.notify(error.localizedDescription) } } } }
                 rowDivider
-                settingsRow("recording and recovery", "input, cancellation, recovery and transcription options") { Button("configure") { model.openAdvanced("microphone") }.buttonStyle(KiviButton()) }
-                rowDivider
-                settingsRow("reduce animation", "calms the orb, box, and pill motion for a snappier feel.") {
-                    Toggle("reduce animation", isOn: $model.saved.reduceMotion).labelsHidden().toggleStyle(SettingsSwitchStyle()).onChange(of: model.saved.reduceMotion) { model.persist() }
+                settingsRow("reduce motion", "use less animation throughout Kivi") {
+                    Toggle("reduce motion", isOn: $model.saved.reduceMotion).labelsHidden().toggleStyle(SettingsSwitchStyle()).onChange(of: model.saved.reduceMotion) { model.persist() }
                 }
             }
             sectionLabel("getting started").padding(.top, 30)
             group {
                 settingsRow("welcome demo", "replay the first-run walkthrough.") { Button("replay") { model.showWelcome = true }.buttonStyle(KiviButton()) }
             }
-            localAdvanced.padding(.top, 30)
         }
     }
     private func appearanceChoice(_ mode: String) -> some View {
@@ -172,99 +201,130 @@ struct SettingsPage: View {
         }
     }
 
-    private var shortcuts: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            sectionLabel("the kivi key")
+    private var keyboardShortcuts: some View {
+        VStack(alignment: .leading, spacing: 24) {
             group {
-                settingsRow("kivi key", "hold to dictate or tap to toggle, using your existing shortcut") { Button(dictation.hybridHotkeyLabel.isEmpty ? "set shortcut" : dictation.hybridHotkeyLabel) { model.openAdvanced("hotkeys") }.buttonStyle(KiviButton()) }
+                KiviShortcutRow(slot: .hybrid, title: "kivi key", subtitle: "tap to toggle; hold to dictate")
                 rowDivider
-                settingsRow("edit selected text", "select text in another app, then choose this from the menu bar") { Button("open editor") { IntentSelectionEditor.shared.captureSelection() }.buttonStyle(KiviButton()) }
+                KiviShortcutRow(slot: .pushToTalk, title: "hold to dictate", subtitle: "release to finish recording")
                 rowDivider
-                settingsRow("cancel take", "choose how escape cancels a recording") { Picker("cancel take", selection: Binding(get: { dictation.cancellationBehavior }, set: { dictation.cancellationBehavior = $0 })) { ForEach(CancellationBehavior.allCases, id: \.self) { Text($0.title).tag($0) } }.labelsHidden().frame(width: 130) }
+                KiviShortcutRow(slot: .toggle, title: "toggle recording", subtitle: "press once to start, again to finish")
             }
-            sectionLabel("text").padding(.top, 30)
             group {
-                settingsRow("paste last content", "your most recent take, ready to use again") { Button(dictation.pasteLastTranscriptionHotkeyLabel.isEmpty ? "set shortcut" : dictation.pasteLastTranscriptionHotkeyLabel) { model.openAdvanced("hotkeys") }.buttonStyle(KiviButton()) }
+                KiviShortcutRow(slot: .pasteLastTranscription, title: "paste latest take", subtitle: "insert your latest take in the focused app")
+                rowDivider
+                KiviShortcutRow(slot: .copyLastTranscription, title: "copy latest take", subtitle: "copy your latest take to the clipboard")
+                rowDivider
+                KiviShortcutRow(slot: .recentTranscriptions, title: "recent takes", subtitle: "choose an earlier take to insert")
             }
-            Button("all shortcuts and recording modes →") { model.openAdvanced("hotkeys") }.buttonStyle(KiviButton()).padding(.top, 24)
+            Button { showMoreShortcuts.toggle() } label: {
+                HStack { Text("more keyboard shortcuts"); Spacer(); Image(systemName: showMoreShortcuts ? "chevron.up" : "chevron.down") }
+            }.buttonStyle(KiviButton()).accessibilityValue(showMoreShortcuts ? "expanded" : "collapsed")
+            if showMoreShortcuts {
+                group {
+                    KiviShortcutRow(slot: .undoLastDictation, title: "undo last dictation", subtitle: "remove the last insertion when it is safe")
+                    rowDivider
+                    KiviShortcutRow(slot: .restoreRawTranscript, title: "restore original transcript", subtitle: "replace the last insertion with its raw text")
+                    rowDivider
+                    KiviShortcutRow(slot: .promptPalette, title: "workflow picker", subtitle: "process selected or copied text")
+                    rowDivider
+                    KiviShortcutRow(slot: .recorderToggle, title: "audio recorder", subtitle: "start or stop a recorder session")
+                }.padding(.top, 12)
+            }
+            caption("click a shortcut to change it, or set another. press Escape to cancel. conflicting keys keep their existing assignment.")
         }
     }
 
-    private var orb: some View {
+    private var recordingIndicator: some View {
         VStack(alignment: .leading, spacing: 0) {
-            sectionLabel("recording pill")
-            caption("the compact recording indicator from your TypeWhisper version.").padding(.bottom, 20)
+            caption("the compact indicator shows when Kivi is listening or processing your words.").padding(.bottom, 20)
             group {
-                settingsRow("look", "the same listening, processing and feedback animations") {
-                    Button("restore TypeWhisper look") {
-                        dictation.indicatorStyle = .minimal
-                        dictation.indicatorTheme = .classic
-                        dictation.notchIndicatorRightContent = .waveform
-                    }.buttonStyle(KiviButton())
-                }
-                rowDivider
-                settingsRow("preview", "see the listening animation without using your microphone") {
-                    Button(pillPreview.isActive ? "stop preview" : "preview pill") {
+                settingsRow("preview indicator", "see the listening animation without using your microphone") {
+                    Button(pillPreview.isActive ? "stop preview" : "preview") {
                         if pillPreview.isActive { pillPreview.stop() } else { pillPreview.start() }
                     }.buttonStyle(KiviButton())
                 }
             }
-            sectionLabel("visibility & place").padding(.top, 30)
+            sectionLabel("visibility & position").padding(.top, 30)
             group {
-                settingsRow("show pill", "choose when the recording indicator appears") {
-                    Picker("show pill", selection: Binding(get: { dictation.notchIndicatorVisibility }, set: { dictation.notchIndicatorVisibility = $0 })) {
-                        Text("while active").tag(NotchIndicatorVisibility.duringActivity)
-                        Text("always").tag(NotchIndicatorVisibility.always)
-                        Text("never").tag(NotchIndicatorVisibility.never)
-                    }.labelsHidden().frame(width: 140)
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("show indicator").font(KiviTheme.medium(16))
+                    KiviSettingsChoices(label: "show indicator", selection: Binding(get: { dictation.notchIndicatorVisibility }, set: { dictation.notchIndicatorVisibility = $0 }),
+                        options: [(.duringActivity, "while active"), (.always, "always"), (.never, "never")])
+                }.padding(20)
+                rowDivider
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("screen position").font(KiviTheme.medium(16))
+                    KiviSettingsChoices(label: "screen position", selection: Binding(get: { dictation.overlayPosition }, set: { dictation.overlayPosition = $0 }),
+                        options: [(.bottom, "bottom"), (.top, "top")])
+                }.padding(20)
+                rowDivider
+                settingsRow("center indicator", "center it horizontally on its current screen") {
+                    Button("center") { NotificationCenter.default.post(name: .centerRecordingPill, object: nil) }.buttonStyle(KiviButton())
                 }
                 rowDivider
-                settingsRow("position", "keep the pill at the top or bottom of the screen") {
-                    Picker("position", selection: Binding(get: { dictation.overlayPosition }, set: { dictation.overlayPosition = $0 })) {
-                        Text("bottom").tag(OverlayPosition.bottom)
-                        Text("top").tag(OverlayPosition.top)
-                    }.labelsHidden().frame(width: 140)
-                }
-                rowDivider
-                settingsRow("center pill", "align with the middle of its screen, keeping its top or bottom position") {
-                    Button("Center pill") { NotificationCenter.default.post(name: .centerRecordingPill, object: nil) }.buttonStyle(KiviButton())
-                }
-                rowDivider
-                settingsRow("visible in screen captures", "include the pill in screenshots and screen sharing") {
-                    Toggle("visible in screen captures", isOn: Binding(get: { dictation.indicatorVisibleInScreenCaptures }, set: { dictation.indicatorVisibleInScreenCaptures = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle())
-                }
-                rowDivider
-                settingsRow("live typing", "insert partial text in supported apps") {
-                    Toggle("live typing", isOn: Binding(get: { dictation.liveFieldTranscriptEnabled }, set: { dictation.liveFieldTranscriptEnabled = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle())
+                settingsRow("show in screen captures", "include the indicator in screenshots and screen sharing") {
+                    Toggle("show in screen captures", isOn: Binding(get: { dictation.indicatorVisibleInScreenCaptures }, set: { dictation.indicatorVisibleInScreenCaptures = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle())
                 }
             }
             sectionLabel("feedback").padding(.top, 30)
             group {
                 settingsRow("spoken feedback", "read feedback aloud") { Toggle("spoken feedback", isOn: Binding(get: { dictation.spokenFeedbackEnabled }, set: { dictation.spokenFeedbackEnabled = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
                 rowDivider
-                settingsRow("sounds", "a small sound when recording starts and stops") { Toggle("sounds", isOn: Binding(get: { dictation.soundFeedbackEnabled }, set: { dictation.soundFeedbackEnabled = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
-                rowDivider
-                settingsRow("indicator options", "more display, transcript and appearance settings") { Button("configure") { model.openAdvanced("appearance") }.buttonStyle(KiviButton()) }
+                settingsRow("recording sounds", "play a sound when recording starts and stops") { Toggle("recording sounds", isOn: Binding(get: { dictation.soundFeedbackEnabled }, set: { dictation.soundFeedbackEnabled = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
             }
+            advancedLink("more indicator options", detail: "advanced display, transcript and theme settings", destination: "appearance").padding(.top, 24)
         }.onDisappear { pillPreview.stop() }
     }
 
-    private var microphone: some View {
+    private var recording: some View {
         VStack(alignment: .leading, spacing: 0) {
             sectionLabel("input")
             group {
-                settingsRow("input device", devices.disconnectedDeviceName.map { "disconnected: \($0)" } ?? "your existing audio input, with the same capture engine") {
-                    Menu {
-                        Button("system default") { devices.selectedDeviceUID = nil }
-                        ForEach(devices.inputDevices, id: \.uid) { device in Button(device.name) { devices.selectedDeviceUID = device.uid } }
-                    } label: { menuLabel(devices.inputDevices.first(where: { $0.uid == devices.selectedDeviceUID })?.name ?? "system default") }.menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                settingsRow("microphone", devices.disconnectedDeviceName.map { "disconnected: \($0)" } ?? "choose the microphone Kivi records from") {
+                    Button { showMicrophones = true } label: {
+                        menuLabel(devices.selectedDeviceUID == nil ? "system default" : (devices.inputDevices.first(where: { $0.uid == devices.selectedDeviceUID })?.name ?? devices.disconnectedDeviceName ?? "microphone unavailable"))
+                    }.buttonStyle(.plain).accessibilityLabel("choose microphone")
+                        .popover(isPresented: $showMicrophones) {
+                            KiviMicrophoneChooser(devices: devices, onClose: { showMicrophones = false })
+                        }
                 }
                 rowDivider
-                settingsRow("test your mic", devices.previewError?.localizedDescription ?? "speak to see your input level") {
+                settingsRow("test microphone", devices.previewError?.localizedDescription ?? "speak to see your input level") {
                     HStack { KiviDeviceMeter(devices: devices, reduceMotion: model.saved.reduceMotion).frame(width: 70); Button(devices.isPreviewActive ? "stop" : "test") { if devices.isPreviewActive { devices.stopPreview() } else { devices.startPreview() } }.buttonStyle(KiviButton()) }
                 }
             }
-            Button("input priority and recording options →") { model.openAdvanced("microphone") }.buttonStyle(KiviButton()).padding(.top, 24)
+            sectionLabel("while recording").padding(.top, 30)
+            group {
+                settingsRow("live typing", "show partial words in supported text fields while you speak") {
+                    Toggle("live typing", isOn: Binding(get: { dictation.liveFieldTranscriptEnabled }, set: { dictation.liveFieldTranscriptEnabled = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle())
+                }
+                rowDivider
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("cancel a take").font(KiviTheme.medium(16))
+                    Text("choose how Escape cancels a recording or processing").font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
+                    ForEach(KiviCancellationChoice.all) { choice in
+                        Button { dictation.cancellationBehavior = choice.value } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: dictation.cancellationBehavior == choice.value ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(dictation.cancellationBehavior == choice.value ? KiviTheme.green : KiviTheme.muted)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(choice.title).font(KiviTheme.medium(14))
+                                    Text(choice.detail).font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
+                                }
+                                Spacer(minLength: 0)
+                            }.padding(10).contentShape(Rectangle())
+                        }.buttonStyle(KiviSettingsOptionStyle(selected: dictation.cancellationBehavior == choice.value, focused: focusedCancellation == choice.value))
+                            .focused($focusedCancellation, equals: choice.value).focusEffectDisabled()
+                            .accessibilityAddTraits(dictation.cancellationBehavior == choice.value ? .isSelected : [])
+                    }
+                }.padding(20)
+            }
+            sectionLabel("recovery").padding(.top, 30)
+            group {
+                settingsRow("interrupted recordings", "review a failed recording and retry it") { Button("open recovery") { KiviRecoveryWindow.shared.show() }.buttonStyle(KiviButton()) }
+            }
+            advancedLink("more recording options", detail: "advanced input priority and transcription settings", destination: "microphone").padding(.top, 24)
         }.onDisappear { devices.stopPreview() }
     }
 
@@ -283,7 +343,7 @@ struct SettingsPage: View {
                     else { Button("allow") { model.bridge.requestAccessibility(); permissionRefresh.toggle() }.buttonStyle(KiviButton()) }
                 }
                 rowDivider
-                settingsRow("target-app context", "the existing insertion engine detects the active app and supported text fields") { Image(systemName: accessibility ? "checkmark.circle" : "lock").foregroundStyle(accessibility ? KiviTheme.green : KiviTheme.muted) }
+                settingsRow("target-app context", "recognize the app and text field where your words should appear") { Image(systemName: accessibility ? "checkmark.circle" : "lock").foregroundStyle(accessibility ? KiviTheme.green : KiviTheme.muted) }
             }.id(permissionRefresh)
             caption("The selected speech engine handles recognition. Parakeet runs locally and does not require Apple Speech Recognition access.").padding(.top, 18)
         }
@@ -296,17 +356,15 @@ struct SettingsPage: View {
         VStack(alignment: .leading, spacing: 0) {
             sectionLabel("your data")
             group {
-                settingsRow("save history", "keep completed takes on this Mac") { Toggle("save history", isOn: $keepHistory).labelsHidden().toggleStyle(SettingsSwitchStyle()).disabled(model.incognito) }
+                settingsRow("save takes", "keep completed dictations on this Mac") { Toggle("save takes", isOn: $keepHistory).labelsHidden().toggleStyle(SettingsSwitchStyle()).disabled(model.incognito) }
                 rowDivider
                 settingsRow("incognito", "new takes and correction learning are not saved") { Toggle("incognito", isOn: $model.incognito).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
-                rowDivider
-                settingsRow("recover interrupted recordings", "review a failed take and retry it explicitly") { Button("open recovery") { model.openAdvanced("recovery") }.buttonStyle(KiviButton()) }
                 rowDivider
                 settingsRow("export your dictations", "save this app’s history as a text file") { Button("export") { model.exportHistory() }.buttonStyle(KiviButton()) }
             }
             sectionLabel("on this Mac").padding(.top, 30)
             group {
-                settingsRow("independent storage", "changes here never change the working TypeWhisper version") { Image(systemName: "internaldrive").foregroundStyle(KiviTheme.green) }
+                settingsRow("local storage", "your saved takes and settings are kept on this Mac") { Image(systemName: "internaldrive").foregroundStyle(KiviTheme.green) }
                 rowDivider
                 settingsRow("retention and backups", "manage recording audio, history retention and local backups") { Button("configure") { model.openAdvanced("privacy") }.buttonStyle(KiviButton()) }
             }
@@ -370,28 +428,62 @@ struct SettingsPage: View {
         }
     }
 
-    private var localAdvanced: some View {
+    private var writing: some View {
         VStack(alignment: .leading, spacing: 0) {
-            sectionLabel("your words")
+            sectionLabel("text processing")
             group {
                 settingsRow("light cleanup", "remove clear hesitations and accidental repeats") { Toggle("light cleanup", isOn: $cleanup).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
                 rowDivider
-                settingsRow("automatic structure", "format explicit lists and new paragraph instructions") { Toggle("automatic structure", isOn: $structure).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
+                settingsRow("format spoken lists", "format explicit lists and new-paragraph instructions") { Toggle("format spoken lists", isOn: $structure).labelsHidden().toggleStyle(SettingsSwitchStyle()) }
                 rowDivider
-                settingsRow("literal text", "skip ordinary cleanup, dictionary and shortcut expansion") { Toggle("literal text", isOn: $model.saved.literal).labelsHidden().toggleStyle(SettingsSwitchStyle()).onChange(of: model.saved.literal) { model.persist() } }
-                rowDivider
-                settingsRow("learn from corrections", "learn conservative name spellings from repeated verified edits") { Toggle("learn from corrections", isOn: $learning).labelsHidden().toggleStyle(SettingsSwitchStyle()).disabled(model.incognito) }
+                settingsRow("literal mode", "skip cleanup, dictionary replacements, text shortcuts and writing styles") { Toggle("literal mode", isOn: $model.saved.literal).labelsHidden().toggleStyle(SettingsSwitchStyle()).onChange(of: model.saved.literal) { model.persist() } }
             }
-            sectionLabel("engines & tools").padding(.top, 30)
+            sectionLabel("personalization").padding(.top, 30)
+            group {
+                settingsRow("learn from corrections", model.incognito ? "paused while incognito is on" : "remember names you correct repeatedly in supported apps") { KiviLearningSwitch() }
+                rowDivider
+                settingsRow("styles & rules", "choose how Kivi writes in different apps") { Button("open styles") { model.page = .styles }.buttonStyle(KiviButton()) }
+            }
+            sectionLabel("for you").padding(.top, 30)
+            group { KiviTalkModelSettings(conversation: model.talk) }
+            sectionLabel("spoken corrections").padding(.top, 30)
+            group {
+                settingsRow("resolve spoken corrections", "keep your final wording after phrases like ‘no, I mean…’") {
+                    Toggle("resolve spoken corrections", isOn: $spokenSelfCorrection).labelsHidden().toggleStyle(SettingsSwitchStyle())
+                }
+            }
+            caption("when configured, transcript text is sent to \(SelfCorrectionService.groqSelected ? "Groq" : "Gemini") for this step. audio stays on your Mac. provider and key settings are in advanced tools.").padding(.top, 12)
+        }
+    }
+
+    private var advancedTools: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            caption("these options open the existing advanced settings window.").padding(.bottom, 24)
+            sectionLabel("models & providers")
             group {
                 settingsRow("speech engine", model.modelStatus) { Button("manage engines") { model.openAdvanced("models") }.buttonStyle(KiviButton()) }
                 rowDivider
-                settingsRow("spoken self-corrections", "configure your optional API cleanup, or keep processing local") { Button("configure") { model.openAdvanced("general") }.buttonStyle(KiviButton()) }
-                rowDivider
-                settingsRow("selection editing", "type an instruction, review the preview, then apply or copy") { Button("open editor") { model.openEditor() }.buttonStyle(KiviButton()) }
-                rowDivider
-                settingsRow("workflows, files and recordings", "all of your foundation’s tools remain available") { Button("all tools") { model.openAdvanced("workflows") }.buttonStyle(KiviButton()) }
+                settingsRow("spoken-correction provider", "configure the text provider and API key for spoken corrections") {
+                    Button("configure provider") { model.openAdvanced("general") }.buttonStyle(KiviButton())
+                }
             }
+            sectionLabel("editing & workflows").padding(.top, 30)
+            group {
+                settingsRow("edit selected text", "review a rewrite, then apply or copy it") { Button("open editor") { model.openEditor() }.buttonStyle(KiviButton()) }
+                rowDivider
+                settingsRow("workflows", "configure reusable processing steps") { Button("open workflows") { model.openAdvanced("workflows") }.buttonStyle(KiviButton()) }
+                rowDivider
+                settingsRow("transcribe a file", "turn an existing audio file into text") { Button("open files") { model.openAdvanced("files") }.buttonStyle(KiviButton()) }
+                rowDivider
+                settingsRow("audio recorder", "record and manage longer sessions") { Button("open recorder") { model.openAdvanced("recorder") }.buttonStyle(KiviButton()) }
+            }
+        }
+    }
+
+    private func advancedLink(_ title: String, detail: String, destination: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Button(title) { model.openAdvanced(destination) }.buttonStyle(KiviButton())
+            caption(detail + " · opens advanced settings")
         }
     }
 
@@ -404,30 +496,30 @@ struct SettingsPage: View {
     private func group<Content: View>(@ViewBuilder content: () -> Content) -> some View { VStack(spacing: 0, content: content).frame(maxWidth: .infinity).background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line)) }
     private var rowDivider: some View { Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.horizontal, 20) }
     private func settingsRow<Content: View>(_ title: String, _ subtitle: String, info: Bool = false, @ViewBuilder content: () -> Content) -> some View {
-        HStack(spacing: 20) {
+        adaptiveRow {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) { Text(title).font(KiviTheme.medium(16)); if info { Image(systemName: "info.circle").font(.system(size: 11)).foregroundStyle(KiviTheme.muted) } }
                 Text(subtitle).font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted).fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 4)
+            if detailWidth >= 600 { Spacer(minLength: 4) }
             content()
         }.padding(.horizontal, 20).padding(.vertical, 12).frame(minHeight: 66)
     }
-    private func previewSwitch(_ key: String, initial: Bool) -> some View {
-        Toggle(key, isOn: Binding(get: { previewValues[key] ?? initial }, set: { previewValues[key] = $0 })).labelsHidden().toggleStyle(SettingsSwitchStyle()).help("Visual preview only; no service setting is changed")
+    private func adaptiveRow<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        let layout = detailWidth < 600
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
+            : AnyLayout(HStackLayout(spacing: 20))
+        return layout(content)
     }
-    private func previewRow(_ title: String, _ subtitle: String, key: String, initial: Bool) -> some View { settingsRow(title, subtitle) { previewSwitch(key, initial: initial) } }
-    private func keycap(_ value: String, faint: Bool = false) -> some View { Text(value).font(KiviTheme.mono(12)).foregroundStyle(faint ? KiviTheme.muted : KiviTheme.ink).padding(.horizontal, 9).frame(height: 27).background(KiviTheme.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 5)).overlay(RoundedRectangle(cornerRadius: 5).stroke(KiviTheme.line)) }
-    private func menuLabel(_ value: String) -> some View { HStack(spacing: 18) { Text(value).font(KiviTheme.body(13)); Image(systemName: "chevron.up.chevron.down").font(.system(size: 9)) }.padding(.horizontal, 11).frame(height: 30).background(KiviTheme.background.opacity(0.4), in: RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(KiviTheme.line)) }
-    private func visualPreview(_ name: String) { model.notify("\(name) is a visual preview. No account service is connected.") }
+    private func menuLabel(_ value: String) -> some View { HStack(spacing: 18) { Text(value).font(KiviTheme.body(13)).lineLimit(1).truncationMode(.middle); Image(systemName: "chevron.up.chevron.down").font(.system(size: 9)) }.padding(.horizontal, 11).frame(maxWidth: 240).frame(height: 30).background(KiviTheme.background.opacity(0.4), in: RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).stroke(KiviTheme.line)) }
     private func resetPage() {
-        switch model.settingsSection {
-        case "general": model.saved.appearance = "system"; model.saved.reduceMotion = false; inactivity = "3 min"; model.persist()
-        case "the orb": dictation.indicatorStyle = .minimal; dictation.indicatorTheme = .classic; dictation.notchIndicatorRightContent = .waveform
+        switch section {
+        case .general: model.saved.appearance = "system"; model.saved.reduceMotion = false; model.persist()
+        case .recordingIndicator: dictation.indicatorStyle = .minimal; dictation.indicatorTheme = .classic; dictation.notchIndicatorRightContent = .waveform
         default: break
         }
-        previewValues = [:]
     }
+
 }
 
 struct SettingsSwitchStyle: ToggleStyle {

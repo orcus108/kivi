@@ -12,7 +12,9 @@ The speech-to-text foundation comes from **[TypeWhisper](https://github.com/Type
 - **Text processing:** typed input for testing, local cleanup and structure, app-specific style choices, and a Literal mode.
 - **Selection editing:** keep the original, preview a rewrite, explicitly apply it, check for document/selection changes, and guard Undo. Copying remains available if insertion cannot be verified.
 - **Recovery:** clear no-speech feedback, retry, and access to a saved take when recovery is enabled.
-- **Everyday interaction:** compact dictionary and shortcut dialogs, deletion confirmation, page/greeting transitions that respect reduced motion, and paged history with background search/export.
+- **For You:** conversational app-specific writing preferences, editable Before → After examples, local previews before saving, independent preference removal, and locally saved chats/drafts. Conversation planning can use Groq with your own key or the local model; example previews use the local editor.
+- **Home and Insights:** searchable saved takes with app/date filters, expandable transcripts, usage summaries and configurable time-saved estimates.
+- **Everyday interaction:** compact dictionary and shortcut dialogs, inline global-rule editing, deletion confirmation, keyboard/focus refinements, and transitions that respect reduced motion.
 
 Start with [the contribution map](docs/CONTRIBUTIONS.md) for source locations and [verification](docs/VERIFICATION.md) for evidence and limits.
 

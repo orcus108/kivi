@@ -979,12 +979,30 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         setupMonitor()
     }
 
+    static func shouldInstallPasteLastDefault(defaults: UserDefaults, hasAssignment: Bool, hasConflict: Bool) -> Bool {
+        let key = "kiviPasteLastDefaultV1"
+        guard !defaults.bool(forKey: key) else { return false }
+        defaults.set(true, forKey: key)
+        return !hasAssignment && !hasConflict
+    }
+
     func registerWorkflowHotkeys(_ entries: [(id: UUID, hotkey: UnifiedHotkey, behavior: WorkflowHotkeyBehavior)]) {
         workflowSlots.removeAll()
         for entry in entries {
             workflowSlots[entry.id, default: []].append(
                 WorkflowHotkeyState(workflowId: entry.id, hotkey: entry.hotkey, behavior: entry.behavior)
             )
+        }
+        // One-time migration, after workflow assignments are known. Clearing it later stays cleared.
+        let defaults = UserDefaults.standard
+        let candidate = UnifiedHotkey(keyCode: 9,
+            modifierFlags: NSEvent.ModifierFlags.command.union(.shift).rawValue, isFn: false)
+        if Self.shouldInstallPasteLastDefault(defaults: defaults,
+            hasAssignment: !hotkeys(for: .pasteLastTranscription).isEmpty,
+            hasConflict: isHotkeyAssigned(candidate, excluding: .pasteLastTranscription) != nil
+                || isHotkeyAssignedToWorkflow(candidate, excludingWorkflowId: nil) != nil) {
+            slots[.pasteLastTranscription] = [SlotState(hotkey: candidate)]
+            persistHotkeys([candidate], for: .pasteLastTranscription)
         }
         tearDownMonitor()
         setupMonitor()

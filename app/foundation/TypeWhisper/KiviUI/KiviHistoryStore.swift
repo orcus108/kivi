@@ -56,6 +56,7 @@ struct KiviTakeSection: Identifiable, Equatable {
         }
         updateSummary()
     }
+    func makeIndependentFeed() -> KiviHistoryStore { KiviHistoryStore(service: service) }
     func activate() { visible = true; if dirty { reload() } }
     func deactivate() { visible = false; queryTask?.cancel(); generation += 1; if loading { dirty = true }; loading = false }
     func recordsChanged() { refreshRecent(); updateSummary(); dirty = true; if visible { reload() } }
@@ -104,8 +105,14 @@ struct KiviTakeSection: Identifiable, Equatable {
         queryTask = Task { [weak self] in await self?.fetch(query: query, offset: offset, version: version) }
     }
     private func fetch(query: HistoryQuery, offset: Int, version: Int) async {
-        guard let page = await service.fetchPageInBackground(query: query, offset: offset, limit: pageSize),
-              !Task.isCancelled, generation == version else { return }
+        let page = await service.fetchPageInBackground(query: query, offset: offset, limit: pageSize)
+        guard !Task.isCancelled, generation == version else { return }
+        guard let page else {
+            loading = false
+            error = "couldn’t load your takes. try again."
+            return
+        }
+        error = nil
         let values = page.records.map(Take.init)
         if offset == 0 { loaded = values } else { loaded.append(contentsOf: values) }
         sections = KiviTakeSection.group(loaded)

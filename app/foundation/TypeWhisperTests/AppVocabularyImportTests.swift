@@ -52,6 +52,20 @@ final class AppVocabularyImportTests: XCTestCase {
         XCTAssertTrue(snippetModel.sources.contains(snippetModel.source))
     }
 
+    func testAquaTextExportKeepsPhrasesAndSkipsComments() throws {
+        let dir = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(dir) }
+        let url = dir.appendingPathComponent("words.txt")
+        try Data("# exported words\r\nSiobhan\r\nHacker News\r\n#general\r\n\r\n".utf8).write(to: url)
+        let batch = try AppVocabularyImport.load(source: .aquaVoice, url: url, destination: .dictionary)
+        XCTAssertEqual(batch.entries.map(\.original), ["Siobhan", "Hacker News", "#general"])
+        XCTAssertTrue(batch.entries.allSatisfy { $0.kind == .term && $0.replacement == nil })
+        let review = AppVocabularyImport.review(batch, existing: [.init(id: UUID(), entry: .init(kind: .term, original: "siobhan", replacement: nil), caseSensitive: false, isEnabled: true)])
+        XCTAssertEqual(review.first?.outcome, .duplicate)
+        try Data([0xff, 0xfe]).write(to: url)
+        XCTAssertThrowsError(try AppVocabularyImport.load(source: .aquaVoice, url: url, destination: .dictionary))
+    }
+
     func testHandyOnlyImportsCustomWords() throws {
         let data = Data(#"{"settings":{"custom_words":[" Kubernetes ","Swift","  "],"custom_filler_words":["um"],"api_key":"ignored"}}"#.utf8)
         let batch = try AppVocabularyImport.parseHandy(data)

@@ -9,6 +9,8 @@ This project builds on TypeWhisper v1.7.1 rather than implementing speech recogn
 | Selection editing | `TypeWhisper/Services/IntentSelectionEditor.swift` | Original retention, local rewrite preview, Apply drift checks, copying and guarded Undo |
 | Correction learning | `TypeWhisper/Services/TargetAppCorrectionLearningService.swift` | Conservative capture/review and guarded rule changes, using the existing insertion foundation |
 | Local styles | `TypeWhisper/KiviUI/KiviStyleRouter.swift`, `KiviLocalEditorRuntime.swift` | Destination style routing and isolated local editor runtime |
+| Conversational preferences | `TypeWhisper/KiviUI/KiviTalkPage.swift`, `KiviTalkConversation.swift`, `KiviTalkService.swift`, `KiviTalkChangeHistory.swift` | App-scoped proposals, preview/save drift checks, independent removal and local conversation/draft persistence |
+| Insights | `TypeWhisper/KiviUI/InsightsPage.swift`, `InsightsData.swift`, `KiviInsightsShare.swift` | Usage summaries, estimated time savings, app patterns and sharing |
 | History responsiveness | `TypeWhisper/Services/HistoryService.swift`, `TypeWhisper/KiviUI/LibraryPages.swift` | Pagination, cancellable search, background summaries/export and reduced UI work |
 
 Paths in rows after the first are relative to `app/foundation/`. Some filenames may expose upstream naming; provenance is preserved rather than presenting the foundation as original work.

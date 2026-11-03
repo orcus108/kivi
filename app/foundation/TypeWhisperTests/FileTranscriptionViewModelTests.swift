@@ -988,6 +988,7 @@ final class FileTranscriptionViewModelTests: XCTestCase {
         XCTAssertEqual(capturedEngineOverrideId, "parakeet")
         XCTAssertEqual(capturedModelOverrideId, "parakeet-large")
         let historyRecord = try XCTUnwrap(historyService.recentRecords.first)
+        XCTAssertEqual(viewModel.recoveredText, "Recovered dictation")
         XCTAssertEqual(historyRecord.rawText, "Recovered dictation")
         XCTAssertEqual(historyRecord.finalText, "Recovered dictation")
         XCTAssertEqual(historyRecord.language, "de")

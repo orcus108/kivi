@@ -5439,14 +5439,21 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         service.accessibilityGrantedOverride = true
         service.pasteboardProvider = { pasteboard }
         service.focusedTextElementOverride = { nil }
+        service.pasteTargetAssessmentOverride = { .unknown }
+        service.pasteCommandAvailabilityOverride = { .unknown }
+        service.pasteVerificationAttempts = 1
+        service.pasteVerificationPollingDelay = .seconds(1)
 
         var pasteCount = 0
         service.pasteSimulatorOverride = {
             pasteCount += 1
         }
 
+        let started = ContinuousClock.now
         let result = try await service.insertText("Hello", awaitPasteVerification: true)
 
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(500),
+                          "An unavailable original text field cannot become verifiable by polling")
         XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextStateUnavailable)))
         XCTAssertEqual(pasteCount, 1)
         XCTAssertEqual(pasteboard.string(forType: .string), "Hello")

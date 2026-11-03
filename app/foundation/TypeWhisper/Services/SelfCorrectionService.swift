@@ -15,7 +15,7 @@ final class SelfCorrectionService: Sendable {
     private let apiKey: String?
     private let useGroq: Bool
     static let providerKey = "intentSelfCorrectionProvider"
-    static var groqSelected: Bool { UserDefaults.standard.string(forKey: providerKey) == "groq" }
+    static var groqSelected: Bool { (UserDefaults.standard.string(forKey: providerKey) ?? "groq") == "groq" }
     static let groqModel = "openai/gpt-oss-20b"
     static var selectedKey: String? { loadKey(useGroq: groqSelected) }
 

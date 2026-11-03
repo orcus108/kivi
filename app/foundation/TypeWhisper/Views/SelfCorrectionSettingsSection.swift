@@ -2,8 +2,8 @@ import SwiftUI
 import AppKit
 
 struct SelfCorrectionSettingsSection: View {
-    @AppStorage(SelfCorrectionService.enabledKey) private var liveCleanupEnabled = false
-    @AppStorage(SelfCorrectionService.providerKey) private var provider = "gemini"
+    @AppStorage(SelfCorrectionService.enabledKey) private var liveCleanupEnabled = true
+    @AppStorage(SelfCorrectionService.providerKey) private var provider = "groq"
     @State private var keyInput = ""
     @State private var input = "I want to book—sorry, I want to cancel the booking."
     @State private var typedResult: SelfCorrectionResult?
@@ -12,13 +12,13 @@ struct SelfCorrectionSettingsSection: View {
     @State private var status = ""
 
     var body: some View {
-        Section("Spoken self-corrections · experiment 1") {
-            Toggle("Clean spoken self-corrections with API", isOn: $liveCleanupEnabled)
+        Section("Spoken self-correction") {
+            Toggle("Enable spoken self-correction", isOn: $liveCleanupEnabled)
             Picker("Cleanup provider", selection: $provider) {
                 Text("Groq - GPT-OSS 20B").tag("groq")
                 Text("Gemini 3.5 Flash-Lite").tag("gemini")
             }.onChange(of: provider) { _, _ in keyInput = ""; cancel("Provider changed") }
-            Text("The selected provider receives transcript text for possible corrections. Audio stays on this Mac. Cleanup adds an API wait; errors keep the original. Turn this off for local dictation without API cleanup.")
+            Text("Groq receives transcript text only when Kivi detects a possible spoken correction. Audio stays on this Mac. If cleanup fails, Kivi keeps the original text. Turn this off to skip API cleanup.")
                 .font(.caption).foregroundStyle(.secondary)
             SecureField("API key for selected provider (replace only)", text: $keyInput)
             Button("Save key") {

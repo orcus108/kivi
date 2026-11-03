@@ -49,6 +49,7 @@ final class DictationRecoveryViewModel: ObservableObject {
 
     @Published private(set) var recoveries: [RecoveryItem]
     @Published var selectedRecoveryID: RecoveryItem.ID?
+    @Published private(set) var recoveredText: String?
     @Published private(set) var lastSavedRecoveryFileName: String?
     @Published private(set) var lastSavedHistoryRecordID: UUID?
     @Published var languageSelection: LanguageSelection = .auto {
@@ -389,6 +390,7 @@ final class DictationRecoveryViewModel: ObservableObject {
                     audioSamples: historyAudioSamples,
                     pipelineSteps: [localizedAppText("Recovered recording", de: "Wiederhergestellte Aufnahme")]
                 )
+                recoveredText = text
                 lastSavedRecoveryFileName = url.lastPathComponent
                 lastSavedHistoryRecordID = historyID
                 if DictationRecoveryAudioStore.isRecentSuccessfulRecording(url) {

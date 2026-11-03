@@ -76,6 +76,113 @@ private final class UnsupportedDictionaryEnginePlugin: NSObject, TranscriptionEn
 }
 
 final class DictionaryServiceTests: XCTestCase {
+    @MainActor
+    func testFailedLearningPreservesDeferredUsageAndLeavesNoPhantomMemory() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        dictionary.addEntry(type: .correction, original: "teh", replacement: "the")
+        _ = dictionary.applyCorrections(to: "teh", deferUsageCountSave: true)
+        dictionary.learningSaveOverride = { throw NSError(domain: "SyntheticSaveFailure", code: 1) }
+        XCTAssertTrue(dictionary.learnCorrectionsWithResult([.init(original: "Rohan", replacement: "Rohaan")]).failed)
+        XCTAssertTrue(dictionary.learnVocabularyWithResult("Kivi").failed)
+        XCTAssertEqual(dictionary.correctionsCount, 1)
+        XCTAssertEqual(dictionary.termsCount, 0)
+        XCTAssertEqual(dictionary.corrections.first?.usageCount, 1)
+        dictionary.saveDeferredUsageCounts()
+        XCTAssertEqual(DictionaryService(appSupportDirectory: directory).corrections.first?.usageCount, 1)
+    }
+
+    @MainActor
+    func testUndoDoesNotClaimSuccessWhenDurableDismissalCannotBeWritten() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let learned = dictionary.learnCorrections([.init(original: "Rohan", replacement: "Rohaan")])
+        let marker = directory.appendingPathComponent("dismissed-correction-learning.json")
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: false)
+        XCTAssertFalse(dictionary.undoLearnedCorrections(learned))
+        XCTAssertEqual(dictionary.correctionsCount, 1)
+        XCTAssertFalse(dictionary.isLearningDismissed(original: "Rohan", replacement: "Rohaan"))
+        try FileManager.default.removeItem(at: marker)
+        XCTAssertTrue(dictionary.undoLearnedCorrections(learned))
+        XCTAssertEqual(dictionary.correctionsCount, 0)
+    }
+
+    @MainActor
+    func testLearnedSpellingFeedsRecognitionAndDisablingRemovesHint() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let result = dictionary.learnCorrectionsWithResult([.init(original: "Rohan", replacement: "Rohaan")])
+        XCTAssertEqual(result.learnedCorrections.count, 1)
+        XCTAssertEqual(dictionary.enabledTerms(), ["Rohaan"])
+        XCTAssertEqual(dictionary.enabledTermHints().map(\.text), ["Rohaan"])
+        XCTAssertEqual(dictionary.getTermsForPrompt(providerId: nil), "Rohaan")
+        XCTAssertEqual(dictionary.previewCorrections(to: "Ask Rohan, then Rohanathan."), "Ask Rohaan, then Rohanathan.")
+        let entry = try XCTUnwrap(dictionary.corrections.first)
+        dictionary.setEntryEnabled(entry, enabled: false)
+        XCTAssertTrue(dictionary.enabledTerms().isEmpty)
+        XCTAssertEqual(dictionary.previewCorrections(to: "Ask Rohan."), "Ask Rohan.")
+        XCTAssertTrue(dictionary.learnCorrections([.init(original: "Rohan", replacement: "Rohaan")]).isEmpty)
+    }
+
+    @MainActor
+    func testVocabularyLearningNeverReplacesFruitAndUndoSurvivesReload() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let learned = dictionary.learnVocabularyWithResult("Kivi").learnedCorrections
+        XCTAssertEqual(learned.count, 1)
+        XCTAssertEqual(dictionary.previewCorrections(to: "I bought kiwi fruit."), "I bought kiwi fruit.")
+        XCTAssertEqual(dictionary.enabledTerms(), ["Kivi"])
+        dictionary.undoLearnedCorrections(learned)
+        let reloaded = DictionaryService(appSupportDirectory: directory)
+        XCTAssertTrue(reloaded.enabledTerms().isEmpty)
+        XCTAssertTrue(reloaded.learnVocabularyWithResult("Kivi").learnedCorrections.isEmpty)
+        reloaded.allowLearning(original: "kiwi", replacement: "Kivi", vocabulary: true)
+        XCTAssertEqual(reloaded.learnVocabularyWithResult("Kivi").learnedCorrections.count, 1)
+    }
+
+    @MainActor
+    func testBatchDeleteSuppressesRelearningAndManualEntryWins() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let learned = dictionary.learnCorrections([.init(original: "Vedan", replacement: "Vedant")])
+        try dictionary.deleteEntries(ids: Set(learned.map(\.id)))
+        let reloaded = DictionaryService(appSupportDirectory: directory)
+        XCTAssertTrue(reloaded.learnCorrections([.init(original: "Vedan", replacement: "Vedant")]).isEmpty)
+        reloaded.addEntry(type: .correction, original: "Vedan", replacement: "Vedanth")
+        XCTAssertTrue(reloaded.learnCorrections([.init(original: "Vedan", replacement: "Vedant")]).isEmpty)
+        XCTAssertEqual(reloaded.previewCorrections(to: "Vedan"), "Vedanth")
+    }
+
+    @MainActor
+    func testLearningRejectsDirectReplacementChainsWithinBatch() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let learned = dictionary.learnCorrections([.init(original: "Vedan", replacement: "Vedant"), .init(original: "Vedant", replacement: "Vedanth")])
+        XCTAssertEqual(learned.count, 1)
+        XCTAssertEqual(dictionary.previewCorrections(to: "Vedan"), "Vedant")
+    }
+
+    @MainActor
+    func testProvisionalRollbackDoesNotSuppressFutureLearningOrDeleteEditedTerm() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let dictionary = DictionaryService(appSupportDirectory: directory)
+        let first = dictionary.learnVocabularyWithResult("Kivi").learnedCorrections
+        dictionary.undoLearnedCorrections(first, suppressRelearning: false)
+        let second = dictionary.learnVocabularyWithResult("Kivi").learnedCorrections
+        XCTAssertEqual(second.count, 1)
+        let entry = try XCTUnwrap(dictionary.terms.first)
+        dictionary.updateEntry(entry, original: "Kivi Dev", replacement: nil, caseSensitive: false)
+        dictionary.undoLearnedCorrections(second)
+        XCTAssertEqual(dictionary.terms.first?.original, "Kivi Dev")
+    }
+
     override func setUp() {
         super.setUp()
         UserDefaults.standard.removeObject(forKey: UserDefaultsKeys.activatedTermPacks)
@@ -130,6 +237,236 @@ final class DictionaryServiceTests: XCTestCase {
         service.saveDeferredUsageCounts()
 
         XCTAssertEqual(DictionaryService(appSupportDirectory: appSupportDirectory).corrections.first?.usageCount, 2)
+    }
+
+    /// Product contract: examples deliberately include unrelated names and everyday words.
+    @MainActor
+    func testDictionaryMatchingEvaluationSet() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "Whisper Flow", replacement: "WisprFlow")
+        service.addEntry(type: .correction, original: "clawed code", replacement: "Claude Code")
+        service.addEntry(type: .correction, original: "git hub", replacement: "GitHub")
+        service.addEntry(type: .correction, original: "O'Neal", replacement: "O’Neill")
+        service.addEntry(type: .correction, original: "type script", replacement: "TypeScript")
+        service.addEntry(type: .term, original: "OpenAI")
+        service.addEntry(type: .term, original: "Linear")
+        service.addEntry(type: .term, original: "May")
+        service.addEntry(type: .term, original: "code")
+        let cases: [(String, String)] = [
+            ("Whisper Flow / whisperflow / WHISPERFLOW", "WisprFlow / WisprFlow / WisprFlow"),
+            ("whisper-flow, whisper‐flow, whisper‑flow", "WisprFlow, WisprFlow, WisprFlow"),
+            ("whisper\u{00a0}flow and whisper\tflow", "WisprFlow and WisprFlow"),
+            ("Wispr Flow and wisprflow", "WisprFlow and WisprFlow"),
+            ("WhisperFlow’s settings; Whisper Flow's settings", "WisprFlow’s settings; WisprFlow's settings"),
+            ("Try ClawedCode and GIT-HUB.", "Try Claude Code and GitHub."),
+            ("Use type-script with open ai.", "Use TypeScript with OpenAI."),
+            ("Ask O’Neal or O'Neal.", "Ask O’Neill or O’Neill."),
+            ("WisprFlow and GitHub and OpenAI", "WisprFlow and GitHub and OpenAI"),
+            ("WhisperFlower MyWhisperFlow WhisperFlows", "WhisperFlower MyWhisperFlow WhisperFlows"),
+            ("whisper\nflow", "whisper\nflow"),
+            ("whisper.flow", "whisper.flow"),
+            ("whisper_flow", "whisper_flow"),
+            ("my_whisperflow whisperflow_settings", "my_whisperflow whisperflow_settings"),
+            ("whisperflow@example.com", "whisperflow@example.com"),
+            ("https://whisper-flow.com", "https://whisper-flow.com"),
+            ("whisperflow.com whisperflow.txt", "whisperflow.com whisperflow.txt"),
+            ("`WhisperFlow` `Whisper Flow`", "`WhisperFlow` `Whisper Flow`"),
+            ("/Users/WhisperFlow ~/WhisperFlow", "/Users/WhisperFlow ~/WhisperFlow"),
+            ("whisper 2 flow", "whisper 2 flow"),
+            ("whisper slow", "whisper slow"),
+            ("linear equations may help", "linear equations may help"),
+            ("we should get help from git", "we should get help from git"),
+            ("type scripts and open air", "type scripts and open air"),
+            ("Clawed, code is ordinary here", "Clawed, code is ordinary here"),
+            ("Whisper Flow! Then type script.", "WisprFlow! Then TypeScript.")
+        ]
+        for (input, expected) in cases {
+            let review = service.reviewMatches(in: input)
+            XCTAssertEqual(review.text, expected, input)
+            XCTAssertEqual(service.previewCorrections(to: input), expected, input)
+            XCTAssertEqual(service.applyCorrections(to: input), expected, input)
+            XCTAssertEqual(service.applyCorrections(to: expected), expected, "second pass: \(input)")
+        }
+    }
+
+    @MainActor
+    func testLiteralUnicodeMatchingAndWholeStructuredAliasesArePreserved() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "Die Straße", replacement: "Die Straße.")
+        service.addEntry(type: .correction, original: "old@example.com", replacement: "new@example.com")
+        XCTAssertEqual(service.applyCorrections(to: "Die Strasse"), "Die Straße.")
+        XCTAssertEqual(service.applyCorrections(to: "old@example.com"), "new@example.com")
+        XCTAssertEqual(service.applyCorrections(to: "Use old@example.com."), "Use new@example.com.")
+        XCTAssertEqual(service.applyCorrections(to: "Die Straße."), "Die Straße.")
+    }
+
+    @MainActor
+    func testAdjacentIndependentDeletionRulesDoNotHideEachOther() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "um", replacement: "")
+        service.addEntry(type: .correction, original: "uh", replacement: "")
+        service.addEntry(type: .correction, original: "teh", replacement: "the")
+        for (input, expected) in [("um uh", ""), ("um uh hello", "hello"),
+                                  ("hello um uh", "hello"), ("hello um uh there", "hello there"),
+                                  ("um uh teh word", "the word")] {
+            XCTAssertEqual(service.applyCorrections(to: input), expected, input)
+            XCTAssertEqual(service.applyCorrections(to: expected), expected, input)
+        }
+        XCTAssertEqual(service.reviewMatches(in: "um uh").correctionIDs.count, 2)
+    }
+
+    @MainActor
+    func testNearbySpellingsAreReviewOnlyAndNeverLearnedAutomatically() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "Whisper Flow", replacement: "WisprFlow")
+        service.addEntry(type: .term, original: "Linear")
+        let count = service.entries.count
+        for source in ["WisprFlaw", "Wisprfolw", "Wisprflw", "Wissprflow", "wispr flaw", "Whisper Flaw", "whisper slow"] {
+            let suggestions = service.suggestedAliases(in: source)
+            XCTAssertTrue(suggestions.contains(.init(heard: source, written: "WisprFlow")), source)
+            XCTAssertEqual(service.applyCorrections(to: source), source, source)
+        }
+        for source in ["WisprFlow", "Whisper Flow", "linear equations may help",
+                       "wisprflaw@example.com", "https://wisprflaw.com", "`WisprFlaw`", "wisprflaw.txt"] {
+            XCTAssertTrue(service.suggestedAliases(in: source).isEmpty, source)
+        }
+        XCTAssertTrue(service.suggestedAliases(in: String(repeating: "a", count: 2_001)).isEmpty)
+        XCTAssertEqual(service.entries.count, count)
+        XCTAssertTrue(service.corrections.allSatisfy { $0.usageCount == 0 })
+        // An explicitly reviewed alias is then eligible for automatic matching.
+        service.addEntry(type: .correction, original: "WisprFlaw", replacement: "WisprFlow")
+        XCTAssertEqual(service.applyCorrections(to: "WisprFlaw"), "WisprFlow")
+    }
+
+    @MainActor
+    func testNearbySpellingAmbiguityOffersAlternativesWithoutPickingOne() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .term, original: "NimbusCloud")
+        service.addEntry(type: .term, original: "NimbusClad")
+        let suggestions = service.suggestedAliases(in: "NimbusClod")
+        XCTAssertEqual(Set(suggestions.map(\.written)), Set(["NimbusCloud", "NimbusClad"]))
+        XCTAssertEqual(service.previewCorrections(to: "NimbusClod"), "NimbusClod")
+        XCTAssertLessThanOrEqual(suggestions.count, 3)
+    }
+
+    @MainActor
+    func testCamelCaseAliasesWorkInBothDirectionsWithoutInventingWordSplits() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "CloudDesk", replacement: "Nimbus")
+        service.addEntry(type: .term, original: "HTTPServer")
+        XCTAssertEqual(service.applyCorrections(to: "cloud desk / cloud-desk / clouddesk"), "Nimbus / Nimbus / Nimbus")
+        XCTAssertEqual(service.applyCorrections(to: "http server / httpserver"), "HTTPServer / HTTPServer")
+        XCTAssertEqual(service.applyCorrections(to: "c loud desk"), "c loud desk")
+    }
+
+    @MainActor
+    func testCompetingNormalizedAliasesAreNotChosenByStorageOrder() throws {
+        for reversed in [false, true] {
+            let directory = try TestSupport.makeTemporaryDirectory()
+            defer { TestSupport.remove(directory) }
+            let service = DictionaryService(appSupportDirectory: directory)
+            let rules = [("blue bird", "Aster"), ("bluebird", "Cedar")]
+            for (source, target) in reversed ? rules.reversed().map({ $0 }) : rules {
+                service.addEntry(type: .correction, original: source, replacement: target)
+            }
+            XCTAssertEqual(service.reviewMatches(in: "bluebird").text, "Cedar") // literal beats inferred
+            XCTAssertEqual(service.reviewMatches(in: "blue bird").text, "Aster")
+        }
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "blue bird", replacement: "Aster")
+        service.addEntry(type: .correction, original: "blue-bird", replacement: "Cedar")
+        let review = service.reviewMatches(in: "bluebird")
+        XCTAssertEqual(review.text, "bluebird")
+        XCTAssertEqual(review.conflicts.count, 1)
+        XCTAssertTrue(review.changes.isEmpty)
+        XCTAssertTrue(service.corrections.allSatisfy { $0.usageCount == 0 })
+    }
+
+    @MainActor
+    func testPreferredOutputsAreTerminalAndRulesDoNotCascade() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "alpha", replacement: "beta")
+        service.addEntry(type: .correction, original: "beta", replacement: "gamma")
+        let review = service.reviewMatches(in: "alpha beta")
+        XCTAssertEqual(review.text, "beta beta")
+        XCTAssertEqual(review.conflicts.count, 1)
+        XCTAssertEqual(service.applyCorrections(to: review.text), review.text)
+        // An independent alias cannot corrupt the preferred output of a longer alias.
+        service.addEntry(type: .correction, original: "clawed code", replacement: "Claude Code")
+        service.addEntry(type: .correction, original: "code", replacement: "program")
+        XCTAssertEqual(service.applyCorrections(to: "clawed code and code"), "Claude Code and program")
+        XCTAssertEqual(service.applyCorrections(to: "Claude Code and code"), "Claude Code and program")
+    }
+
+    @MainActor
+    func testMatchingRespectsDisabledEntriesAndCaseSensitiveAliases() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "Cloud Desk", replacement: "Nimbus", caseSensitive: true)
+        XCTAssertEqual(service.applyCorrections(to: "CloudDesk cloud desk"), "Nimbus cloud desk")
+        let entry = try XCTUnwrap(service.corrections.first)
+        service.toggleEntry(entry)
+        XCTAssertEqual(service.applyCorrections(to: "CloudDesk"), "CloudDesk")
+    }
+
+    @MainActor
+    func testReviewDoesNotCountUsageAndAliasesSharePreferredSpelling() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "clawed code", replacement: "ClaudeCode")
+        service.addEntry(type: .correction, original: "cloud code", replacement: "ClaudeCode")
+        let review = service.reviewMatches(in: "ClawedCode cloud-code claude code")
+        XCTAssertEqual(review.text, "ClaudeCode ClaudeCode ClaudeCode")
+        XCTAssertEqual(review.changes.count, 3)
+        XCTAssertTrue(service.corrections.allSatisfy { $0.usageCount == 0 })
+        XCTAssertTrue(service.reviewMatches(in: "claude code").correctionIDs.isEmpty)
+        _ = service.applyCorrections(to: ["clawedcode", "clawed-code", "cloud code"])
+        XCTAssertTrue(service.corrections.allSatisfy { $0.usageCount == 1 })
+        let reloaded = DictionaryService(appSupportDirectory: directory)
+        XCTAssertEqual(reloaded.applyCorrections(to: "clawedcode and cloudcode"), "ClaudeCode and ClaudeCode")
+    }
+
+    @MainActor
+    func testCorrectionAcceptsJoinedAndVariableSpacingWithWordBoundaries() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "Whisper Flow", replacement: "WisprFlow")
+        for input in ["Whisper Flow", "WhisperFlow", "Whisperflow", "WHISPERFLOW", "whisper  flow", "Whisper\tFlow"] {
+            XCTAssertEqual(service.applyCorrections(to: "Use (\(input)), please."), "Use (WisprFlow), please.")
+            XCTAssertEqual(service.previewCorrections(to: input), "WisprFlow")
+        }
+        for input in ["WhisperFlower", "MyWhisperFlow", "Whisper\nFlow", "WisprFlow"] {
+            XCTAssertEqual(service.applyCorrections(to: input), input)
+        }
+    }
+
+    @MainActor
+    func testFlexibleSpacingDoesNotExpandAnExistingReplacement() throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let service = DictionaryService(appSupportDirectory: directory)
+        service.addEntry(type: .correction, original: "git hub", replacement: "GitHub.com")
+        XCTAssertEqual(service.applyCorrections(to: "git hub and GitHub.com"), "GitHub.com and GitHub.com")
+        XCTAssertEqual(service.applyCorrections(to: service.applyCorrections(to: "github")), "GitHub.com")
     }
 
     @MainActor

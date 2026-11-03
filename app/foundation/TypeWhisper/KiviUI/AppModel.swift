@@ -8,6 +8,7 @@ struct ExpansionEntry: Codable, Identifiable, Equatable { var id = UUID(); var t
 struct Take: Identifiable, Equatable, Sendable { var id: UUID; var date: Date; var raw: String; var text: String; var source: String; var isSpeech: Bool; var wordCount: Int { text.split(whereSeparator: \.isWhitespace).count } }
 struct WritingStyle: Identifiable, Codable, Equatable {
     var id: String; var name: String; var subtitle: String; var mode: String; var rules: String; var apps: String
+    var usesGroupTone: Bool? = nil
     static let defaults: [Self] = [
         .init(id: "developer", name: "developer", subtitle: "terse, and your code stays code", mode: "clear", rules: "Preserve code identifiers, commands, paths and technical terms.", apps: "Cursor, Xcode, Terminal"),
         .init(id: "work", name: "work messaging", subtitle: "clear, quick, and work-ready", mode: "clear", rules: "Preserve every number and commitment.", apps: "Slack, Teams, Zoom"),
@@ -50,8 +51,9 @@ extension Take {
 }
 
 enum Page: String, CaseIterable {
-    case record, history, dictionary, shortcuts, styles, settings
-    var icon: String { switch self { case .record: "mic"; case .history: "clock"; case .dictionary: "sparkle"; case .shortcuts: "bolt"; case .styles: "line.diagonal"; case .settings: "gearshape" } }
+    case record, talk, insights, dictionary, shortcuts, styles, settings
+    var title: String { self == .record ? "home" : self == .talk ? "for you" : rawValue }
+    var icon: String { switch self { case .record: "house"; case .talk: "bubble.left"; case .insights: "chart.bar.xaxis"; case .dictionary: "sparkle"; case .shortcuts: "bolt"; case .styles: "line.diagonal"; case .settings: "gearshape" } }
 }
 
 @MainActor final class KiviAudioMeter: ObservableObject { @Published var level = 0.0 }
@@ -98,14 +100,27 @@ enum Page: String, CaseIterable {
     @Published var saved = SavedState()
     @Published var page: Page = .record {
         didSet {
-            if page == .record && oldValue != .record { greeting = (greeting + 1) % 3 }
+            if page == .record && oldValue != .record { advanceGreeting() }
         }
     }
     @Published var showWelcome = false
     let writing = KiviDraftStore()
+    lazy var talk: KiviTalkConversation = {
+        let conversation = KiviTalkConversation()
+        conversation.configurationChanged = { [weak self] in self?.refreshWritingPreferences() }
+        conversation.protectedTerms = { [weak self] in self?.services.dictionaryService.vocabularyForPrompt(limit: .max) ?? [] }
+        return conversation
+    }()
     var draft: String { get { writing.text } set { if writing.text != newValue { writing.text = newValue } } }
+    private var greetingCycle = KiviGreetingCycle()
+    var currentGreeting: (String, String, String) { greetingCycle.current }
+    func advanceGreeting(now: Date = Date()) {
+        greetingCycle.advance(now: now)
+        greeting &+= 1
+    }
     @Published var greeting = 0; @Published var toast: String?; @Published var settingsSection = "general"
     @Published var selectedTake: Take?; @Published var selectedStyle: String?
+    @Published var styleAppToOpen: String?
     @Published var modelStatus = "loading your dictation engine…"
     @Published var incognito = false { didSet { updatePrivacy() } }
     let services: ServiceContainer
@@ -125,6 +140,8 @@ enum Page: String, CaseIterable {
     init(services: ServiceContainer = .shared) {
         self.services = services; history = KiviHistoryStore(service: services.historyService); speech = SpeechCapture(services.dictationViewModel); dataDirectory = AppConstants.appSupportDirectory
         if let data = try? Data(contentsOf: stateURL), let state = try? JSONDecoder().decode(SavedState.self, from: data) { saved = state }
+        let styleConfig = KiviStyleRouter.load()
+        saved.styles = styleConfig.styles; saved.appOverrides = styleConfig.overrides
         saved.literal = UserDefaults.standard.string(forKey: IntentTextPipeline.styleKey) == "literal"
         saved.locale = services.settingsViewModel.selectedLanguage ?? "en"
         previousLiteral = saved.literal
@@ -204,20 +221,45 @@ enum Page: String, CaseIterable {
             do {
                 let style = saved.literal ? IntentTextStyle.literal : IntentTextPipeline.style(bundleID: nil, url: nil)
                 let processed = try await IntentDictationProcessor.process(raw, style: style, dictionary: services.dictionaryService)
-                let result = style == .literal ? raw : services.snippetService.applySnippets(to: processed.text)
+                let styled = style == .literal ? (text: raw, step: Optional<String>.none) : await KiviStyleRouter.process(processed.text, appName: "writing pad", bundleID: nil, protectedTerms: services.dictionaryService.vocabularyForPrompt(limit: .max))
+                let result = style == .literal ? raw : services.snippetService.applySnippets(to: styled.text)
                 guard draft == raw else { notify("Writing pad changed; the previous result was discarded."); return }
                 draft = result
-                if !privateTake && !incognito { _ = services.historyService.addRecord(rawText: raw, finalText: result, appName: "writing pad", appBundleIdentifier: Bundle.main.bundleIdentifier, durationSeconds: 0, language: "en", engineUsed: "typed", pipelineSteps: processed.steps) }
+                if !privateTake && !incognito { _ = services.historyService.addRecord(rawText: raw, finalText: result, appName: "writing pad", appBundleIdentifier: Bundle.main.bundleIdentifier, durationSeconds: 0, language: "en", engineUsed: "typed", pipelineSteps: processed.steps + [styled.step].compactMap { $0 }) }
                 notify(privateTake || incognito ? "cleaned · incognito" : "cleaned and saved")
             } catch { notify(error.localizedDescription) }
         }
     }
     func openEditor(text: String? = nil) { let editor = IntentSelectionEditor.shared; editor.openTyped(); editor.source = text ?? draft }
+    func refreshWritingPreferences() {
+        let config = KiviStyleRouter.load()
+        saved.styles = config.styles; saved.appOverrides = config.overrides
+        _ = persist()
+    }
+    private func storeStyles(_ config: KiviStyleConfiguration) {
+        saved.styles = config.styles; saved.appOverrides = config.overrides
+        if let data = try? JSONEncoder().encode(config) { UserDefaults.standard.set(data, forKey: KiviStyleRouter.key) }
+        _ = persist()
+    }
     func saveStyle(_ style: WritingStyle, app: String?) {
-        if let app { saved.appOverrides[app] = style }
-        else if let i = saved.styles.firstIndex(where: { $0.id == style.id }) { saved.styles[i] = style }
-        KiviStyleRouter.save(style, app: app); _ = persist()
+        var config = KiviStyleRouter.load()
+        config.styles = saved.styles; config.overrides = saved.appOverrides
+        if let app {
+            config.assign(app, to: style.id)
+            if style.rules.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (style.usesGroupTone == true || config.group(for: app)?.mode == style.mode) {
+                config.reset(app)
+            } else { config.overrides[app] = style; config.enabled.insert("app:" + app) }
+        } else { config.upsert(style); config.enabled.insert(style.id) }
+        storeStyles(config)
         notify("style saved · applies locally to future dictation")
+    }
+    func deleteStyleGroup(_ id: String) {
+        var config = KiviStyleRouter.load(); config.styles = saved.styles; config.overrides = saved.appOverrides
+        config.deleteGroup(id); storeStyles(config)
+    }
+    func resetAppStyle(_ app: String) {
+        var config = KiviStyleRouter.load(); config.styles = saved.styles; config.overrides = saved.appOverrides
+        config.reset(app); storeStyles(config)
     }
     func applyStyle(_ style: WritingStyle) { openEditor(); IntentSelectionEditor.shared.instruction = "Rewrite in a \(style.mode) style. \(style.rules) Preserve all facts, names and numbers." }
     func refreshModels() async { refreshEngineStatus() }
@@ -244,7 +286,21 @@ struct KiviRootHost: View {
         RootView().environmentObject(model)
             .preferredColorScheme(model.showWelcome ? .light : (model.saved.appearance == "system" ? nil : model.saved.appearance == "light" ? .light : .dark))
             .background(WindowConfigurator())
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
+                restoreKiviFullScreenCapability(after: notification)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { notification in
+                restoreKiviFullScreenCapability(after: notification)
+            }
             .task { await KiviLocalEditorRuntime.shared.ensureRunning() }
+    }
+
+    private func restoreKiviFullScreenCapability(after notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window.identifier?.rawValue == "kivi-main" else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            KiviWindowConfiguratorView.configure(window)
+        }
     }
 }
 
@@ -261,6 +317,65 @@ struct KiviRootHost: View {
             case .saveFailed: return "the word couldn’t be saved. please try again."
             }
         }
+    }
+
+    static func grouped(_ values: [LexiconEntry]) -> [LexiconEntry] {
+        var result: [LexiconEntry] = []
+        for value in values {
+            if let index = result.firstIndex(where: { $0.written == value.written }) {
+                if value.heard != value.written {
+                    let previous = result[index].heard == value.written ? [] : [result[index].heard]
+                    result[index].heard = (previous + [value.heard]).joined(separator: ", ")
+                }
+            } else { result.append(value) }
+        }
+        return result
+    }
+
+    static func saveGroupedWord(written: String, misspellings: String?, editing id: UUID?, service: DictionaryService) throws {
+        let spelling = written.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spelling.isEmpty else { throw WordError.empty }
+        var aliases: [String] = []
+        if let misspellings {
+            for part in misspellings.split(separator: ",", omittingEmptySubsequences: false) {
+                let alias = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !alias.isEmpty else { throw WordError.empty }
+                guard alias != spelling else { throw WordError.sameSpelling }
+                if !aliases.contains(where: { $0.caseInsensitiveCompare(alias) == .orderedSame }) { aliases.append(alias) }
+            }
+        }
+        let oldSpelling = id.flatMap { key in service.entries.first { $0.id == key } }.map { $0.replacement ?? $0.original }
+        if id != nil && oldSpelling == nil { throw WordError.saveFailed }
+        let oldEntries = service.entries.filter { oldSpelling != nil && ($0.replacement ?? $0.original) == oldSpelling }
+        let oldIDs = Set(oldEntries.map(\.id))
+        // Validate the entire draft before changing any stored rules.
+        for alias in aliases {
+            guard !service.entries.contains(where: {
+                !oldIDs.contains($0.id) && $0.type == .correction &&
+                $0.original.caseInsensitiveCompare(alias) == .orderedSame && $0.replacement != spelling
+            }) else { throw WordError.duplicate }
+        }
+        for alias in aliases {
+            if let existing = oldEntries.first(where: { $0.type == .correction && $0.original.caseInsensitiveCompare(alias) == .orderedSame }) {
+                service.updateEntry(existing, original: alias, replacement: spelling, caseSensitive: existing.caseSensitive)
+            } else if !service.entries.contains(where: { $0.type == .correction && $0.original.caseInsensitiveCompare(alias) == .orderedSame && $0.replacement == spelling }) {
+                service.addEntry(type: .correction, original: alias, replacement: spelling)
+            }
+            guard service.entries.contains(where: { $0.type == .correction && $0.original.caseInsensitiveCompare(alias) == .orderedSame && $0.replacement == spelling }) else { throw WordError.saveFailed }
+        }
+        let terms = oldEntries.filter { $0.type == .term }
+        if aliases.isEmpty || !terms.isEmpty {
+            if let term = terms.first {
+                service.updateEntry(term, original: spelling, replacement: nil, caseSensitive: term.caseSensitive, ctcMinSimilarity: term.ctcMinSimilarity)
+            } else if !service.entries.contains(where: { $0.type == .term && $0.original == spelling }) {
+                service.addEntry(type: .term, original: spelling)
+            }
+            guard service.entries.contains(where: { $0.type == .term && $0.original == spelling }) else { throw WordError.saveFailed }
+        }
+        let removed = oldEntries.filter { entry in
+            entry.type == .correction && !aliases.contains { $0.caseInsensitiveCompare(entry.original) == .orderedSame }
+        }
+        try service.deleteEntries(ids: Set(removed.map(\.id)))
     }
 
     static func saveWord(written: String, misspelling: String?, editing id: UUID?, service: DictionaryService) throws {
