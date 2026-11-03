@@ -8,11 +8,13 @@ This project builds on TypeWhisper v1.7.1 rather than implementing speech recogn
 | Typed/local text processing | `TypeWhisper/Services/IntentTextPipeline.swift`, `TypeWhisperTests/IntentExperimentsTests.swift` | Cleanup, structure, preferred spelling protection, destination rules and Literal mode |
 | Selection editing | `TypeWhisper/Services/IntentSelectionEditor.swift` | Original retention, local rewrite preview, Apply drift checks, copying and guarded Undo |
 | Correction learning | `TypeWhisper/Services/TargetAppCorrectionLearningService.swift` | Conservative capture/review and guarded rule changes, using the existing insertion foundation |
-| Local styles | `TypeWhisper/KiviUI/KiviStyleRouter.swift`, `KiviLocalEditorRuntime.swift` | Destination style routing and isolated local editor runtime |
-| Conversational preferences | `TypeWhisper/KiviUI/KiviTalkPage.swift`, `KiviTalkConversation.swift`, `KiviTalkService.swift`, `KiviTalkChangeHistory.swift` | App-scoped proposals, preview/save drift checks, independent removal and local conversation/draft persistence |
-| Insights | `TypeWhisper/KiviUI/InsightsPage.swift`, `InsightsData.swift`, `KiviInsightsShare.swift` | Usage summaries, estimated time savings, app patterns and sharing |
-| History responsiveness | `TypeWhisper/Services/HistoryService.swift`, `TypeWhisper/KiviUI/LibraryPages.swift` | Pagination, cancellable search, background summaries/export and reduced UI work |
+| Local styles | `TypeWhisper/KiviUI/Features/Styles/KiviStyleRouter.swift`, `TypeWhisper/KiviUI/Services/KiviLocalEditorRuntime.swift` | Destination style routing and isolated local editor runtime |
+| Conversational preferences | `TypeWhisper/KiviUI/Features/ForYou/` | App-scoped proposals, preview/save drift checks, independent removal and local conversation/draft persistence |
+| Insights | `TypeWhisper/KiviUI/Features/Insights/` | Usage summaries, estimated time savings, app patterns and sharing |
+| History responsiveness | `TypeWhisper/Services/HistoryService.swift`, `TypeWhisper/KiviUI/Features/History/LibraryPages.swift` | Pagination, cancellable search, background summaries/export and reduced UI work |
 
 Paths in rows after the first are relative to `app/foundation/`. Some filenames may expose upstream naming; provenance is preserved rather than presenting the foundation as original work.
 
 The implementation was developed with AI coding assistance. Product direction, iteration and evaluation were driven by Vedant; the repository is evidence of the resulting implementation, not a claim that every line was written manually. Inherited recognition engines, plugins, accounts, sync and other upstream facilities should not be read as new contributions here.
+
+See the [Kivi source map](../app/foundation/TypeWhisper/KiviUI/README.md) for feature boundaries and source registration.
