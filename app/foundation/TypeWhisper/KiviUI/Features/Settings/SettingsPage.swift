@@ -322,7 +322,7 @@ struct SettingsPage: View {
             }
             sectionLabel("recovery").padding(.top, 30)
             group {
-                settingsRow("interrupted recordings", "review a failed recording and retry it") { Button("open recovery") { KiviRecoveryWindow.shared.show() }.buttonStyle(KiviButton()) }
+                settingsRow("recording recovery", "recover a cancelled or interrupted recording") { Button("open recovery") { KiviRecoveryWindow.shared.show() }.buttonStyle(KiviButton()) }
             }
             advancedLink("more recording options", detail: "advanced input priority and transcription settings", destination: "microphone").padding(.top, 24)
         }.onDisappear { devices.stopPreview() }

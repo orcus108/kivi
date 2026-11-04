@@ -41,8 +41,8 @@ private struct RecordContent: View {
                                 withAnimation(.easeInOut(duration: 0.42)) { greetingHighlightReveal = 1 }
                             }
                         if KiviTheme.usesIllustratedSummaries {
-                            KiviSummaryBanner(subject: "words-today", value: history.summary.todayWords.formatted(),
-                                              caption: "words today, in \(history.summary.todayCount) \(history.summary.todayCount == 1 ? "take" : "takes")",
+                            KiviSummaryBanner(subject: "words-today", value: history.summary.todayWords == 0 ? "no words yet" : history.summary.todayWords.formatted(),
+                                              caption: history.summary.todayWords == 0 ? "today" : "words today, in \(history.summary.todayCount) \(history.summary.todayCount == 1 ? "take" : "takes")",
                                               bannerAspectRatio: 3.8, artworkPlacement: .home)
                             recentTakes
                         } else {
@@ -128,6 +128,7 @@ private struct HomeTakeRow: View {
     let take: Take
     let reduceMotion: Bool
     @State private var expanded = false
+    @State private var copyFeedbackID: UUID?
     @State private var hovered = false
     @State private var fullHeight: CGFloat = 0
     @State private var collapsedHeight: CGFloat = 0
@@ -147,7 +148,7 @@ private struct HomeTakeRow: View {
                 // The preview owns the collapsed layout; the full text keeps one
                 // stable layout throughout the reveal. Animating lineLimit itself
                 // can draw the full text outside the row's intermediate bounds.
-                Button { model.copy(take.text) } label: {
+                Button { copyTake() } label: {
                     transcript.lineLimit(3).fixedSize(horizontal: false, vertical: true)
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { collapsedHeight = $0 }
                         .hidden().accessibilityHidden(true)
@@ -178,8 +179,8 @@ private struct HomeTakeRow: View {
                 Text(take.date.formatted(date: .omitted, time: .shortened))
                     .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
                     .monospacedDigit().fixedSize()
-                    .onTapGesture { model.copy(take.text) }
-                IconButton(icon: "square.on.square", label: "copy take") { model.copy(take.text) }
+                    .onTapGesture { copyTake() }
+                IconButton(icon: copyFeedbackID == nil ? "square.on.square" : "checkmark", label: copyFeedbackID == nil ? "copy take" : "copied") { copyTake() }
             }
             .frame(height: 24)
         }
@@ -190,11 +191,21 @@ private struct HomeTakeRow: View {
             RoundedRectangle(cornerRadius: 8)
                 .fill(hovered ? KiviTheme.green.opacity(0.035) : .clear)
                 .contentShape(Rectangle())
-                .onTapGesture { model.copy(take.text) }
+                .onTapGesture { copyTake() }
+        }
+        .task(id: copyFeedbackID) {
+            guard copyFeedbackID != nil else { return }
+            do { try await Task.sleep(for: .seconds(2)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            copyFeedbackID = nil
         }
         .onHover { hovered = $0 }
         .accessibilityElement(children: .contain)
-        .accessibilityAction(named: Text("copy take")) { model.copy(take.text) }
+        .accessibilityAction(named: Text("copy take")) { copyTake() }
+    }
+    private func copyTake() {
+        if model.copy(take.text) { copyFeedbackID = UUID() }
     }
     private func setExpanded(_ value: Bool) {
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { expanded = value }

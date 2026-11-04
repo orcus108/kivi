@@ -5,6 +5,47 @@ import XCTest
 
 final class DictationRecoveryAudioStoreTests: XCTestCase {
     @MainActor
+    func testCancelledDictationPreservesAudioAndOffersRecovery() async throws {
+        for phase in [DictationViewModel.State.recording, .processing] {
+            let directory = makeTemporaryDirectory()
+            let store = DictationRecoveryAudioStore(directory: directory)
+            let vm = makeDictationViewModel(appSupportDirectory: directory,
+                modelManager: ModelManagerService(), audioRecordingService: AudioRecordingService(recoveryAudioStore: store))
+            store.startNewRecording()
+            let samples = Array(repeating: Float(0.2), count: 32_000)
+            store.append(samples)
+            vm.state = phase
+            vm.kiviCancelRecording()
+            for _ in 0..<200 where vm.actionFeedbackMessage != "cancelled — recording saved" {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let url = try XCTUnwrap(store.latestRecoveryURL)
+            XCTAssertEqual(try Data(contentsOf: url), legacyRecoveryWavData(for: samples))
+            XCTAssertEqual(vm.actionFeedbackMessage, "cancelled — recording saved")
+            XCTAssertNotNil(vm.actionFeedbackActionTitle)
+            XCTAssertNil(vm.lastTranscribedText)
+        }
+    }
+
+    @MainActor
+    func testCancelledDictationWithRecoveryDisabledDoesNotOfferAnOlderTake() async throws {
+        let directory = makeTemporaryDirectory()
+        let store = DictationRecoveryAudioStore(directory: directory)
+        let vm = makeDictationViewModel(appSupportDirectory: directory,
+            modelManager: ModelManagerService(), audioRecordingService: AudioRecordingService(recoveryAudioStore: store))
+        store.startNewRecording()
+        store.append([0.2])
+        let older = try XCTUnwrap(store.preserveActiveRecording())
+        store.startNewRecording(enabled: false)
+        vm.state = .processing
+        vm.kiviCancelRecording()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(store.recoveryURLs, [older])
+        XCTAssertNil(vm.actionFeedbackActionTitle)
+        XCTAssertNotEqual(vm.actionFeedbackMessage, "cancelled — recording saved")
+    }
+
+    @MainActor
     func testNoSpeechRetryUsesSavedAudioOnceAndMakesRecoveredTextAvailable() async throws {
         for output in ["", "  recovered words  ", "error"] {
             let directory = makeTemporaryDirectory()

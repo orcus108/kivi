@@ -31,32 +31,30 @@ struct KiviRecoveryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 Text("pick up where you left off").font(KiviTheme.serif(30))
-                Text("listen to a saved take, then try its transcription again. recovered words appear here for you to copy. history follows your existing settings.")
+                Text("cancelled and interrupted recordings stay here. listen to a take, then recover its words. recovered words appear here for you to copy. history follows your existing settings.")
                     .font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
                 if recovery.recoveries.isEmpty {
                     Label(recovery.isRecoveryStorageDisabled ? "recording recovery is turned off" : "no recordings to recover", systemImage: "waveform")
                         .font(KiviTheme.body(17)).padding(.vertical, 24)
                 } else {
-                    Picker("recording", selection: $recovery.selectedRecoveryID) {
-                        ForEach(recovery.recoveries) { take in Text(take.fileName).tag(take.id as String?) }
-                    }.disabled(recovery.isProcessing)
+                    KiviRecoveryChoice(title: "recording", selection: $recovery.selectedRecoveryID,
+                                       options: recovery.recoveries.map { ($0.id as String?, $0.fileName) })
+                        .disabled(recovery.isProcessing)
                     HStack(spacing: 10) {
                         Button("listen") { play() }.buttonStyle(KiviButton())
                         Button("stop playback") { player?.stop() }.buttonStyle(KiviButton())
                         Spacer()
                         Button("discard…") { pendingDiscard = recovery.selectedRecovery }.buttonStyle(KiviButton())
                     }.disabled(recovery.isProcessing)
-                    Picker("speech engine", selection: $recovery.selectedEngine) {
-                        Text("use my current engine").tag(nil as String?)
-                        ForEach(recovery.availableEngines, id: \.providerId) { engine in
-                            Text(engine.providerDisplayName).tag(engine.providerId as String?).disabled(!recovery.canUseForTranscription(engine))
-                        }
-                    }.disabled(recovery.isProcessing)
+                    KiviRecoveryChoice(title: "speech engine", selection: $recovery.selectedEngine,
+                                       options: [(nil, "use my current engine")] + recovery.availableEngines
+                                        .filter { recovery.canUseForTranscription($0) }
+                                        .map { ($0.providerId as String?, $0.providerDisplayName) })
+                        .disabled(recovery.isProcessing)
                     if let engine = recovery.resolvedEngine, engine.transcriptionModels.count > 1 {
-                        Picker("model", selection: $recovery.selectedModel) {
-                            Text("default model").tag(nil as String?)
-                            ForEach(engine.transcriptionModels, id: \.id) { model in Text(model.displayName).tag(model.id as String?) }
-                        }.disabled(recovery.isProcessing)
+                        KiviRecoveryChoice(title: "model", selection: $recovery.selectedModel,
+                                           options: [(nil, "default model")] + engine.transcriptionModels.map { ($0.id as String?, $0.displayName) })
+                            .disabled(recovery.isProcessing)
                     }
                     Text("uses your selected engine and existing language settings. a cloud engine sends this recording to its provider.")
                         .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
@@ -114,5 +112,51 @@ struct KiviRecoveryView: View {
         guard let url = recovery.recoveryURL else { return }
         do { player?.stop(); player = try AVAudioPlayer(contentsOf: url); player?.play(); playbackError = nil }
         catch { playbackError = "could not play this recording: \(error.localizedDescription)" }
+    }
+}
+
+private struct KiviRecoveryChoice: View {
+    let title: String
+    @Binding var selection: String?
+    let options: [(String?, String)]
+    @State private var isOpen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
+            Button { isOpen.toggle() } label: {
+                HStack {
+                    Text(options.first(where: { $0.0 == selection })?.1 ?? "choose a \(title)")
+                        .lineLimit(1)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                }.frame(maxWidth: .infinity)
+            }
+            .buttonStyle(KiviButton())
+            .accessibilityLabel(title)
+            .popover(isPresented: $isOpen) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(options.indices, id: \.self) { index in
+                            Button {
+                                selection = options[index].0
+                                isOpen = false
+                            } label: {
+                                HStack {
+                                    Text(options[index].1)
+                                    Spacer()
+                                    if selection == options[index].0 { Image(systemName: "checkmark") }
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(KiviButton())
+                            .accessibilityAddTraits(selection == options[index].0 ? .isSelected : [])
+                        }
+                    }.padding(14)
+                }
+                .frame(width: 420, height: min(320, CGFloat(options.count * 48 + 28)))
+                .foregroundStyle(KiviTheme.ink).background(KiviTheme.panel)
+                .onExitCommand { isOpen = false }
+            }
+        }
     }
 }

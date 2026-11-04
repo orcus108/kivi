@@ -30,3 +30,12 @@ Separate signed-development checks verified local chat/draft restoration across 
 The Kivi layer now groups 32 Swift files into app setup, shared controls, services and feature folders. Their contents are unchanged. Xcode file/build IDs are preserved, source registration handles nested folders, and the public export uses the same registration script as development. Four registration regression checks pass in both locations.
 
 The reorganized source passed the signed development build and 389 selected tests, then the exported unsigned Release build and its own 389 tests. File-reference and source-content checks passed. The installed development app relaunched with its existing identity/signature; the native smoke check remained unverified because all three bounded capture attempts failed with ScreenCaptureKit `-3811`. This refactor changes organization and build registration, not application behavior. See the [source map](../app/foundation/TypeWhisper/KiviUI/README.md).
+
+
+## Recovery and Home refinements — 4 November 2026
+
+The public source export passed its unsigned Release build, **391 selected regression tests with zero failures**, and four source-registration checks. Cancelled ordinary dictation now preserves eligible audio through the existing recovery store and offers an explicit recovery action. Synthetic tests cover exact audio preservation during recording/processing cancellation and ensure disabled recovery does not offer an older recording. Recovery choices use Kivi popovers. Home copy controls briefly become a checkmark after successful copying, and zero-word days say “no words yet.”
+
+The 881-file export inventory, both dependency lockfiles, documentation links and whitespace checks passed. Common credential/path scan matches were unchanged fixtures/examples already in public source. Private logs, runtime data, credentials, models and original Kivi media remain excluded. Build/test scripts did not install or launch an app.
+
+Separate signed-development checks confirmed recovery navigation, selected choices/Escape and discard cancellation; live microphone recovery and the empty recovery state remain unverified. Home copying exposed the transient checkmark/copied state through accessibility and retained its toast; the brief rendered tick, repeated-click timing and zero-word appearance remain unverified. These source checks do not establish live speech or cross-app behavior.

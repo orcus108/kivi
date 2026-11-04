@@ -207,7 +207,13 @@ enum Page: String, CaseIterable {
         } catch { notify("Could not save: \(error.localizedDescription)"); return false }
     }
     func notify(_ message: String) { toastTask?.cancel(); toast = message; toastTask = Task { try? await Task.sleep(for: .seconds(6)); if !Task.isCancelled { toast = nil } } }
-    func copy(_ text: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string); notify("copied") }
+    @discardableResult
+    func copy(_ text: String) -> Bool {
+        NSPasteboard.general.clearContents()
+        let copied = NSPasteboard.general.setString(text, forType: .string)
+        notify(copied ? "copied" : "couldn’t copy. try again.")
+        return copied
+    }
     func toggleRecording(external: Bool = false, asInstruction: Bool = false) {
         if asInstruction { services.dictationViewModel.startSelectionInstruction(); return }
         services.dictationViewModel.kiviToggleRecording()

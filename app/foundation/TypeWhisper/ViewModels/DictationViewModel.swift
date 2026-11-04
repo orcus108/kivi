@@ -1391,7 +1391,7 @@ final class DictationViewModel: ObservableObject {
         pinnedInsertionTarget = nil
     }
 
-    private func abortActiveRecordingImmediately(sessionMessage: String, preserveRecoveryAudio: Bool = false) {
+    private func abortActiveRecordingImmediately(sessionMessage: String, preserveRecoveryAudio: Bool = false, showCancellationRecovery: Bool = false) {
         let pendingStartTask = recordingStartTask
         if pendingStartTask != nil {
             pendingStartTask?.cancel()
@@ -1413,7 +1413,8 @@ final class DictationViewModel: ObservableObject {
             )
             restoreRecordingSideEffects()
             if preserveRecoveryAudio {
-                audioRecordingService.preserveActiveRecoveryRecording()
+                let result = audioRecordingService.preserveActiveRecoveryRecordingResult()
+                if showCancellationRecovery { showCancelledRecordingRecovery(result) }
             } else {
                 audioRecordingService.discardActiveRecoveryRecording()
             }
@@ -1669,7 +1670,7 @@ final class DictationViewModel: ObservableObject {
         clearCancelWarning()
 
         if state == .processing, recordingStartTask != nil, !isStopInFlight {
-            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage, preserveRecoveryAudio: true, showCancellationRecovery: true)
             finishCancellation(message: cancelledMessage)
             return
         }
@@ -1677,7 +1678,7 @@ final class DictationViewModel: ObservableObject {
         switch state {
         case .recording:
             guard !isStopInFlight else { return }
-            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage, preserveRecoveryAudio: true, showCancellationRecovery: true)
             finishCancellation(message: cancelledMessage)
         case .processing:
             cancelActiveDictationSessionIfNeeded(message: cancelledMessage)
@@ -1688,6 +1689,8 @@ final class DictationViewModel: ObservableObject {
             recordingCleanupTask = Task {
                 await previousCleanup?.value
                 await finalizationTask?.value
+                let result = audioRecordingService.preserveActiveRecoveryRecordingResult()
+                showCancelledRecordingRecovery(result)
             }
             stopFinalizationTask = nil
             streamingHandler.stop()
@@ -1696,11 +1699,19 @@ final class DictationViewModel: ObservableObject {
             transcriptionTask?.cancel()
             transcriptionTask = nil
             endTargetAppAccessibilityObservation()
-            audioRecordingService.discardActiveRecoveryRecording()
             finishCancellation(message: cancelledMessage)
         default:
             break
         }
+    }
+
+    private func showCancelledRecordingRecovery(_ result: DictationRecoveryPreservationResult) {
+        // Never offer an older take as the recording that was just cancelled, or
+        // replace feedback belonging to a new recording started during cleanup.
+        guard result.newlyPreservedURL != nil,
+              state == .idle || (state == .inserting && actionFeedbackMessage == String(localized: "Cancelled")) else { return }
+        showNotchFeedback(message: "cancelled — recording saved", icon: "arrow.uturn.backward.circle",
+                          duration: 8, action: .openDictationRecovery)
     }
 
     private func finishCancellation(message: String) {
@@ -2479,7 +2490,7 @@ final class DictationViewModel: ObservableObject {
         clearCancelWarning()
         if recordingStartTask != nil, !isRecordingInputReady {
             let cancelledMessage = String(localized: "Cancelled")
-            abortActiveRecordingImmediately(sessionMessage: cancelledMessage)
+            abortActiveRecordingImmediately(sessionMessage: cancelledMessage, preserveRecoveryAudio: true, showCancellationRecovery: true)
             finishCancellation(message: cancelledMessage)
             return
         }
