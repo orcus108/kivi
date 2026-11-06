@@ -216,6 +216,7 @@ final class HistoryService: ObservableObject {
             fatalError("Failed to initialize history store: \(error)")
         }
 
+        try? purgeExpiredKiviTrash(now: Date())
         migrateWordsCountIfNeeded()
         refreshRecentRecords()
     }
@@ -709,7 +710,7 @@ final class HistoryService: ObservableObject {
         var apps: [String: AppAccumulator] = [:]
         var devices: [DeviceKey: Int] = [:]
         let context = ModelContext(modelContainer)
-        var descriptor = FetchDescriptor<TranscriptionRecord>()
+        var descriptor = Self.fetchDescriptor(for: HistoryQuery())
         descriptor.propertiesToFetch = [
             \TranscriptionRecord.appName,
             \TranscriptionRecord.appBundleIdentifier,
@@ -789,6 +790,11 @@ final class HistoryService: ObservableObject {
     }
 
     func record(withID id: UUID) -> TranscriptionRecord? {
+        guard let record = storedRecord(withID: id), record.kiviDeletedAt == nil else { return nil }
+        return record
+    }
+
+    private func storedRecord(withID id: UUID) -> TranscriptionRecord? {
         var descriptor = FetchDescriptor<TranscriptionRecord>(
             predicate: #Predicate { $0.id == id }
         )
@@ -848,7 +854,7 @@ final class HistoryService: ObservableObject {
         var counts: [String: Int] = [:]
         var visitedCount = 0
         let context = ModelContext(modelContainer)
-        var descriptor = FetchDescriptor<TranscriptionRecord>()
+        var descriptor = Self.fetchDescriptor(for: HistoryQuery())
         descriptor.propertiesToFetch = [\TranscriptionRecord.appURL]
         try context.enumerate(descriptor, batchSize: 500) { record in
             if checksCancellation, visitedCount.isMultiple(of: 500) { try Task.checkCancellation() }
@@ -864,7 +870,7 @@ final class HistoryService: ObservableObject {
     func purgeOldRecords(retentionDays: Int = 90) {
         let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: Date()) ?? Date()
         let descriptor = FetchDescriptor<TranscriptionRecord>(
-            predicate: #Predicate { $0.timestamp < cutoff }
+            predicate: #Predicate { $0.kiviDeletedAt == nil && $0.timestamp < cutoff }
         )
         let old: [TranscriptionRecord]
         do {
@@ -1052,7 +1058,7 @@ final class HistoryService: ObservableObject {
                 record.audioUpdatedAt = audio.updatedAt
                 record.historySyncAudioEligible = false
             case .deleteHistory(let recordID):
-                if let record = record(withID: recordID) {
+                if let record = storedRecord(withID: recordID) {
                     deleteAudioFile(for: record)
                     modelContext.delete(record)
                 }
@@ -1129,7 +1135,7 @@ final class HistoryService: ObservableObject {
     }
 
     private func remoteRecord(for id: UUID, timestamp: Date) -> TranscriptionRecord {
-        if let existing = record(withID: id) { return existing }
+        if let existing = storedRecord(withID: id) { return existing }
         let record = TranscriptionRecord(
             id: id,
             timestamp: timestamp,
@@ -1151,6 +1157,7 @@ final class HistoryService: ObservableObject {
 
     private func refreshRecentRecords() {
         var descriptor = FetchDescriptor<TranscriptionRecord>(
+            predicate: #Predicate { $0.kiviDeletedAt == nil },
             sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
         )
         descriptor.fetchLimit = Self.recentRecordsLimit
@@ -1191,16 +1198,16 @@ final class HistoryService: ObservableObject {
 
         // Keep the common mailbox-only path inside SQLite. The remaining optional filters
         // are applied during bounded enumeration to avoid one prohibitively large predicate.
-        let predicate: Predicate<TranscriptionRecord>?
+        let predicate: Predicate<TranscriptionRecord>
         switch query.collection {
         case .all:
-            predicate = nil
+            predicate = #Predicate { $0.kiviDeletedAt == nil }
         case .inbox:
-            predicate = #Predicate { $0.inboxStateRaw == openInboxState }
+            predicate = #Predicate { $0.kiviDeletedAt == nil && $0.inboxStateRaw == openInboxState }
         case .withAudio:
-            predicate = #Predicate { $0.audioFileName != nil || $0.remoteAudioRelativePath != nil }
+            predicate = #Predicate { $0.kiviDeletedAt == nil && ($0.audioFileName != nil || $0.remoteAudioRelativePath != nil) }
         case .failed:
-            predicate = #Predicate { $0.processingStateRaw == failedProcessingState }
+            predicate = #Predicate { $0.kiviDeletedAt == nil && $0.processingStateRaw == failedProcessingState }
         }
 
         let sortBy: [SortDescriptor<TranscriptionRecord>]
@@ -1299,7 +1306,7 @@ final class HistoryService: ObservableObject {
     private func records(withIDs ids: [UUID]) -> [TranscriptionRecord] {
         guard !ids.isEmpty else { return [] }
         let descriptor = FetchDescriptor<TranscriptionRecord>(
-            predicate: #Predicate { ids.contains($0.id) }
+            predicate: #Predicate { ids.contains($0.id) && $0.kiviDeletedAt == nil }
         )
         do {
             let fetched = try modelContext.fetch(descriptor)
@@ -1443,6 +1450,63 @@ private final class BackgroundAudioWrites: @unchecked Sendable {
 
 // Value-only snapshots cross the background context boundary; SwiftData models never do.
 extension HistoryService {
+    func moveKiviTakeToTrash(id: UUID, now: Date = Date()) throws {
+        guard let record = record(withID: id) else { throw CocoaError(.fileNoSuchFile) }
+        try setKiviDeletionDate(now, on: record)
+    }
+
+    func restoreKiviTake(id: UUID, now: Date = Date()) throws {
+        guard let record = storedRecord(withID: id), let deletedAt = record.kiviDeletedAt,
+              deletedAt > Self.kiviTrashCutoff(now) else { throw CocoaError(.fileNoSuchFile) }
+        try setKiviDeletionDate(nil, on: record)
+    }
+
+    func recentlyDeletedKiviTakes(now: Date = Date()) throws -> [Take] {
+        try purgeExpiredKiviTrash(now: now)
+        let descriptor = FetchDescriptor<TranscriptionRecord>(
+            predicate: #Predicate { $0.kiviDeletedAt != nil },
+            sortBy: [SortDescriptor(\.kiviDeletedAt, order: .reverse)]
+        )
+        return try modelContext.fetch(descriptor).map(Take.init)
+    }
+
+    private static func kiviTrashCutoff(_ now: Date) -> Date {
+        now.addingTimeInterval(-30 * 24 * 60 * 60)
+    }
+
+    private func setKiviDeletionDate(_ date: Date?, on record: TranscriptionRecord) throws {
+        record.kiviDeletedAt = date
+        do { try modelContext.save() }
+        catch {
+            modelContext.rollback()
+            throw error
+        }
+        refreshRecentRecords()
+    }
+
+    private func purgeExpiredKiviTrash(now: Date) throws {
+        let cutoff = Self.kiviTrashCutoff(now)
+        let descriptor = FetchDescriptor<TranscriptionRecord>(
+            predicate: #Predicate { record in
+                record.kiviDeletedAt.flatMap { $0 <= cutoff } ?? false
+            }
+        )
+        let expired = try modelContext.fetch(descriptor)
+        guard !expired.isEmpty else { return }
+        let ids = expired.map(\.id)
+        let audioFiles = expired.compactMap(\.audioFileName)
+        for record in expired { modelContext.delete(record) }
+        do { try modelContext.save() }
+        catch {
+            modelContext.rollback()
+            throw error
+        }
+        historySyncPreferences?.recordRetentionPrunes(ids)
+        for file in audioFiles {
+            try? FileManager.default.removeItem(at: audioDirectory.appendingPathComponent(file))
+        }
+    }
+
     func kiviSummary(now: Date = Date(), calendar: Calendar = .current) async throws -> KiviHistorySummary {
         let container = modelContainer
         let task = Task.detached(priority: .utility) {
@@ -1451,7 +1515,7 @@ extension HistoryService {
             var sources = Set<String>()
             var todaySources: [String: Int] = [:]
             let interval = calendar.dateInterval(of: .day, for: now)!
-            let descriptor = FetchDescriptor<TranscriptionRecord>()
+            let descriptor = Self.fetchDescriptor(for: HistoryQuery())
             try context.enumerate(descriptor, batchSize: 500) { record in
                 try Task.checkCancellation()
                 let source = record.appName ?? "writing pad"
@@ -1502,7 +1566,7 @@ extension HistoryService {
         let scan = Task.detached(priority: .utility) {
             let context = ModelContext(container)
             var days: [Date: KiviInsightDay] = [:]
-            try context.enumerate(FetchDescriptor<TranscriptionRecord>(), batchSize: 500) { record in
+            try context.enumerate(Self.fetchDescriptor(for: HistoryQuery()), batchSize: 500) { record in
                 try Task.checkCancellation()
                 guard record.engineUsed != "typed", record.source == .mac,
                       record.processingState == .ready else { return }

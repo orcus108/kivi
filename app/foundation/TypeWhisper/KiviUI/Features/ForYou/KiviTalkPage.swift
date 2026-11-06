@@ -67,7 +67,7 @@ struct KiviTalkPage: View {
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(KiviTalkEscapeCapture(enabled: showChats || showHistory || conversation.busy || conversation.listening || conversation.transcribing) { handleEscape() })
+        .background(KiviEscapeCapture(enabled: showChats || showHistory || conversation.busy || conversation.listening || conversation.transcribing) { handleEscape() })
         .onAppear { composerFocused = true }
         .onDisappear { conversation.cancelVoice() }
         .onExitCommand(perform: handleEscape)
@@ -424,35 +424,6 @@ struct KiviTalkPage: View {
         }
         if let style = config.overrides[app], config.enabled.contains("app:" + app) { parts.append("App (\(style.mode)): " + style.rules) }
         return parts.isEmpty ? "No saved writing preferences are active for this app." : parts.joined(separator: "\n")
-    }
-}
-
-/// NSTextView handles cancelOperation before SwiftUI's ancestor onExitCommand.
-/// Consume plain Escape only for this page’s active history/response/capture.
-private struct KiviTalkEscapeCapture: NSViewRepresentable {
-    var enabled: Bool
-    var onEscape: () -> Void
-    func makeNSView(context: Context) -> CaptureView { CaptureView() }
-    func updateNSView(_ view: CaptureView, context: Context) { view.enabled = enabled; view.onEscape = onEscape }
-    static func dismantleNSView(_ view: CaptureView, coordinator: ()) { view.removeMonitor() }
-
-    final class CaptureView: NSView {
-        var enabled = false
-        var onEscape: (() -> Void)?
-        private var monitor: Any?
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            removeMonitor()
-            guard window != nil else { return }
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, self.enabled, event.keyCode == 53, event.window === self.window,
-                      event.modifierFlags.intersection([.shift, .option, .command, .control]).isEmpty else { return event }
-                if let editor = self.window?.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
-                self.onEscape?()
-                return nil
-            }
-        }
-        func removeMonitor() { if let monitor { NSEvent.removeMonitor(monitor) }; monitor = nil }
     }
 }
 

@@ -2,19 +2,32 @@ import SwiftUI
 
 struct RecordPage: View {
     @EnvironmentObject var model: AppModel
-    var body: some View { RecordContent(speech: model.speech, history: model.history).environmentObject(model) }
+    let searchEnabled: Bool
+
+    var body: some View {
+        RecordContent(speech: model.speech, history: model.history, searchEnabled: searchEnabled)
+            .environmentObject(model)
+    }
 }
 private struct RecordContent: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var greetingVisible = false
     @State private var greetingHighlightReveal: CGFloat = 0
+    @State private var pendingDeletion: UUID?
+    @State private var showingDeleted = false
+    @State private var deletedTakes: [Take] = []
+    @State private var deletedLoadFailed = false
+    private enum HistoryNavigation { case openDeleted, backToHistory }
+    @FocusState private var historyNavigation: HistoryNavigation?
     private var feed: KiviHistoryStore { history }
     let speech: SpeechCapture
     @ObservedObject var history: KiviHistoryStore
-    init(speech: SpeechCapture, history: KiviHistoryStore) {
+    let searchEnabled: Bool
+    init(speech: SpeechCapture, history: KiviHistoryStore, searchEnabled: Bool) {
         self.speech = speech
         self.history = history
+        self.searchEnabled = searchEnabled
     }
     var body: some View {
         GeometryReader { geometry in
@@ -83,39 +96,184 @@ private struct RecordContent: View {
         }.animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.greeting)
     }
     private var reduceMotion: Bool { model.saved.reduceMotion || systemReduceMotion }
-    private var recentTakes: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            KiviHistoryControls(history: feed)
-            LazyVStack(alignment: .leading, spacing: 26) {
-                if feed.sections.isEmpty && !feed.loading && feed.error == nil {
-                    Text(feed.search.isEmpty && feed.source == nil && feed.period == "all time" && feed.kind == "all" ? "your saved takes will appear here." : "no takes match. try another search or clear the filters.")
-                        .font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted).padding(.vertical, 24)
-                }
-                ForEach(feed.sections) { section in
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        Text(dayTitle(section.id)).font(KiviTheme.medium(13)).foregroundStyle(KiviTheme.muted)
-                        ForEach(section.takes) { take in
-                            HomeTakeRow(take: take, reduceMotion: reduceMotion)
-                            Rectangle().fill(KiviTheme.line.opacity(0.7)).frame(height: 1)
-                        }
-                    }
-                }
-                if feed.loading {
-                    Text("loading takes…").font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
-                }
-                if let error = feed.error {
-                    HStack {
-                        Text(error).font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
-                        Button("try again") { feed.reload() }.buttonStyle(KiviButton())
-                    }
-                } else if feed.hasMore && !feed.loading {
-                    Button("load older takes") { feed.loadMore() }.buttonStyle(KiviButton())
-                        .onAppear { feed.loadMore() }
-                }
-            }.padding(.top, 22)
+    private let historyHeaderSpacing: CGFloat = 22
 
+    private var recentTakes: some View {
+        VStack(alignment: .leading, spacing: historyHeaderSpacing) {
+            if showingDeleted {
+                deletedHistory
+            } else {
+                historyHeader
+                activeHistory
+            }
         }
     }
+
+    private var historyHeader: some View {
+        HStack(spacing: 8) {
+            KiviHistoryControls(
+                history: feed,
+                searchEnabled: searchEnabled,
+                heading: feed.sections.first.map { dayTitle($0.id) } ?? "history",
+                reduceMotion: reduceMotion
+            )
+            Spacer(minLength: 8)
+            recentlyDeletedButton.fixedSize()
+        }
+    }
+
+    private var activeHistory: some View {
+        LazyVStack(alignment: .leading, spacing: 26) {
+            if feed.sections.isEmpty && !feed.loading && feed.error == nil {
+                Text(feed.search.isEmpty ? "your saved takes will appear here." : "no takes match. try another search.")
+                    .font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted).padding(.vertical, 24)
+            }
+            ForEach(feed.sections) { section in
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if section.id != feed.sections.first?.id || !feed.search.isEmpty {
+                        Text(dayTitle(section.id)).font(KiviTheme.medium(13)).foregroundStyle(KiviTheme.muted)
+                            .accessibilityAddTraits(.isHeader)
+                            .padding(.bottom, 8)
+                    }
+                    ForEach(section.takes) { take in
+                        HomeTakeRow(
+                            take: take,
+                            reduceMotion: reduceMotion,
+                            confirmingDeletion: pendingDeletion == take.id,
+                            cancelDeletion: { pendingDeletion = nil }
+                        ) {
+                            if pendingDeletion == take.id {
+                                pendingDeletion = nil
+                                deleteTake(take)
+                            } else {
+                                pendingDeletion = take.id
+                            }
+                        }
+                        Rectangle().fill(KiviTheme.line.opacity(0.7)).frame(height: 1)
+                    }
+                }
+            }
+            if feed.loading {
+                Text("loading takes…").font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
+            }
+            if let error = feed.error {
+                HStack {
+                    Text(error).font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
+                    Button("try again") { feed.reload() }.buttonStyle(KiviButton())
+                }
+            } else if feed.hasMore && !feed.loading {
+                Button("load older takes") { feed.loadMore() }.buttonStyle(KiviButton())
+                    .onAppear { feed.loadMore() }
+            }
+        }
+    }
+    @State private var historyLinkHovered = false
+
+    private var recentlyDeletedButton: some View {
+        historyLink("recently deleted", destination: .openDeleted) {
+            pendingDeletion = nil
+            loadDeletedHistory()
+            showingDeleted = true
+            historyNavigation = .backToHistory
+        }
+    }
+
+    private func historyLink(_ title: LocalizedStringKey, destination: HistoryNavigation, action: @escaping () -> Void) -> some View {
+        Button {
+            historyLinkHovered = false
+            action()
+        } label: {
+            HStack(spacing: 5) {
+                if destination == .backToHistory { historyChevron("chevron.left") }
+                Text(title).font(KiviTheme.medium(13))
+                if destination == .openDeleted { historyChevron("chevron.right") }
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(historyLinkHovered || historyNavigation == destination ? KiviTheme.green : KiviTheme.muted)
+        .onHover { historyLinkHovered = $0 }
+        .focused($historyNavigation, equals: destination)
+        .padding(.trailing, 12)
+    }
+
+    private func historyChevron(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 9, weight: .semibold))
+            .accessibilityHidden(true)
+    }
+
+    private var deletedHistory: some View {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("recently deleted").font(KiviTheme.serif(25)).foregroundStyle(KiviTheme.ink)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                historyLink("back to history", destination: .backToHistory, action: closeDeletedHistory)
+                    .keyboardShortcut(.cancelAction)
+            }
+            Text("you can restore deleted takes for 30 days.")
+                .font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
+
+            if deletedLoadFailed {
+                Text("couldn’t load deleted takes.").font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
+                Button("try again") { loadDeletedHistory() }.buttonStyle(KiviButton())
+            } else if deletedTakes.isEmpty {
+                Text("no recently deleted takes.").font(KiviTheme.body(14)).foregroundStyle(KiviTheme.muted)
+            }
+            ForEach(deletedTakes) { take in
+                HStack(alignment: .top, spacing: 14) {
+                    AppGlyph(name: take.source, size: 20).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(take.text).font(KiviTheme.body(16)).foregroundStyle(KiviTheme.ink).lineLimit(3)
+                        Text("\(take.source) · \(take.date.formatted(date: .abbreviated, time: .shortened))")
+                            .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("restore") { restoreTake(take) }.buttonStyle(KiviButton())
+                        .accessibilityLabel("restore take from \(take.source)")
+                }
+                .padding(.vertical, 8)
+                Rectangle().fill(KiviTheme.line.opacity(0.7)).frame(height: 1)
+            }
+        }
+    }
+
+    private func closeDeletedHistory() {
+        showingDeleted = false
+        deletedTakes = []
+        historyNavigation = .openDeleted
+    }
+
+    private func loadDeletedHistory() {
+        do {
+            deletedTakes = try feed.recentlyDeleted()
+            deletedLoadFailed = false
+        } catch {
+            deletedTakes = []
+            deletedLoadFailed = true
+        }
+    }
+
+    private func deleteTake(_ take: Take) {
+        do {
+            try feed.delete(take)
+            model.notify("moved to recently deleted")
+        } catch {
+            model.notify("couldn’t delete the take. try again.")
+        }
+    }
+
+    private func restoreTake(_ take: Take) {
+        do {
+            try feed.restore(take)
+            deletedTakes.removeAll { $0.id == take.id }
+            model.notify("take restored")
+        } catch {
+            model.notify("couldn’t restore the take.")
+            loadDeletedHistory()
+        }
+    }
+
     private func dayTitle(_ date: Date) -> String {
         if Calendar.current.isDateInToday(date) { return "today" }
         if Calendar.current.isDateInYesterday(date) { return "yesterday" }
@@ -127,6 +285,11 @@ private struct HomeTakeRow: View {
     @EnvironmentObject var model: AppModel
     let take: Take
     let reduceMotion: Bool
+    let confirmingDeletion: Bool
+    let cancelDeletion: () -> Void
+    let delete: () -> Void
+    private enum ActionFocus { case copy, trash, cancel }
+    @FocusState private var actionFocus: ActionFocus?
     @State private var expanded = false
     @State private var copyFeedbackID: UUID?
     @State private var hovered = false
@@ -175,16 +338,36 @@ private struct HomeTakeRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 12) {
-                Text(take.date.formatted(date: .omitted, time: .shortened))
-                    .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
-                    .monospacedDigit().fixedSize()
-                    .onTapGesture { copyTake() }
-                IconButton(icon: copyFeedbackID == nil ? "square.on.square" : "checkmark", label: copyFeedbackID == nil ? "copy take" : "copied") { copyTake() }
-            }
-            .frame(height: 24)
+            Text(take.date.formatted(date: .omitted, time: .shortened))
+                .font(KiviTheme.body(12)).foregroundStyle(KiviTheme.muted)
+                .monospacedDigit().fixedSize()
+                .frame(height: 24)
+                .opacity(showActions ? 0 : 1)
+                .allowsHitTesting(!showActions)
+                .onTapGesture { copyTake() }
         }
         .padding(.horizontal, 12).padding(.vertical, 18)
+        .overlay(alignment: .trailing) {
+            rowActions
+                .frame(height: 24)
+                .padding(.horizontal, 12)
+                .frame(maxHeight: .infinity, alignment: .trailing)
+                .background {
+                    HStack(spacing: 0) {
+                        LinearGradient(colors: [.clear, KiviTheme.background], startPoint: .leading, endPoint: .trailing)
+                            .frame(width: actionFadeWidth)
+                        KiviTheme.background
+                    }
+                    .padding(.leading, -actionFadeWidth)
+                    .allowsHitTesting(false)
+                }
+                .opacity(showActions ? 1 : 0)
+                .allowsHitTesting(showActions)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onChange(of: confirmingDeletion) { _, confirming in
+            if confirming { actionFocus = .cancel }
+        }
         // Put the empty-space action behind the content, so child controls
         // consume their own clicks without also copying the take.
         .background {
@@ -203,7 +386,46 @@ private struct HomeTakeRow: View {
         .onHover { hovered = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: Text("copy take")) { copyTake() }
+        .accessibilityAction(named: Text("delete take")) {
+            if !confirmingDeletion { delete() }
+        }
     }
+    private var actionFadeWidth: CGFloat { confirmingDeletion ? 32 : 20 }
+    private var showActions: Bool { hovered || actionFocus != nil || confirmingDeletion }
+
+    @ViewBuilder
+    private var rowActions: some View {
+        if confirmingDeletion {
+            HStack(spacing: 16) {
+                Button(action: delete) {
+                    Text("delete?").font(KiviTheme.medium(12))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("confirm delete take")
+                .help("move to recently deleted")
+                IconButton(icon: "xmark", label: "cancel deletion") {
+                    cancelDeletion()
+                    actionFocus = .trash
+                }
+                .focused($actionFocus, equals: .cancel)
+                .keyboardShortcut(.cancelAction)
+            }
+            .frame(width: 88)
+        } else {
+            HStack(spacing: 12) {
+                IconButton(icon: copyFeedbackID == nil ? "square.on.square" : "checkmark", label: copyFeedbackID == nil ? "copy take" : "copied") { copyTake() }
+                    .focused($actionFocus, equals: .copy)
+                IconButton(icon: "trash", label: "delete take", hoverColor: .red, action: delete)
+                    .focused($actionFocus, equals: .trash)
+            }
+        }
+    }
+
     private func copyTake() {
         if model.copy(take.text) { copyFeedbackID = UUID() }
     }

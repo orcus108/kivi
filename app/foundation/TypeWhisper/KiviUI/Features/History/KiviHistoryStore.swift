@@ -56,6 +56,20 @@ struct KiviTakeSection: Identifiable, Equatable {
         }
         updateSummary()
     }
+    func delete(_ take: Take) throws {
+        try service.moveKiviTakeToTrash(id: take.id)
+        loaded.removeAll { $0.id == take.id }
+        sections = KiviTakeSection.group(loaded)
+        recordsChanged()
+    }
+
+    func restore(_ take: Take) throws {
+        try service.restoreKiviTake(id: take.id)
+        recordsChanged()
+    }
+
+    func recentlyDeleted() throws -> [Take] { try service.recentlyDeletedKiviTakes() }
+
     func makeIndependentFeed() -> KiviHistoryStore { KiviHistoryStore(service: service) }
     func activate() { visible = true; if dirty { reload() } }
     func deactivate() { visible = false; queryTask?.cancel(); generation += 1; if loading { dirty = true }; loading = false }

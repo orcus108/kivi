@@ -71,6 +71,9 @@ final class KiviWindowConfiguratorView: NSView {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @State private var accountMenuVisible = false
+    @FocusState private var accountButtonFocused: Bool
+    @FocusState private var accountMenuFocus: String?
     @State private var sidebarVisible = true
     @State private var windowIsFullScreen = false
     @FocusState private var focusedNav: Page?
@@ -90,7 +93,7 @@ struct RootView: View {
                     ZStack(alignment: .topLeading) {
                         Group {
                             switch model.page {
-                            case .record: RecordPage()
+                            case .record: RecordPage(searchEnabled: !accountMenuVisible)
                             case .talk: KiviTalkPage(conversation: model.talk)
                             case .insights: InsightsPage(history: model.services.historyService)
                             case .dictionary: DictionaryPage()
@@ -153,6 +156,26 @@ struct RootView: View {
                     .background(KiviTheme.panel, in: Capsule()).overlay(Capsule().stroke(KiviTheme.line)).shadow(radius: 20).padding(.bottom, 24).padding(.horizontal, 30).transition(.opacity)
             }
         }
+        .overlay(alignment: .bottomLeading) {
+            ZStack(alignment: .bottomLeading) {
+                if accountMenuVisible {
+                    Color.clear.contentShape(Rectangle()).onTapGesture { closeAccountMenu() }
+                        .background(KiviEscapeCapture(enabled: !model.showWelcome, onEscape: closeAccountMenu))
+                }
+                ZStack(alignment: .bottomLeading) {
+                    if accountMenuVisible {
+                        accountMenu
+                            .frame(width: 232)
+                            .transition(reducePageMotion ? .identity : .opacity.combined(with: .offset(y: 6)))
+                    }
+                }
+                .animation(reducePageMotion ? nil : .easeOut(duration: 0.16), value: accountMenuVisible)
+                .allowsHitTesting(accountMenuVisible)
+                .padding(.leading, 16).padding(.bottom, 76)
+            }
+        }
+        .onChange(of: accountMenuVisible) { if accountMenuVisible { accountMenuFocus = "incognito" } }
+        .onChange(of: sidebarVisible) { if !sidebarVisible { accountMenuVisible = false } }
         .overlay { if model.showWelcome { WelcomePreview().environmentObject(model).ignoresSafeArea(.container, edges: .top).transition(.opacity) } }
         
         .onAppear {
@@ -168,7 +191,7 @@ struct RootView: View {
             guard let window = notification.object as? NSWindow, window.identifier?.rawValue == "kivi-main" else { return }
             windowIsFullScreen = false
         }
-        .onChange(of: model.page) { model.selectedTake = nil; visibleNavLabel = nil }
+        .onChange(of: model.page) { model.selectedTake = nil; visibleNavLabel = nil; accountMenuVisible = false }
         .environment(\.kiviReduceMotion, model.saved.reduceMotion)
     }
     // The header and navigation share one continuous outer surface.
@@ -199,29 +222,96 @@ struct RootView: View {
             nav(.insights); nav(.dictionary); nav(.shortcuts); nav(.styles)
             Spacer()
             Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.horizontal, sidebarVisible ? 16 : 10)
-            HStack(spacing: 6) {
-                Button { model.page = .settings; model.settingsSection = "account" } label: {
-                    Text("v").font(KiviTheme.medium(14)).foregroundStyle(KiviTheme.background).frame(width: 28, height: 28).background(KiviTheme.green, in: Circle()).overlay(Circle().stroke(KiviTheme.green.opacity(0.3), lineWidth: 4))
-                }.buttonStyle(.plain).help("Your local workspace").accessibilityLabel("account settings")
-                if sidebarVisible {
-                    Button { model.page = .settings; model.settingsSection = "account" } label: {
-                        HStack(spacing: 6) {
-                            Text("Vedant Misra").font(KiviTheme.medium(14)).lineLimit(1).fixedSize()
-                            Text("pro").font(KiviTheme.medium(11).italic()).fixedSize().foregroundStyle(KiviTheme.green).padding(.horizontal, 6).padding(.vertical, 1).background(KiviTheme.green.opacity(0.13), in: Capsule())
+            Button {
+                sidebarVisible = true
+                accountMenuVisible = true
+            } label: {
+                HStack(spacing: 10) {
+                    Text("v").font(KiviTheme.medium(12)).foregroundStyle(KiviTheme.background)
+                        .frame(width: 22, height: 22).background(KiviTheme.green, in: Circle())
+                        .overlay(alignment: .bottomTrailing) {
+                            if !sidebarVisible && model.incognito {
+                                Circle().fill(KiviTheme.green).frame(width: 6, height: 6)
+                                    .overlay(Circle().stroke(KiviTheme.background, lineWidth: 1))
+                                    .offset(x: 3, y: 2)
+                            }
                         }
-                    }.buttonStyle(.plain).help("Your local workspace")
-                    Spacer(minLength: 0)
-                    IconButton(icon: model.incognito ? "eye.slash" : "eye", label: model.incognito ? "turn incognito off" : "turn incognito on") { model.incognito.toggle(); model.notify(model.incognito ? "incognito on · new takes are not saved" : "incognito off") }
-                        .foregroundStyle(model.incognito ? KiviTheme.green : KiviTheme.muted)
-                    IconButton(icon: "gearshape", label: "settings") { model.page = .settings }
+                    if sidebarVisible {
+                        Text("Vedant Misra").font(KiviTheme.medium(13)).foregroundStyle(KiviTheme.ink.opacity(0.85)).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    if sidebarVisible && model.incognito {
+                        Image(systemName: "eye.slash").font(.system(size: 12)).foregroundStyle(KiviTheme.green)
+                    }
+                    if sidebarVisible {
+                        Image(systemName: "chevron.up").font(.system(size: 9, weight: .medium)).foregroundStyle(KiviTheme.muted)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading).frame(height: 40).padding(.horizontal, 10)
+                .contentShape(RoundedRectangle(cornerRadius: 8))
             }
-            // Keep the avatar anchored as the wider account controls are revealed.
-            .frame(height: 30)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 24).padding(.trailing, 14).padding(.vertical, 20)
+            .buttonStyle(KiviAccountRowStyle(focused: accountButtonFocused, selected: accountMenuVisible))
+            .focused($accountButtonFocused).focusEffectDisabled()
+            .accessibilityLabel(model.incognito ? "account menu, incognito on" : "account menu")
+            .accessibilityValue(accountMenuVisible ? "expanded" : "collapsed")
+            .help("Incognito and settings")
+            .padding(.horizontal, 14).padding(.vertical, 14)
         }
     }
+    private func closeAccountMenu() {
+        accountMenuVisible = false
+        accountButtonFocused = true
+    }
+
+    private var accountMenu: some View {
+        VStack(spacing: 4) {
+            accountMenuRow("incognito", icon: "eye.slash") {
+                Capsule().fill(model.incognito ? KiviTheme.green.opacity(0.72) : KiviTheme.muted.opacity(0.3))
+                    .frame(width: 30, height: 18)
+                    .overlay {
+                        Circle().fill(model.incognito ? KiviTheme.background : KiviTheme.muted)
+                            .frame(width: 12, height: 12)
+                            .offset(x: model.incognito ? 6 : -6)
+                    }
+                    .animation(reducePageMotion ? nil : .easeInOut(duration: 0.28), value: model.incognito)
+            } action: {
+                model.incognito.toggle()
+                model.notify(model.incognito ? "incognito on · new takes are not saved" : "incognito off")
+            }
+            .accessibilityValue(model.incognito ? "on" : "off")
+            accountMenuRow("settings", icon: "gearshape") {
+                Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(KiviTheme.muted)
+            } action: {
+                closeAccountMenu()
+                model.page = .settings
+            }
+        }
+        .padding(6).background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(KiviTheme.line))
+        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
+    }
+
+    private func accountMenuRow<Trailing: View>(_ title: String, icon: String, @ViewBuilder trailing: () -> Trailing, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon).font(.system(size: 14)).foregroundStyle(KiviTheme.muted).frame(width: 18)
+                Text(title).font(KiviTheme.body(14)).foregroundStyle(KiviTheme.ink)
+                Spacer(minLength: 8)
+                trailing()
+            }.padding(.horizontal, 10).frame(height: 38).contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(KiviAccountRowStyle(focused: accountMenuFocus == title))
+        .focused($accountMenuFocus, equals: title).focusEffectDisabled().accessibilityLabel(title)
+        .onKeyPress(.downArrow) { moveAccountFocus(from: title, offset: 1); return .handled }
+        .onKeyPress(.upArrow) { moveAccountFocus(from: title, offset: -1); return .handled }
+    }
+
+    private func moveAccountFocus(from title: String, offset: Int) {
+        let rows = ["incognito", "settings"]
+        guard let index = rows.firstIndex(of: title) else { return }
+        accountMenuFocus = rows[(index + offset + rows.count) % rows.count]
+    }
+
     private func nav(_ page: Page) -> some View {
         Button { model.selectedTake = nil; model.page = page } label: {
             HStack(spacing: 0) {
@@ -309,5 +399,46 @@ private struct KiviNavLabelAnchors: PreferenceKey {
     nonisolated static var defaultValue: [Page: Anchor<CGRect>] { [:] }
     nonisolated static func reduce(value: inout [Page: Anchor<CGRect>], nextValue: () -> [Page: Anchor<CGRect>]) {
         value.merge(nextValue(), uniquingKeysWith: { _, next in next })
+    }
+}
+
+private struct KiviAccountRowStyle: ButtonStyle {
+    var focused = false
+    var selected = false
+    @State private var hovered = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(KiviTheme.ink.opacity(configuration.isPressed ? 0.09 : (hovered || selected ? 0.045 : 0)), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(focused ? KiviTheme.green.opacity(0.65) : .clear))
+            .onHover { hovered = $0 }
+    }
+}
+
+/// NSTextView handles cancelOperation before SwiftUI's ancestor onExitCommand.
+/// Consume plain Escape for an active interaction in this window.
+struct KiviEscapeCapture: NSViewRepresentable {
+    var enabled: Bool
+    var onEscape: () -> Void
+    func makeNSView(context: Context) -> CaptureView { CaptureView() }
+    func updateNSView(_ view: CaptureView, context: Context) { view.enabled = enabled; view.onEscape = onEscape }
+    static func dismantleNSView(_ view: CaptureView, coordinator: ()) { view.removeMonitor() }
+
+    final class CaptureView: NSView {
+        var enabled = false
+        var onEscape: (() -> Void)?
+        private var monitor: Any?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeMonitor()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.enabled, event.keyCode == 53, event.window === self.window,
+                      event.modifierFlags.intersection([.shift, .option, .command, .control]).isEmpty else { return event }
+                if let editor = self.window?.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
+                self.onEscape?()
+                return nil
+            }
+        }
+        func removeMonitor() { if let monitor { NSEvent.removeMonitor(monitor) }; monitor = nil }
     }
 }

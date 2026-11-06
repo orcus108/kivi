@@ -46,6 +46,7 @@ enum CaptureInboxState: String, Codable, Sendable {
 final class TranscriptionRecord {
     var id: UUID
     var timestamp: Date
+    var kiviDeletedAt: Date?
     var rawText: String
     var finalText: String
     var appName: String?

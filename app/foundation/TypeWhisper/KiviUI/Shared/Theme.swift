@@ -184,6 +184,7 @@ struct AppGlyph: View {
 struct IconButton: View {
     var icon: String
     var label: String
+    var hoverColor = KiviTheme.green
     var action: () -> Void
     @State private var isHovering = false
     var body: some View {
@@ -193,7 +194,7 @@ struct IconButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(isHovering ? KiviTheme.green : KiviTheme.muted)
+        .foregroundStyle(isHovering ? hoverColor : KiviTheme.muted)
         .onHover { isHovering = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovering)
         .help(label).accessibilityLabel(label)

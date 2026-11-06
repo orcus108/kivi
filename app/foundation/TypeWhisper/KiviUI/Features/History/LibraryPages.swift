@@ -2,82 +2,95 @@ import SwiftUI
 import AppKit
 
 struct KiviHistoryControls: View {
-    @EnvironmentObject var model: AppModel
     @ObservedObject var history: KiviHistoryStore
-    @State private var showFilter = false
-    @State private var filterHovered = false
+    let searchEnabled: Bool
+    let heading: String
+    let reduceMotion: Bool
+    @State private var showSearch = false
+    @State private var searchIconHovered = false
     @FocusState private var searchFocused: Bool
-    private var filtered: Bool { history.source != nil || history.period != "all time" || history.kind != "all" }
+    @FocusState private var searchButtonFocused: Bool
+
+    private var expanded: Bool { showSearch || !history.search.isEmpty }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) {
-                        HStack(spacing: 12) {
-                            Image(systemName: "magnifyingglass").font(.system(size: 16)).foregroundStyle(KiviTheme.muted)
-                            TextField("search your words", text: $history.search)
-                                .textFieldStyle(.plain).font(KiviTheme.body(16)).focused($searchFocused)
-                                .onSubmit { model.notify("showing matching words from your local history") }
-                                .onExitCommand { searchFocused = false }
-                            if !history.search.isEmpty {
-                                IconButton(icon: "xmark", label: "clear search") { history.search = "" }
-                            }
+        ZStack(alignment: .leading) {
+            if expanded {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 11)).foregroundStyle(KiviTheme.muted)
+                        .accessibilityHidden(true)
+                    TextField("search your words", text: $history.search)
+                        .textFieldStyle(.plain).font(KiviTheme.body(13))
+                        .focused($searchFocused)
+                        .disabled(!searchEnabled)
+                        .task {
+                            await Task.yield()
+                            if showSearch && searchEnabled && !Task.isCancelled { searchFocused = true }
                         }
-                        .padding(.horizontal, 16).frame(height: 50)
-                        .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(searchFocused ? KiviTheme.green : KiviTheme.line))
-                        .background(KiviSearchFocusBoundary(focused: $searchFocused))
-                        Button { searchFocused = false; showFilter.toggle() } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "line.3.horizontal.decrease").font(.system(size: 14))
-                                Text("filter")
-                                if filtered { Circle().fill(KiviTheme.green).frame(width: 6, height: 6).accessibilityHidden(true) }
-                            }
-                                .font(KiviTheme.body(16)).foregroundStyle(filterHovered || showFilter ? KiviTheme.ink : KiviTheme.muted)
-                                .padding(.horizontal, 16).frame(height: 50)
-                                .background(KiviTheme.panel, in: RoundedRectangle(cornerRadius: 8))
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(KiviTheme.line))
-                        }.buttonStyle(.plain).onHover { filterHovered = $0 }
-                            .accessibilityValue("\(showFilter ? "expanded" : "collapsed"), \(filtered ? "filters active" : "no active filters")")
-                            .popover(isPresented: $showFilter, arrowEdge: .bottom) {
-                                ScrollView { filterPopover }.frame(maxHeight: 480)
-                                    .onExitCommand { showFilter = false }
-                            }
+                    Button(action: closeSearch) {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .medium))
+                            .frame(width: 24, height: 24).contentShape(Rectangle())
                     }
-            if filtered {
-                HStack {
-                    Text([history.source, history.period == "all time" ? nil : history.period, history.kind == "all" ? nil : history.kind].compactMap { $0 }.joined(separator: " · "))
-                        .font(KiviTheme.body(13)).foregroundStyle(KiviTheme.muted)
-                    Spacer()
-                    Button("clear filters") { history.source = nil; history.period = "all time"; history.kind = "all" }.buttonStyle(KiviButton())
+                    .buttonStyle(.plain).foregroundStyle(KiviTheme.muted)
+                    .accessibilityLabel("close history search")
+                    .help("close history search")
                 }
+                .frame(maxWidth: 210)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(searchEnabled && searchFocused ? KiviTheme.green : KiviTheme.line)
+                        .frame(height: 1).allowsHitTesting(false)
+                }
+                .background(KiviSearchFocusBoundary(focused: $searchFocused))
+                .background(KiviEscapeCapture(enabled: searchEnabled && searchFocused, onEscape: closeSearch))
+                .onChange(of: searchEnabled) { if !searchEnabled { searchFocused = false } }
+                .transition(reduceMotion ? .identity : .modifier(
+                    active: HistorySearchWidth(scale: 0.25),
+                    identity: HistorySearchWidth(scale: 1)
+                ).combined(with: .opacity))
+                .allowsHitTesting(expanded)
+            } else {
+                HStack(spacing: 8) {
+                    Text(heading)
+                        .font(KiviTheme.medium(13)).foregroundStyle(KiviTheme.muted)
+                        .accessibilityAddTraits(.isHeader)
+                        .fixedSize()
+                    searchButton
+                }
+                .transition(reduceMotion ? .identity : .opacity)
+                .allowsHitTesting(!expanded)
             }
         }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.24), value: expanded)
     }
-    private var filterPopover: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("apps").font(KiviTheme.mono(11)).foregroundStyle(KiviTheme.muted).padding(.horizontal, 10).padding(.bottom, 3)
-            filterRow("all apps", checked: history.source == nil, icon: "square.grid.2x2") { history.source = nil }
-            ForEach(history.summary.sources, id: \.self) { source in
-                Button { history.source = source } label: {
-                    HStack(spacing: 10) { AppGlyph(name: source, size: 18); Text(source.lowercased()); Spacer(); if history.source == source { Image(systemName: "checkmark").font(.system(size: 11)) } }
-                        .font(KiviTheme.body(14)).padding(.horizontal, 10).frame(height: 34).contentShape(Rectangle())
-                }.buttonStyle(KiviButton())
-            }
-            Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.vertical, 6)
-            Text("time").font(KiviTheme.mono(11)).foregroundStyle(KiviTheme.muted).padding(.horizontal, 10)
-            ForEach(["all time", "today", "this week", "this month"], id: \.self) { period in
-                filterRow(period, checked: history.period == period, icon: nil) { history.period = period }
-            }
-            Rectangle().fill(KiviTheme.line).frame(height: 1).padding(.vertical, 6)
-            filterRow("system clipboard", checked: history.source == "system clipboard", icon: "clipboard") { history.source = "system clipboard" }
-        }.padding(10).frame(width: 256).background(KiviTheme.background).foregroundStyle(KiviTheme.ink)
+
+    private var searchButton: some View {
+        Button { showSearch = true } label: {
+            Image(systemName: "magnifyingglass").font(.system(size: 11, weight: .medium))
+                .frame(width: 24, height: 24).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(searchIconHovered || searchButtonFocused ? KiviTheme.green : KiviTheme.muted)
+        .onHover { searchIconHovered = $0 }
+        .focused($searchButtonFocused)
+        .disabled(!searchEnabled)
+        .accessibilityLabel("search history")
+        .help("search history")
     }
-    private func filterRow(_ title: String, checked: Bool, icon: String?, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                if let icon { Image(systemName: icon).frame(width: 18).foregroundStyle(KiviTheme.muted) }
-                Text(title); Spacer(); if checked { Image(systemName: "checkmark").font(.system(size: 11)).foregroundStyle(KiviTheme.green) }
-            }.font(KiviTheme.body(14)).padding(.horizontal, 10).frame(height: 34).contentShape(Rectangle())
-        }.buttonStyle(KiviButton())
+
+    private func closeSearch() {
+        searchFocused = false
+        history.search = ""
+        showSearch = false
+        searchButtonFocused = true
+    }
+}
+
+private struct HistorySearchWidth: ViewModifier {
+    let scale: CGFloat
+
+    func body(content: Content) -> some View {
+        content.scaleEffect(x: scale, y: 1, anchor: UnitPoint(x: 0.25, y: 0.5))
     }
 }
 
@@ -99,33 +112,11 @@ private struct KiviSearchFocusBoundary: NSViewRepresentable {
         var clearFocus: (() -> Void)?
         var isSearchFocused: (() -> Bool)?
         private var monitor: Any?
-        private var initialActivation: NSObjectProtocol?
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             stopObserving()
-            guard let window else { return }
-            // A window can pick its initial field after the view attaches. Clear it
-            // once at activation as well, without disturbing later app switches.
-            let clearInitialFocus: () -> Void = { [weak self, weak window] in
-                DispatchQueue.main.async {
-                    guard let self, let window, self.window === window else { return }
-                    self.clearFocus?()
-                    if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
-                        window.makeFirstResponder(nil)
-                    }
-                }
-            }
-            if window.isKeyWindow { clearInitialFocus() }
-            else {
-                initialActivation = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
-                    clearInitialFocus()
-                    if let token = self?.initialActivation {
-                        NotificationCenter.default.removeObserver(token)
-                        self?.initialActivation = nil
-                    }
-                }
-            }
+            guard window != nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
                 guard let self, let window = self.window, event.window === window,
                       self.isSearchFocused?() == true else { return event }
@@ -138,7 +129,6 @@ private struct KiviSearchFocusBoundary: NSViewRepresentable {
             }
         }
         func stopObserving() {
-            if let initialActivation { NotificationCenter.default.removeObserver(initialActivation); self.initialActivation = nil }
             if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
         }
     }

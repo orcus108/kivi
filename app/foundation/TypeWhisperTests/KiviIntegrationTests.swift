@@ -1270,6 +1270,44 @@ private final class KiviJournalFailDefaults: UserDefaults, @unchecked Sendable {
         store.deactivate()
     }
 
+    func testRecentlyDeletedTakeSurvivesReopenAndRestoresOriginalRecord() async throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(directory) }
+        let now = Date()
+        let id = UUID()
+        let service = HistoryService(appSupportDirectory: directory, eventEmitter: { _ in })
+        XCTAssertTrue(service.addRecord(id: id, timestamp: now, rawText: "original",
+                                        finalText: "saved fixture", appName: "Test App",
+                                        appBundleIdentifier: nil, durationSeconds: 1,
+                                        language: "en", engineUsed: "test", audioSamples: [0.1]))
+        let audioURL = try XCTUnwrap(service.audioFileURL(for: XCTUnwrap(service.record(withID: id))))
+        try service.moveKiviTakeToTrash(id: id, now: now)
+        XCTAssertNil(service.record(withID: id))
+        XCTAssertTrue(service.recentRecords.isEmpty)
+        XCTAssertEqual(service.recordCount(), 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        let summary = try await service.kiviSummary(now: now)
+        XCTAssertEqual(summary.todayWords, 0)
+        let destination = directory.appendingPathComponent("export.txt")
+        try await service.exportKiviHistory(to: destination)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "")
+
+        let reopened = HistoryService(appSupportDirectory: directory, eventEmitter: { _ in })
+        XCTAssertEqual(try reopened.recentlyDeletedKiviTakes(now: now).map(\.id), [id])
+        try reopened.restoreKiviTake(id: id, now: now)
+        let restored = try XCTUnwrap(reopened.record(withID: id))
+        XCTAssertEqual(restored.timestamp, now)
+        XCTAssertEqual(restored.finalText, "saved fixture")
+        XCTAssertEqual(reopened.audioFileURL(for: restored), audioURL)
+        XCTAssertTrue(try reopened.recentlyDeletedKiviTakes(now: now).isEmpty)
+
+        try reopened.moveKiviTakeToTrash(id: id, now: now)
+        let expiry = now.addingTimeInterval(30 * 24 * 60 * 60 + 1)
+        XCTAssertThrowsError(try reopened.restoreKiviTake(id: id, now: expiry))
+        XCTAssertTrue(try reopened.recentlyDeletedKiviTakes(now: expiry).isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
     func testKiviDateRangeAndSearchSemantics() throws {
         let record = TranscriptionRecord(rawText: "hello  world", finalText: "Café", appName: nil,
                                          appBundleIdentifier: nil, durationSeconds: 0, language: "en", engineUsed: "typed")
