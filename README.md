@@ -1,5 +1,9 @@
 # Kivi
 
+[![Watch the Kivi demo](assets/kivi-demo.jpg)](https://github.com/orcus108/kivi/raw/refs/heads/main/assets/kivi-demo.mp4)
+
+[Watch the demo](https://github.com/orcus108/kivi/raw/refs/heads/main/assets/kivi-demo.mp4)
+
 A native macOS dictation prototype exploring how you teach an app to write the way you want.
 
 - Dictate into your apps.
